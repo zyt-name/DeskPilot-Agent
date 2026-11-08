@@ -1,6 +1,8 @@
 .venv/
 .xm-agent/
 vendor/
+.idea/
+.vscode/
 __pycache__/
 *.py[cod]
 .pytest_cache/
