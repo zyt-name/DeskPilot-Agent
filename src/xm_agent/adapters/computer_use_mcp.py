@@ -29,6 +29,7 @@ class ComputerUseMcpAdapter:
     """
 
     name = "computer_use_mcp"
+    vision_only = True
 
     def __init__(
         self,
@@ -77,8 +78,10 @@ class ComputerUseMcpAdapter:
         return Receipt(False, error=f"unsupported capability: {capability}")
 
     def verify(self, expect: str | dict[str, Any] | None) -> Verification:
+        # This backend has no element tree, so text expectations cannot be
+        # checked here. The runtime asks the vision model before task.finish.
         if expect is None:
-            return Verification(True, "no expectation")
+            return Verification(True, "no expectation", deferred=True)
         try:
             data, image = self._invoke({"action": "get_screenshot"})
         except MCPError as exc:
@@ -86,7 +89,7 @@ class ComputerUseMcpAdapter:
         path = self._save_png(image)
         return Verification(
             True,
-            "screenshot captured; semantic check requires a vision model",
+            "screenshot captured; semantic check deferred to the vision model",
             {
                 "screenshot_path": path,
                 "expect": expect,
@@ -94,6 +97,7 @@ class ComputerUseMcpAdapter:
                 "image_width": data.get("image_width"),
                 "image_height": data.get("image_height"),
             },
+            deferred=True,
         )
 
     def close(self) -> None:
@@ -116,7 +120,18 @@ class ComputerUseMcpAdapter:
             text = str(args.get("text", ""))
             if not text:
                 raise MCPError("type requires text")
-            return self._receipt(self._invoke({"action": "type", "text": text})[0])
+            if args.get("clear"):
+                self._invoke({"action": "key", "text": "ctrl+a"})
+            receipt = self._receipt(
+                self._invoke({"action": "type", "text": text})[0]
+            )
+            if receipt.ok and args.get("press_enter"):
+                press = self._receipt(
+                    self._invoke({"action": "key", "text": "return"})[0]
+                )
+                if not press.ok:
+                    return press
+            return receipt
         if action == "key":
             keys = str(args.get("keys") or args.get("text") or "")
             if not keys:

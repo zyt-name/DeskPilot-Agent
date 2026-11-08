@@ -9,15 +9,30 @@ default_adapter = "mock"
 root = ".xm-agent/audit"
 keep_days = 7
 
+[audit_ai]
+# ai = 低风险自动执行，敏感操作交顶层审计模型；confirm_all = 所有写操作前询问。
+# 不提供关闭审计或完全访问的选项。
+mode = "ai"
+# 留空时使用当前活动的执行模型（独立性较弱，界面会标注）。
+model_provider_id = ""
+model_id = ""
+timeout_seconds = 12
+fail_closed = true
+protected_paths = [
+  "C:/Users/*/.ssh",
+  "C:/Users/*/.aws",
+]
+# 这些能力即使顶层 AI 判定 allow 也必须由用户确认一次。
+always_confirm = ["file.transfer", "terminal.exec"]
+
 [model]
 provider = "openai_compat"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
-timeout_seconds = 60
+timeout_seconds = 120
 temperature = 0.0
-# computer_use 后端需要视觉模型：设为 true 且 model 必须支持图像输入。
-vision = false
+# 图像输入能力由官方模型列表/模型名称自动判定，不在这里手动开关。
 
 [policy]
 allowed_capabilities = [
@@ -44,7 +59,9 @@ kind = "mock"
 
 [adapters.windows]
 kind = "windows_mcp"
-command = ["vendor/Windows-MCP/.venv/Scripts/python.exe", "-m", "windows_mcp", "serve"]
+# --config 相对 cwd 解析：config/windows-mcp.toml 关闭了 Windows-MCP 自带的
+# 同意弹窗与所有权钩子，改由 XM Agent 统一提示和暂停。
+command = ["vendor/Windows-MCP/.venv/Scripts/python.exe", "-m", "windows_mcp", "serve", "--config", "../../config/windows-mcp.toml"]
 cwd = "vendor/Windows-MCP"
 
 [adapters.windows.env]
@@ -64,11 +81,13 @@ wait_for = "WaitFor"
 [adapters.xshell]
 # 框架保留：本机未安装 Xshell，真实会话暂不验证。
 kind = "xshell_mcp"
-command = ["node", "vendor/xshell-mcp/dist/server.js"]
+# node 的脚本参数按 cwd 解析，这里写相对 cwd 的入口。
+command = ["node", "dist/server.js"]
 cwd = "vendor/xshell-mcp"
 
 [adapters.xshell.env]
-XSHELL_MCP_CONFIG = "D:/xm/agent/config/xshell-mcp.json"
+# 相对 vendor/xshell-mcp 工作目录解析。
+XSHELL_MCP_CONFIG = "../../config/xshell-mcp.json"
 
 [adapters.xshell.tools]
 exec = "xshell_exec"
@@ -76,9 +95,10 @@ read = "xshell_read_screen"
 wait_for = "xshell_wait_for"
 
 [adapters.computer_use]
-# 视觉通道：需先执行 npm install && npm run build，并提供视觉模型。
+# 视觉通道：资源管理器负责构建，并提供视觉模型。
 kind = "computer_use_mcp"
-command = ["node", "vendor/computer-use-mcp/dist/main.js"]
+# node 的脚本参数按 cwd 解析，这里写相对 cwd 的入口。
+command = ["node", "dist/main.js"]
 cwd = "vendor/computer-use-mcp"
 
 [adapters.computer_use.tools]

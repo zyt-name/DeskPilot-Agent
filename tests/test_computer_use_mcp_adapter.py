@@ -119,6 +119,35 @@ class ComputerUseAdapterTests(unittest.TestCase):
             ],
         )
 
+    def test_type_clear_and_press_enter(self) -> None:
+        adapter, client, _ = self.make(
+            [ok_result(), ok_result(), ok_result()]
+        )
+        receipt = adapter.execute(
+            "desktop.act",
+            {
+                "action": "type",
+                "text": "https://github.com/search?q=zmsy",
+                "clear": True,
+                "press_enter": True,
+            },
+        )
+        self.assertTrue(receipt.ok)
+        self.assertEqual(
+            client.calls,
+            [
+                ("computer", {"action": "key", "text": "ctrl+a"}),
+                (
+                    "computer",
+                    {
+                        "action": "type",
+                        "text": "https://github.com/search?q=zmsy",
+                    },
+                ),
+                ("computer", {"action": "key", "text": "return"}),
+            ],
+        )
+
     def test_scroll_uses_given_coordinate(self) -> None:
         adapter, client, _ = self.make([ok_result(), ok_result()])
         adapter.execute("desktop.act", {"action": "scroll", "amount": 2, "x": 8, "y": 9})
@@ -183,6 +212,7 @@ class ComputerUseAdapterTests(unittest.TestCase):
         adapter, client, _ = self.make([shot_result()])
         verification = adapter.verify("saved")
         self.assertTrue(verification.ok)
+        self.assertTrue(verification.deferred)
         self.assertTrue(verification.evidence["deferred"])
         self.assertEqual(verification.evidence["expect"], "saved")
         self.assertTrue(Path(verification.evidence["screenshot_path"]).exists())

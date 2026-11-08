@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from xm_agent.storage import DEFAULT_PROFILE, Storage
 
 
@@ -58,3 +60,154 @@ def test_run_goal_is_truncated(tmp_path):
     storage = Storage(tmp_path / "app.db")
     storage.create_run("run-long", "x" * 900, "mock")
     assert len(storage.get_run("run-long")["goal"]) == 500
+
+
+def test_conversations_messages_and_runs(tmp_path):
+    storage = Storage(tmp_path / "app.db")
+    conversation = storage.create_conversation(
+        title="清理任务", adapter="mock", audit_mode="confirm_all"
+    )
+    assert conversation["audit_mode"] == "confirm_all"
+    storage.add_message(conversation["id"], "user", "清理构建目录", kind="goal")
+    storage.add_message(
+        conversation["id"],
+        "assistant",
+        "thinking...",
+        kind="thinking",
+        payload={"step": 1},
+    )
+    storage.create_run("run-a", "清理构建目录", "mock", conversation["id"])
+
+    detail = storage.get_conversation(conversation["id"])
+    assert [item["role"] for item in detail["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert detail["messages"][1]["payload"] == {"step": 1}
+    assert [run["id"] for run in detail["runs"]] == ["run-a"]
+
+    listed = storage.list_conversations()
+    assert listed[0]["message_count"] == 2
+    assert listed[0]["task_count"] == 1
+
+    storage.delete_conversation(conversation["id"])
+    assert storage.get_conversation(conversation["id"]) is None
+    assert storage.list_messages(conversation["id"]) == []
+    assert storage.get_run("run-a")["conversation_id"] is None
+
+
+def test_run_events_are_ordered_and_replayable(tmp_path):
+    storage = Storage(tmp_path / "app.db")
+    conversation = storage.create_conversation("事件", "mock")
+    first = storage.append_run_event(
+        "run-b", conversation["id"], "start", {"goal": "x"}
+    )
+    second = storage.append_run_event(
+        "run-b", conversation["id"], "step", {"step": 1}
+    )
+    assert second > first
+
+    events = storage.list_run_events("run-b")
+    assert [event["event"] for event in events] == ["start", "step"]
+    replay = storage.list_run_events("run-b", after_id=first)
+    assert [event["event"] for event in replay] == ["step"]
+    grouped = storage.list_conversation_events(conversation["id"])
+    assert len(grouped) == 2
+
+
+def test_task_queue_ordering_and_jump(tmp_path):
+    storage = Storage(tmp_path / "app.db")
+    conversation = storage.create_conversation("队列", "mock")
+    first = storage.enqueue_task(conversation["id"], "任务一", "mock")
+    second = storage.enqueue_task(
+        conversation["id"], "任务二", "windows", audit_mode="confirm_all"
+    )
+    assert second["audit_mode"] == "confirm_all"
+    assert storage.next_queued_task()["id"] == first["id"]
+
+    assert storage.jump_queue_task(second["id"]) is True
+    assert storage.next_queued_task()["id"] == second["id"]
+
+    storage.set_queue_status(second["id"], "running", run_id="run-c")
+    queued = storage.list_queue()
+    assert [item["id"] for item in queued] == [first["id"]]
+    stored = storage.get_queue_task(second["id"])
+    assert stored["status"] == "running"
+    assert stored["run_id"] == "run-c"
+
+    assert storage.jump_queue_task("missing") is False
+    storage.remove_queue_task(first["id"])
+    assert storage.get_queue_task(first["id"]) is None
+
+
+def test_audit_decisions_are_recorded_and_marked(tmp_path):
+    storage = Storage(tmp_path / "app.db")
+    payload = {
+        "operation": {
+            "operation_id": "sha256:abc",
+            "capability": "terminal.exec",
+            "action": "exec",
+        },
+        "environment": {"cwd": str(tmp_path)},
+        "verdict": {
+            "verdict": "ask_user",
+            "risk": "high",
+            "categories": ["data_loss"],
+            "source": "ai",
+            "model": "audit-model",
+            "latency_ms": 12,
+        },
+        "user_decision": "allow",
+        "reason": "",
+    }
+    decision_id = storage.record_audit_decision(payload, "run-d", "conv-d")
+    assert decision_id > 0
+
+    records = storage.list_audit_decisions(run_id="run-d")
+    assert len(records) == 1
+    record = records[0]
+    assert record["operation_id"] == "sha256:abc"
+    assert record["verdict"] == "ask_user"
+    assert record["categories"] == ["data_loss"]
+    assert record["user_decision"] == "allow"
+    assert record["executed"] is None
+
+    storage.mark_audit_executed("run-d", "sha256:abc", True, "")
+    record = storage.list_audit_decisions(run_id="run-d")[0]
+    assert record["executed"] is True
+
+    assert storage.list_audit_decisions(conversation_id="other") == []
+
+
+def test_legacy_vision_flag_is_recomputed_on_migration(tmp_path):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE ai_models (
+            provider_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            vision INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'api',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, model_id)
+        );
+        INSERT INTO ai_models
+            (provider_id, model_id, display_name, vision, source, created_at)
+        VALUES ('p1', 'glm-5.3-flash', 'GLM', 1, 'custom', '2026-01-01');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    models = storage.list_ai_models("p1")
+    assert models[0]["model_id"] == "glm-5.3-flash"
+    assert models[0]["vision"] is False
+
+    with storage._connect() as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(ai_models)")
+        }
+    assert "vision_source" in columns

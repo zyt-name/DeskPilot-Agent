@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .model_caps import SOURCE_PROVIDER, resolve_vision_detail
 
 DEFAULT_PROFILE: dict[str, Any] = {
     "display_name": "本地用户",
@@ -37,6 +40,91 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    adapter TEXT NOT NULL DEFAULT 'mock',
+    audit_mode TEXT NOT NULL DEFAULT 'ai',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_updated
+    ON conversations(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'text',
+    payload TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON messages(conversation_id, id);
+
+CREATE TABLE IF NOT EXISTS run_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    conversation_id TEXT,
+    event TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_events_run
+    ON run_events(run_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_run_events_conversation
+    ON run_events(conversation_id, id);
+
+CREATE TABLE IF NOT EXISTS task_queue (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    audit_mode TEXT NOT NULL DEFAULT 'ai',
+    status TEXT NOT NULL DEFAULT 'queued',
+    position INTEGER NOT NULL DEFAULT 0,
+    run_id TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_queue_status
+    ON task_queue(status, position, created_at);
+
+CREATE TABLE IF NOT EXISTS audit_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    run_id TEXT,
+    conversation_id TEXT,
+    operation_id TEXT NOT NULL,
+    capability TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    descriptor TEXT NOT NULL DEFAULT '',
+    environment TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL DEFAULT '',
+    verdict_json TEXT NOT NULL DEFAULT '',
+    risk TEXT NOT NULL DEFAULT '',
+    categories TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    user_decision TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    executed INTEGER,
+    error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_decisions_run
+    ON audit_decisions(run_id, id);
+
 CREATE TABLE IF NOT EXISTS ai_providers (
     id TEXT PRIMARY KEY,
     preset_id TEXT NOT NULL DEFAULT 'custom',
@@ -57,6 +145,7 @@ CREATE TABLE IF NOT EXISTS ai_models (
     model_id TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
     vision INTEGER NOT NULL DEFAULT 0,
+    vision_source TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT 'api',
     created_at TEXT NOT NULL,
     PRIMARY KEY (provider_id, model_id)
@@ -89,6 +178,39 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _dump(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _load(value: str | None, default: Any) -> Any:
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return default
+
+
+def _model_record(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    reported = (
+        bool(item.get("vision"))
+        if item.get("vision_source") == SOURCE_PROVIDER
+        else None
+    )
+    vision, source = resolve_vision_detail(
+        str(item.get("model_id") or ""), reported=reported
+    )
+    item["vision"] = vision
+    item["vision_source"] = source
+    return item
+
+
+def _sort_models(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items.sort(key=lambda item: (not item["vision"], item["model_id"].casefold()))
+    return items
+
+
 class Storage:
     """Small SQLite store for local profile and task history."""
 
@@ -97,6 +219,38 @@ class Storage:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(runs)")
+        }
+        if "conversation_id" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN conversation_id TEXT")
+        queue_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_queue)")
+        }
+        if queue_columns and "run_id" not in queue_columns:
+            conn.execute("ALTER TABLE task_queue ADD COLUMN run_id TEXT")
+        audit_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(audit_decisions)")
+        }
+        if audit_columns and "verdict_json" not in audit_columns:
+            conn.execute(
+                "ALTER TABLE audit_decisions ADD COLUMN verdict_json "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        model_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(ai_models)")
+        }
+        if model_columns and "vision_source" not in model_columns:
+            conn.execute(
+                "ALTER TABLE ai_models ADD COLUMN vision_source "
+                "TEXT NOT NULL DEFAULT ''"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=5)
@@ -163,14 +317,21 @@ class Storage:
             )
         return self.get_profile()
 
-    def create_run(self, run_id: str, goal: str, adapter: str) -> None:
+    def create_run(
+        self,
+        run_id: str,
+        goal: str,
+        adapter: str,
+        conversation_id: str | None = None,
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (id, goal, adapter, status, created_at)
-                VALUES (?, ?, ?, 'running', ?)
+                INSERT INTO runs
+                    (id, goal, adapter, status, conversation_id, created_at)
+                VALUES (?, ?, ?, 'running', ?, ?)
                 """,
-                (run_id, goal[:500], adapter[:64], _now()),
+                (run_id, goal[:500], adapter[:64], conversation_id, _now()),
             )
 
     def finish_run(
@@ -193,14 +354,524 @@ class Storage:
             ).fetchone()
         return dict(row) if row is not None else None
 
-    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_runs(
+        self, limit: int = 20, conversation_id: str | None = None
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
         with self._connect() as conn:
+            if conversation_id:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM runs WHERE conversation_id = ?
+                     ORDER BY created_at DESC, rowid DESC LIMIT ?
+                    """,
+                    (conversation_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- conversations -------------------------------------------------
+
+    def create_conversation(
+        self,
+        title: str = "",
+        adapter: str = "mock",
+        audit_mode: str = "ai",
+    ) -> dict[str, Any]:
+        conversation_id = uuid.uuid4().hex[:12]
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO conversations
+                    (id, title, adapter, audit_mode, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    title.strip()[:120],
+                    adapter[:64],
+                    "confirm_all" if audit_mode == "confirm_all" else "ai",
+                    now,
+                    now,
+                ),
+            )
+        conversation = self.get_conversation(conversation_id)
+        assert conversation is not None
+        return conversation
+
+    def get_conversation(
+        self, conversation_id: str, include_messages: bool = True
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            conversation = dict(row)
+            conversation["runs"] = [
+                dict(item)
+                for item in conn.execute(
+                    """
+                    SELECT r.*,
+                           (SELECT MIN(e.id) FROM run_events e
+                             WHERE e.run_id = r.id) AS first_event_id
+                      FROM runs r
+                     WHERE r.conversation_id = ?
+                     ORDER BY r.created_at ASC, r.rowid ASC
+                    """,
+                    (conversation_id,),
+                ).fetchall()
+            ]
+            conversation["messages"] = (
+                self._messages(conn, conversation_id)
+                if include_messages
+                else []
+            )
+            conversation["last_event_id"] = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM run_events "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()[0]
+            )
+        return conversation
+
+    def list_conversations(self, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 200))
+        with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                """
+                SELECT c.*,
+                       (SELECT COUNT(*) FROM messages m
+                         WHERE m.conversation_id = c.id) AS message_count,
+                       (SELECT COUNT(*) FROM runs r
+                         WHERE r.conversation_id = c.id) AS task_count,
+                       (SELECT MAX(m.created_at) FROM messages m
+                         WHERE m.conversation_id = c.id) AS last_message_at,
+                       (SELECT r.status FROM runs r
+                         WHERE r.conversation_id = c.id
+                         ORDER BY r.created_at DESC, r.rowid DESC
+                         LIMIT 1) AS last_status
+                  FROM conversations c
+                 ORDER BY COALESCE(last_message_at, c.updated_at) DESC
+                 LIMIT ?
+                """,
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def update_conversation(
+        self, conversation_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        allowed = {
+            key: fields[key]
+            for key in ("title", "adapter", "audit_mode")
+            if key in fields and fields[key] is not None
+        }
+        if allowed:
+            assignments = ", ".join(f"{key} = ?" for key in allowed)
+            values = list(allowed.values()) + [_now(), conversation_id]
+            with self._connect() as conn:
+                conn.execute(
+                    f"UPDATE conversations SET {assignments}, updated_at = ? "
+                    "WHERE id = ?",
+                    values,
+                )
+        return self.get_conversation(conversation_id, include_messages=False)
+
+    def touch_conversation(self, conversation_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (_now(), conversation_id),
+            )
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM task_queue WHERE conversation_id = ? "
+                "AND status = 'queued'",
+                (conversation_id,),
+            )
+            conn.execute(
+                "UPDATE runs SET conversation_id = NULL "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "UPDATE run_events SET conversation_id = NULL "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM conversations WHERE id = ?", (conversation_id,)
+            )
+
+    def add_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        kind: str = "text",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO messages
+                    (conversation_id, role, content, kind, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    role[:16],
+                    content[:20000],
+                    kind[:32],
+                    _dump(payload or {}),
+                    now,
+                ),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (now, conversation_id),
+            )
+            message_id = int(cursor.lastrowid)
+        return {
+            "id": message_id,
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": content,
+            "kind": kind,
+            "payload": payload or {},
+            "created_at": now,
+        }
+
+    def list_messages(
+        self, conversation_id: str, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 2000))
+        with self._connect() as conn:
+            return self._messages(conn, conversation_id, limit)
+
+    @staticmethod
+    def _messages(
+        conn: sqlite3.Connection, conversation_id: str, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT * FROM messages WHERE conversation_id = ?
+                 ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+            """,
+            (conversation_id, max(1, min(int(limit), 2000))),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = _load(item.get("payload"), {})
+            result.append(item)
+        return result
+
+    # -- run events ----------------------------------------------------
+
+    def append_run_event(
+        self,
+        run_id: str,
+        conversation_id: str | None,
+        event: str,
+        payload: dict[str, Any],
+    ) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO run_events
+                    (run_id, conversation_id, event, payload, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    conversation_id,
+                    event[:64],
+                    _dump(payload),
+                    _now(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_run_events(
+        self, run_id: str, after_id: int = 0, limit: int = 2000
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM run_events
+                 WHERE run_id = ? AND id > ?
+                 ORDER BY id ASC LIMIT ?
+                """,
+                (run_id, max(0, int(after_id)), max(1, min(int(limit), 5000))),
+            ).fetchall()
+        return [self._event_dict(row) for row in rows]
+
+    def list_conversation_events(
+        self, conversation_id: str, after_id: int = 0, limit: int = 2000
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM run_events
+                 WHERE conversation_id = ? AND id > ?
+                 ORDER BY id ASC LIMIT ?
+                """,
+                (
+                    conversation_id,
+                    max(0, int(after_id)),
+                    max(1, min(int(limit), 5000)),
+                ),
+            ).fetchall()
+        return [self._event_dict(row) for row in rows]
+
+    @staticmethod
+    def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "run_id": row["run_id"],
+            "conversation_id": row["conversation_id"],
+            "event": row["event"],
+            "payload": _load(row["payload"], {}),
+            "created_at": row["created_at"],
+        }
+
+    # -- task queue ----------------------------------------------------
+
+    def enqueue_task(
+        self,
+        conversation_id: str,
+        goal: str,
+        adapter: str,
+        audit_mode: str = "ai",
+    ) -> dict[str, Any]:
+        task_id = uuid.uuid4().hex[:12]
+        with self._connect() as conn:
+            position = conn.execute(
+                "SELECT COALESCE(MAX(position), 0) + 1 FROM task_queue "
+                "WHERE status = 'queued'"
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO task_queue
+                    (id, conversation_id, goal, adapter, audit_mode,
+                     status, position, created_at)
+                VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    task_id,
+                    conversation_id,
+                    goal[:500],
+                    adapter[:64],
+                    "confirm_all" if audit_mode == "confirm_all" else "ai",
+                    int(position),
+                    _now(),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM task_queue WHERE id = ?", (task_id,)
+            ).fetchone()
+        return dict(row)
+
+    def list_queue(self, status: str = "queued") -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_queue WHERE status = ? "
+                "ORDER BY position ASC, created_at ASC",
+                (status,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def next_queued_task(self) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_queue WHERE status = 'queued' "
+                "ORDER BY position ASC, created_at ASC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_queue_task(self, task_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_queue WHERE id = ?", (task_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_queue_status(
+        self,
+        task_id: str,
+        status: str,
+        run_id: str | None = None,
+    ) -> None:
+        now = _now()
+        started = now if status == "running" else None
+        finished = now if status in {"done", "failed", "cancelled"} else None
+        with self._connect() as conn:
+            if started:
+                conn.execute(
+                    "UPDATE task_queue SET status = ?, run_id = ?, "
+                    "started_at = ? WHERE id = ?",
+                    (status, run_id, started, task_id),
+                )
+            elif finished:
+                conn.execute(
+                    "UPDATE task_queue SET status = ?, finished_at = ? "
+                    "WHERE id = ?",
+                    (status, finished, task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_queue SET status = ? WHERE id = ?",
+                    (status, task_id),
+                )
+
+    def jump_queue_task(self, task_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM task_queue WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] != "queued":
+                return False
+            minimum = conn.execute(
+                "SELECT COALESCE(MIN(position), 1) FROM task_queue "
+                "WHERE status = 'queued'"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE task_queue SET position = ? WHERE id = ?",
+                (int(minimum) - 1, task_id),
+            )
+        return True
+
+    def remove_queue_task(self, task_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM task_queue WHERE id = ?", (task_id,))
+
+    # -- audit decisions -----------------------------------------------
+
+    def record_audit_decision(
+        self,
+        payload: dict[str, Any],
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
+        descriptor = payload.get("operation") or {}
+        verdict = payload.get("verdict") or {}
+        categories = verdict.get("categories") or []
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO audit_decisions
+                    (ts, run_id, conversation_id, operation_id, capability,
+                     action, descriptor, environment, verdict, verdict_json,
+                     risk, categories, source, user_decision, model,
+                     latency_ms, prompt_tokens, completion_tokens,
+                     total_tokens, executed, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _now(),
+                    run_id,
+                    conversation_id,
+                    str(descriptor.get("operation_id") or ""),
+                    str(descriptor.get("capability") or ""),
+                    str(descriptor.get("action") or ""),
+                    _dump(descriptor),
+                    _dump(payload.get("environment") or {}),
+                    str(verdict.get("verdict") or ""),
+                    _dump(verdict),
+                    str(verdict.get("risk") or ""),
+                    _dump(categories),
+                    str(verdict.get("source") or ""),
+                    str(payload.get("user_decision") or ""),
+                    str(verdict.get("model") or ""),
+                    max(0, int(verdict.get("latency_ms") or 0)),
+                    max(0, int(verdict.get("prompt_tokens") or 0)),
+                    max(0, int(verdict.get("completion_tokens") or 0)),
+                    max(0, int(verdict.get("total_tokens") or 0)),
+                    None,
+                    str(payload.get("reason") or "")[:2000],
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def mark_audit_executed(
+        self,
+        run_id: str,
+        operation_id: str,
+        ok: bool,
+        error: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE audit_decisions
+                   SET executed = ?, error = ?
+                 WHERE id = (
+                    SELECT id FROM audit_decisions
+                     WHERE run_id = ? AND operation_id = ?
+                     ORDER BY id DESC LIMIT 1
+                 )
+                """,
+                (
+                    int(bool(ok)),
+                    error[:2000],
+                    run_id,
+                    operation_id,
+                ),
+            )
+
+    def list_audit_decisions(
+        self,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        clauses: list[str] = []
+        values: list[Any] = []
+        if run_id:
+            clauses.append("run_id = ?")
+            values.append(run_id)
+        if conversation_id:
+            clauses.append("conversation_id = ?")
+            values.append(conversation_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM audit_decisions {where} "
+                "ORDER BY id DESC LIMIT ?",
+                values,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["descriptor"] = _load(item.get("descriptor"), {})
+            item["environment"] = _load(item.get("environment"), {})
+            item["verdict_json"] = _load(item.get("verdict_json"), {})
+            item["categories"] = _load(item.get("categories"), [])
+            item["executed"] = (
+                None if item["executed"] is None else bool(item["executed"])
+            )
+            result.append(item)
+        return result
 
     def list_ai_providers(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -216,16 +887,17 @@ class Storage:
             ).fetchall()
             models = conn.execute(
                 """
-                SELECT provider_id, model_id, display_name, vision, source
+                SELECT provider_id, model_id, display_name, vision,
+                       vision_source, source
                   FROM ai_models
-                 ORDER BY vision DESC, model_id COLLATE NOCASE
                 """
             ).fetchall()
         grouped: dict[str, list[dict[str, Any]]] = {}
         for model in models:
-            item = dict(model)
-            item["vision"] = bool(item["vision"])
+            item = _model_record(model)
             grouped.setdefault(item.pop("provider_id"), []).append(item)
+        for items in grouped.values():
+            _sort_models(items)
         result = []
         for row in rows:
             item = dict(row)
@@ -354,20 +1026,28 @@ class Storage:
                 model_id = str(model.get("model_id") or "").strip()
                 if not model_id:
                     continue
+                if model.get("vision_source") == SOURCE_PROVIDER:
+                    vision = bool(model.get("vision"))
+                    vision_source = SOURCE_PROVIDER
+                else:
+                    vision, vision_source = resolve_vision_detail(model_id)
                 conn.execute(
                     """
                     INSERT INTO ai_models
-                        (provider_id, model_id, display_name, vision, source, created_at)
-                    VALUES (?, ?, ?, ?, 'api', ?)
+                        (provider_id, model_id, display_name, vision,
+                         vision_source, source, created_at)
+                    VALUES (?, ?, ?, ?, ?, 'api', ?)
                     ON CONFLICT(provider_id, model_id) DO UPDATE SET
                         display_name = excluded.display_name,
-                        vision = excluded.vision
+                        vision = excluded.vision,
+                        vision_source = excluded.vision_source
                     """,
                     (
                         provider_id,
                         model_id[:200],
                         str(model.get("display_name") or model_id)[:200],
-                        int(bool(model.get("vision"))),
+                        int(vision),
+                        vision_source,
                         now,
                     ),
                 )
@@ -377,46 +1057,43 @@ class Storage:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT model_id, display_name, vision, source
+                SELECT model_id, display_name, vision, vision_source, source
                   FROM ai_models
                  WHERE provider_id = ?
-                 ORDER BY vision DESC, model_id COLLATE NOCASE
                 """,
                 (provider_id,),
             ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["vision"] = bool(item["vision"])
-            result.append(item)
-        return result
+        return _sort_models([_model_record(row) for row in rows])
 
     def add_ai_model(
         self,
         provider_id: str,
         model_id: str,
         display_name: str = "",
-        vision: bool = False,
     ) -> dict[str, Any] | None:
         model_id = model_id.strip()
         if not model_id:
             raise ValueError("model id is required")
+        vision, vision_source = resolve_vision_detail(model_id)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO ai_models
-                    (provider_id, model_id, display_name, vision, source, created_at)
-                VALUES (?, ?, ?, ?, 'custom', ?)
+                    (provider_id, model_id, display_name, vision,
+                     vision_source, source, created_at)
+                VALUES (?, ?, ?, ?, ?, 'custom', ?)
                 ON CONFLICT(provider_id, model_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     vision = excluded.vision,
+                    vision_source = excluded.vision_source,
                     source = 'custom'
                 """,
                 (
                     provider_id,
                     model_id[:200],
                     (display_name.strip() or model_id)[:200],
-                    int(bool(vision)),
+                    int(vision),
+                    vision_source,
                     _now(),
                 ),
             )
@@ -514,7 +1191,7 @@ class Storage:
             ).fetchone()
             model_row = conn.execute(
                 """
-                SELECT model_id, display_name, vision, source
+                SELECT model_id, display_name, vision, vision_source, source
                   FROM ai_models
                  WHERE provider_id = ? AND model_id = ?
                 """,
@@ -529,8 +1206,7 @@ class Storage:
         provider = dict(provider_row)
         provider["has_key"] = bool(provider.get("has_key"))
         provider["requires_key"] = bool(provider.get("requires_key"))
-        model = dict(model_row)
-        model["vision"] = bool(model["vision"])
+        model = _model_record(model_row)
         return {"provider": provider, "model": model}
 
     def record_ai_usage(

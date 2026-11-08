@@ -43,7 +43,9 @@ def _print_event(event: str, payload: dict[str, Any]) -> None:
         print("[busy] desktop lock is held by another process")
 
 
-def _interactive_confirm(action: Action, reason: str) -> bool:
+def _interactive_confirm(
+    action: Action, reason: str, mandatory: bool = False
+) -> bool:
     print(f"\n[confirm] {reason}")
     print(f"  capability: {action.capability}")
     print(f"  args: {json.dumps(action.args, ensure_ascii=False)}")
@@ -102,7 +104,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         config.runtime.lock_path, config.runtime.lock_ttl_seconds
     )
     confirm = (
-        (lambda action, reason: True)
+        (
+            lambda action, reason, mandatory=False: (
+                _interactive_confirm(action, reason) if mandatory else True
+            )
+        )
         if args.yes
         else _interactive_confirm
     )
@@ -255,7 +261,7 @@ def _cmd_demo(_: argparse.Namespace) -> int:
         lock=lock,
         max_steps=6,
         max_consecutive_failures=2,
-        confirm=lambda action, reason: True,
+        confirm=lambda action, reason, mandatory=False: True,
         on_event=_print_event,
     )
     result = runtime.run("在记事本中输入 hello 并保存")

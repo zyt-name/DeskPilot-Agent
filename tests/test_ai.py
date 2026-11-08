@@ -22,7 +22,7 @@ from xm_agent.ai.factory import build_active_provider
 from xm_agent.ai.models import ModelListError, fetch_models
 from xm_agent.ai.service import AiService
 from xm_agent.bootstrap import build_provider
-from xm_agent.config import AgentConfig
+from xm_agent.config import AdapterConfig, AgentConfig
 from xm_agent.providers.anthropic import AnthropicProvider
 from xm_agent.providers.common import supports_temperature
 from xm_agent.providers.fake import HeuristicMockProvider
@@ -144,8 +144,13 @@ def test_catalog_covers_vendors_plans_and_vision():
     assert is_vision_model("gpt-4o-mini")
     assert is_vision_model("claude-3-5-sonnet-latest")
     assert is_vision_model("glm-4v")
+    assert is_vision_model("qwen2.5-vl-72b-instruct")
+    assert is_vision_model("gemini-2.5-pro")
     assert not is_vision_model("deepseek-chat")
     assert not is_vision_model("gpt-3.5-turbo")
+    assert not is_vision_model("glm-5.3-flash")
+    assert not is_vision_model("o1-mini")
+    assert not is_vision_model("gemini-1.0-pro")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
@@ -244,6 +249,144 @@ def test_fetch_models_marks_vision_and_test_records_usage(tmp_path):
         ][0]
         headers = {key.lower(): value for key, value in request["headers"].items()}
         assert headers.get("authorization") == "Bearer sk-local-test"
+
+
+def test_provider_metadata_field_shapes():
+    from xm_agent.model_caps import reported_vision
+
+    assert (
+        reported_vision(
+            {"architecture": {"input_modalities": ["text", "image"]}}
+        )
+        is True
+    )
+    assert reported_vision({"supported_input_modalities": ["text"]}) is False
+    assert reported_vision({"supports_image_in": True}) is True
+    assert reported_vision({"modality": "text+image->text"}) is True
+    assert reported_vision({"modality": "text->image"}) is None
+    assert (
+        reported_vision(
+            {"capabilities": {"image_input": {"supported": False}}}
+        )
+        is False
+    )
+    assert reported_vision({"capabilities": ["completion"]}) is None
+
+
+def test_vision_uses_provider_metadata_and_ignores_manual_flags(tmp_path):
+    with _mock_server() as api:
+        api.add(
+            "GET",
+            "/v1/models",
+            {
+                "data": [
+                    {
+                        "id": "custom-omni",
+                        "architecture": {"input_modalities": ["text", "image"]},
+                    },
+                    {
+                        "id": "gpt-4o",
+                        "architecture": {"input_modalities": ["text"]},
+                    },
+                    {"id": "brand-new-model"},
+                ]
+            },
+        )
+        service = AiService(Storage(tmp_path / "app.db"))
+        provider = _custom_openai(service, api)
+        models = {
+            model["model_id"]: model
+            for model in service.fetch_models(provider["id"])
+        }
+        assert models["custom-omni"]["vision"] is True
+        assert models["custom-omni"]["vision_source"] == "provider"
+        assert models["gpt-4o"]["vision"] is False
+        assert models["brand-new-model"]["vision"] is False
+        assert models["brand-new-model"]["vision_source"] == "unknown"
+
+        with service.storage._connect() as conn:
+            conn.execute(
+                "UPDATE ai_models SET vision = 1, vision_source = '' "
+                "WHERE provider_id = ? AND model_id = 'brand-new-model'",
+                (provider["id"],),
+            )
+        stored = {
+            model["model_id"]: model
+            for model in service.storage.list_ai_models(provider["id"])
+        }
+        assert stored["brand-new-model"]["vision"] is False
+
+        assert service.add_model(provider["id"], "glm-5.3-flash")["vision"] is False
+        assert service.add_model(provider["id"], "qwen2.5-vl-7b")["vision"] is True
+
+
+def test_anthropic_list_reads_image_capability(tmp_path):
+    with _mock_server() as api:
+        api.add(
+            "GET",
+            "/v1/models?limit=100",
+            {
+                "data": [
+                    {
+                        "id": "claude-3-5-sonnet-20241022",
+                        "capabilities": {
+                            "image_input": {"supported": True}
+                        },
+                    },
+                    {
+                        "id": "claude-3-5-haiku-20241022",
+                        "capabilities": {
+                            "image_input": {"supported": False}
+                        },
+                    },
+                ]
+            },
+        )
+        provider = {
+            "base_url": api.base,
+            "models_style": "anthropic",
+            "preset_id": "custom",
+            "plan_id": "anthropic",
+        }
+        models = {
+            model["model_id"]: model
+            for model in fetch_models(provider, "sk-test")
+        }
+        assert models["claude-3-5-sonnet-20241022"]["vision"] is True
+        assert models["claude-3-5-haiku-20241022"]["vision"] is False
+        assert models["claude-3-5-haiku-20241022"]["vision_source"] == "provider"
+
+
+def test_ollama_list_reads_families_and_capabilities(tmp_path):
+    with _mock_server() as api:
+        api.add(
+            "GET",
+            "/api/tags",
+            {
+                "models": [
+                    {
+                        "name": "llava:latest",
+                        "details": {"families": ["llama", "clip"]},
+                    },
+                    {
+                        "name": "llama3.2:latest",
+                        "details": {"families": ["llama"]},
+                        "capabilities": ["completion"],
+                    },
+                ]
+            },
+        )
+        provider = {
+            "base_url": api.base.replace("/v1", ""),
+            "models_style": "ollama",
+        }
+        models = {
+            model["model_id"]: model
+            for model in fetch_models(provider, "")
+        }
+        assert models["llava:latest"]["vision"] is True
+        assert models["llava:latest"]["vision_source"] == "provider"
+        assert models["llama3.2:latest"]["vision"] is False
 
 
 def test_model_list_error_payload_is_reported(tmp_path):
@@ -358,7 +501,7 @@ def test_active_provider_uses_plan_endpoint_for_stale_row(tmp_path):
             "api_key_hint": secret_hint("sk-test"),
         }
     )
-    storage.add_ai_model("legacy-active", "glm-4.6", "glm-4.6", False)
+    storage.add_ai_model("legacy-active", "glm-4.6", "glm-4.6")
     storage.set_active_ai("legacy-active", "glm-4.6")
     provider = build_active_provider(storage)
     assert isinstance(provider, AnthropicProvider)
@@ -518,7 +661,7 @@ def test_anthropic_provider_uses_messages_api(tmp_path):
             }
         )
         service.add_model(
-            provider["id"], "claude-3-5-sonnet-latest", vision=True
+            provider["id"], "claude-3-5-sonnet-latest"
         )
         result = service.test_provider(
             provider["id"], "claude-3-5-sonnet-latest"
@@ -547,7 +690,7 @@ def test_disabled_requires_key_allows_local_ollama(tmp_path):
         }
     )
     assert provider["requires_key"] is False
-    service.add_model(provider["id"], "llama3.2", vision=False)
+    service.add_model(provider["id"], "llama3.2")
     built = build_active_provider(storage, timeout_seconds=5)
     assert built is not None
     assert built.keyless is True
@@ -578,6 +721,21 @@ def test_build_provider_prefers_active_model_then_mock(tmp_path):
     service.add_model(provider["id"], "llama3.2")
     built = build_provider(config, "mock", storage=storage, source="test")
     assert built.provider_model == "llama3.2"
+
+
+def test_build_provider_requires_vision_for_computer_use():
+    config = AgentConfig()
+    config.adapters["computer_use"] = AdapterConfig(kind="computer_use_mcp")
+    config.model.provider = "openai_compat"
+    config.model.base_url = "http://127.0.0.1:9"
+    config.model.model = "glm-5.3-flash"
+
+    with pytest.raises(RuntimeError, match="纯文本模型"):
+        build_provider(config, "computer_use")
+
+    config.model.model = "gpt-4o"
+    built = build_provider(config, "computer_use")
+    assert built.vision is True
 
 
 def test_supports_temperature_for_reasoning_models():

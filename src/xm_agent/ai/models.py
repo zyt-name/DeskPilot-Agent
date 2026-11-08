@@ -6,7 +6,8 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from .catalog import is_chat_model, is_vision_model, plan_by_id
+from ..model_caps import reported_vision, resolve_vision_detail
+from .catalog import is_chat_model, plan_by_id
 
 
 class ModelListError(RuntimeError):
@@ -53,13 +54,21 @@ def _get_json(url: str, headers: dict[str, str], timeout: int = 20) -> Any:
 
 
 def _model_item(
-    model_id: str, display_name: str = "", vision: bool | None = None
+    model_id: str,
+    display_name: str = "",
+    *,
+    reported: bool | None = None,
+    families: list[str] | None = None,
 ) -> dict[str, Any]:
     model_id = model_id.strip()
+    vision, vision_source = resolve_vision_detail(
+        model_id, reported=reported, families=families
+    )
     return {
         "model_id": model_id,
         "display_name": (display_name or model_id).strip()[:200],
-        "vision": is_vision_model(model_id) if vision is None else bool(vision),
+        "vision": vision,
+        "vision_source": vision_source,
         "source": "api",
     }
 
@@ -99,7 +108,9 @@ def _openai_style(
             continue
         model_id = str(entry.get("id") or entry.get("name") or "")
         display = str(entry.get("display_name") or entry.get("name") or model_id)
-        items.append(_model_item(model_id, display))
+        items.append(
+            _model_item(model_id, display, reported=reported_vision(entry))
+        )
     return _clean(items)
 
 
@@ -128,7 +139,9 @@ def _anthropic_style(
             continue
         model_id = str(entry.get("id") or "")
         display = str(entry.get("display_name") or model_id)
-        items.append(_model_item(model_id, display))
+        items.append(
+            _model_item(model_id, display, reported=reported_vision(entry))
+        )
     return _clean(items)
 
 
@@ -160,7 +173,11 @@ def _gemini_style(
         if any(marker in model_id.casefold() for marker in ("embedding", "aqa")):
             continue
         items.append(
-            _model_item(model_id, str(entry.get("displayName") or model_id))
+            _model_item(
+                model_id,
+                str(entry.get("displayName") or model_id),
+                reported=reported_vision(entry),
+            )
         )
     return _clean(items)
 
@@ -182,10 +199,18 @@ def _ollama_style(
         if not isinstance(entry, dict):
             continue
         model_id = str(entry.get("name") or entry.get("model") or "")
-        details = entry.get("details") or {}
+        details = entry.get("details")
+        if not isinstance(details, dict):
+            details = {}
         families = details.get("families") or []
-        vision = "clip" in families or is_vision_model(model_id)
-        items.append(_model_item(model_id, model_id, vision))
+        items.append(
+            _model_item(
+                model_id,
+                model_id,
+                reported=reported_vision(entry),
+                families=families if isinstance(families, list) else None,
+            )
+        )
     return _clean(items)
 
 

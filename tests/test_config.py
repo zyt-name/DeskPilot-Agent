@@ -1,3 +1,4 @@
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("xshell", config.adapters)
         self.assertEqual(config.adapters["windows"].kind, "windows_mcp")
         self.assertEqual(config.adapters["windows"].env["POSTHOG_API_KEY"], "")
+        self.assertIn("--config", config.adapters["windows"].command)
+        windows_config = tomllib.loads(
+            (ROOT / "config" / "windows-mcp.toml").read_text(encoding="utf-8")
+        )
+        self.assertFalse(windows_config["control"]["enabled"])
         self.assertEqual(config.adapters["xshell"].kind, "xshell_mcp")
         self.assertEqual(config.adapters["xshell"].tools["exec"], "xshell_exec")
         self.assertIn("computer_use", config.adapters)
@@ -29,9 +35,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             config.adapters["computer_use"].tools["computer"], "computer"
         )
+        for name in ("xshell", "computer_use"):
+            adapter = config.adapters[name]
+            self.assertEqual(adapter.command[0], "node")
+            # Node resolves the script argument against cwd, so it must not
+            # repeat the vendor/<name> prefix already implied by cwd.
+            self.assertFalse(adapter.command[1].startswith("vendor/"))
+            self.assertFalse(adapter.command[1].startswith("vendor\\"))
+            self.assertTrue(adapter.cwd.startswith("vendor/"))
         self.assertIn("echo", config.policy.allowed_command_prefixes)
         self.assertEqual(config.model.provider, "openai_compat")
-        self.assertFalse(config.model.vision)
 
 
 if __name__ == "__main__":

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 import unittest
+import unittest.mock
 
-from xm_agent.adapters.windows_mcp import WindowsMcpAdapter, parse_snapshot
+from xm_agent.adapters.windows_mcp import (
+    WindowsMcpAdapter,
+    _exact_expect,
+    parse_snapshot,
+)
 
 SNAPSHOT = """Cursor Position: (100,200)
 Screenshot Size: (1920,1080)
@@ -55,6 +60,14 @@ class SnapshotParseTests(unittest.TestCase):
         self.assertEqual(elements[3].name, "开始")
         self.assertEqual(windows, ["Untitled - Notepad"])
         self.assertEqual(active, "Untitled - Notepad")
+
+    def test_exact_expect_extracts_quoted_text_or_url(self) -> None:
+        self.assertEqual(_exact_expect("出现「运行」对话框"), "运行")
+        self.assertEqual(_exact_expect('window "GitHub" is open'), "GitHub")
+        self.assertEqual(
+            _exact_expect("输入框里显示 https://github.com"), "https://github.com"
+        )
+        self.assertEqual(_exact_expect("GitHub"), "GitHub")
 
     def test_survives_missing_sections(self) -> None:
         elements, windows, active = parse_snapshot("UI Tree:\ndesktop\n")
@@ -164,6 +177,43 @@ class WindowsAdapterTests(unittest.TestCase):
         args = self.client.calls[-1][1]
         self.assertEqual(args["condition"], "element_exists")
         self.assertEqual(args["text"], "保存")
+
+    def test_user_control_waits_and_retries_once(self) -> None:
+        class _GuardedClient(_StubClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocked = True
+
+            def call_tool(self, name: str, arguments: dict) -> dict:
+                if name == "Shortcut" and self.blocked:
+                    self.blocked = False
+                    self.calls.append((name, arguments))
+                    status = {
+                        "code": "USER_CONTROL",
+                        "status": {"state": "user", "wait_seconds": 0.5},
+                    }
+                    return {
+                        "isError": True,
+                        "content": [
+                            {"type": "text", "text": json.dumps(status)}
+                        ],
+                    }
+                return super().call_tool(name, arguments)
+
+        client = _GuardedClient()
+        adapter = WindowsMcpAdapter(client)
+        with unittest.mock.patch(
+            "xm_agent.adapters.windows_mcp.time.sleep"
+        ) as sleep:
+            receipt = adapter.execute(
+                "desktop.act", {"action": "key", "keys": "win+r"}
+            )
+        self.assertTrue(receipt.ok)
+        sleep.assert_called_once()
+        self.assertGreaterEqual(sleep.call_args.args[0], 0.5)
+        self.assertEqual(
+            [call[0] for call in client.calls], ["Shortcut", "Shortcut"]
+        )
 
     def test_numeric_element_id_is_not_a_label(self) -> None:
         self.adapter.observe(1)

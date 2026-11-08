@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 
 from ..config import AgentConfig
+from .hotkey import GlobalHotkey
+from .overlay import ScreenIndicator
 from .server import STATIC_DIR, UiServer
 from .window import open_window
 
@@ -14,10 +16,16 @@ def run_gui(
     debug: bool = False,
     server_only: bool = False,
 ) -> int:
-    server = UiServer(config, db_path=db_path, port=port)
+    indicator = ScreenIndicator()
+    indicator.start()
+    server = UiServer(config, db_path=db_path, port=port, indicator=indicator)
     url = server.start()
+    hotkey = GlobalHotkey(server.toggle_pause_active)
+    server.native_hotkey = hotkey.start()
     print(f"[ui] local api: {url}")
     print(f"[ui] database: {server.storage.path.resolve()}")
+    if server.native_hotkey:
+        print("[ui] global F8 pause enabled")
     try:
         if server_only:
             print("[ui] server-only mode, press Ctrl+C to stop")
@@ -28,6 +36,8 @@ def run_gui(
                 return 0
         return open_window(url, debug=debug)
     finally:
+        hotkey.stop()
+        indicator.close()
         server.stop()
 
 

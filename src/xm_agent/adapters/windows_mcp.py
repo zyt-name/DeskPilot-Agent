@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 from ..mcp_stdio import MCPError, StdioMCPClient
@@ -176,7 +177,11 @@ class WindowsMcpAdapter(McpToolAdapter):
     def verify(self, expect: str | dict[str, Any] | None) -> Verification:
         if expect is None:
             return Verification(True, "no expectation")
-        args = expect if isinstance(expect, dict) else {"text": str(expect)}
+        args = (
+            expect
+            if isinstance(expect, dict)
+            else {"text": _exact_expect(str(expect))}
+        )
         try:
             data = self._call("wait_for", self._wait_args(args))
         except MCPError as exc:
@@ -223,10 +228,31 @@ class WindowsMcpAdapter(McpToolAdapter):
             return self._receipt(self._call("move", self._loc(args)))
         return Receipt(False, error=f"unsupported desktop action: {action}")
 
+    def _call(
+        self, tool_key: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        data = super()._call(tool_key, arguments)
+        deadline = time.monotonic() + 30.0
+        while True:
+            wait = _user_control_wait(data)
+            if wait is None:
+                return data
+            # The human at the desk keeps priority; wait for a full idle window
+            # instead of turning the transient guard into a task error.
+            if time.monotonic() + wait + 0.25 > deadline:
+                return data
+            time.sleep(wait + 0.25)
+            data = super()._call(tool_key, arguments)
+
     def _loc(self, args: dict[str, Any]) -> dict[str, Any]:
         if args.get("x") is not None and args.get("y") is not None:
             return {"loc": [int(args["x"]), int(args["y"])]}
         element_id = str(args.get("element_id", ""))
+        if not element_id:
+            raise MCPError(
+                "action requires element_id or x/y; browser address bars are "
+                "not in the UIA tree, so use Win+R to enter URLs"
+            )
         coords = self._coords.get(element_id)
         if coords is None:
             raise MCPError(
@@ -264,6 +290,46 @@ class WindowsMcpAdapter(McpToolAdapter):
             raise MCPError("wait requires text, window or element_id")
         payload["timeout"] = float(timeout)
         return payload
+
+
+_QUOTED_RE = re.compile(r"[「\"“'‘]([^」\"”'’]{1,80})[」\"”'’]")
+_URL_RE = re.compile(r"https?://[^\s，。；、）)」\"”'’]+")
+
+
+def _exact_expect(value: str) -> str:
+    """Turn a model-written expectation into text WaitFor can match.
+
+    WaitFor does exact UIA text matching, but models often phrase expect as a
+    sentence (``出现「运行」对话框``). Prefer the quoted fragment or URL inside
+    it; otherwise keep the original text.
+    """
+    text = value.strip()
+    quoted = _QUOTED_RE.search(text)
+    if quoted:
+        return quoted.group(1).strip()
+    url = _URL_RE.search(text)
+    if url:
+        return url.group(0).strip()
+    return text
+
+
+def _user_control_wait(data: dict[str, Any]) -> float | None:
+    error = data.get("error")
+    payload: Any = error
+    if isinstance(error, str):
+        try:
+            payload = json.loads(error)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(payload, dict) or payload.get("code") != "USER_CONTROL":
+        return None
+    status = payload.get("status")
+    if not isinstance(status, dict):
+        return 0.0
+    try:
+        return max(0.0, float(status.get("wait_seconds") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _text_of(result: dict[str, Any]) -> str:

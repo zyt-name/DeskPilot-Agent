@@ -23,6 +23,17 @@ class AuditConfig:
 
 
 @dataclass
+class AuditAiConfig:
+    mode: str = "ai"
+    model_provider_id: str = ""
+    model_id: str = ""
+    timeout_seconds: int = 12
+    fail_closed: bool = True
+    protected_paths: list[str] = field(default_factory=list)
+    always_confirm: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ModelConfig:
     provider: str = "fake"
     base_url: str = "https://api.openai.com/v1"
@@ -30,7 +41,6 @@ class ModelConfig:
     api_key_env: str = "OPENAI_API_KEY"
     timeout_seconds: int = 60
     temperature: float = 0.0
-    vision: bool = False
 
 
 @dataclass
@@ -55,6 +65,7 @@ class AdapterConfig:
 class AgentConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
+    audit_ai: AuditAiConfig = field(default_factory=AuditAiConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     adapters: dict[str, AdapterConfig] = field(
@@ -100,6 +111,7 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     runtime_raw = data.get("runtime", {})
     audit_raw = data.get("audit", {})
+    audit_ai_raw = data.get("audit_ai", {})
     model_raw = data.get("model", {})
     policy_raw = data.get("policy", {})
     adapters_raw = data.get("adapters", {})
@@ -122,6 +134,43 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         root=str(audit_raw.get("root", defaults.audit.root)),
         keep_days=int(audit_raw.get("keep_days", defaults.audit.keep_days)),
     )
+    audit_ai_mode = str(
+        audit_ai_raw.get("mode", defaults.audit_ai.mode)
+    ).strip().casefold()
+    if audit_ai_mode not in {"ai", "confirm_all"}:
+        raise ValueError(
+            "audit_ai.mode must be 'ai' or 'confirm_all'; "
+            "turning auditing off is not supported"
+        )
+    audit_ai = AuditAiConfig(
+        mode=audit_ai_mode,
+        model_provider_id=str(
+            audit_ai_raw.get(
+                "model_provider_id", defaults.audit_ai.model_provider_id
+            )
+        ),
+        model_id=str(
+            audit_ai_raw.get("model_id", defaults.audit_ai.model_id)
+        ),
+        timeout_seconds=int(
+            audit_ai_raw.get(
+                "timeout_seconds", defaults.audit_ai.timeout_seconds
+            )
+        ),
+        fail_closed=bool(
+            audit_ai_raw.get(
+                "fail_closed", defaults.audit_ai.fail_closed
+            )
+        ),
+        protected_paths=_str_list(
+            audit_ai_raw.get("protected_paths"),
+            defaults.audit_ai.protected_paths,
+        ),
+        always_confirm=_str_list(
+            audit_ai_raw.get("always_confirm"),
+            defaults.audit_ai.always_confirm,
+        ),
+    )
     model = ModelConfig(
         provider=str(model_raw.get("provider", defaults.model.provider)),
         base_url=str(model_raw.get("base_url", defaults.model.base_url)),
@@ -133,7 +182,6 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         temperature=float(
             model_raw.get("temperature", defaults.model.temperature)
         ),
-        vision=bool(model_raw.get("vision", defaults.model.vision)),
     )
     policy = PolicyConfig(
         allowed_capabilities=_str_list(
@@ -167,6 +215,7 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
     return AgentConfig(
         runtime=runtime,
         audit=audit,
+        audit_ai=audit_ai,
         model=model,
         policy=policy,
         adapters=adapters,

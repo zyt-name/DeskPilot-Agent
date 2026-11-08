@@ -10,12 +10,15 @@ from typing import Any
 from ..contracts import CAPABILITIES
 from ..types import Action, Observation, StepRecord
 from .common import (
+    VERIFY_SYSTEM_PROMPT,
+    DeltaCallback,
     UsageCallback,
     history_compact,
     image_data,
     normalize_usage,
     observation_text,
     parse_action_json,
+    parse_verdict_json,
     supports_temperature,
     system_prompt,
     usage_with_latency,
@@ -24,6 +27,22 @@ from .common import (
 
 class ProviderError(RuntimeError):
     pass
+
+
+def _content_parts(content: Any) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text") or block.get("content")
+                if text:
+                    parts.append(str(text))
+            elif isinstance(block, str):
+                parts.append(block)
+        return parts
+    return []
 
 
 class OpenAICompatProvider:
@@ -65,17 +84,24 @@ class OpenAICompatProvider:
         observation: Observation,
         history: list[StepRecord],
         remaining_steps: int,
+        *,
+        instructions: list[str] | None = None,
+        on_delta: DeltaCallback | None = None,
     ) -> Action:
         messages = [
             {"role": "system", "content": system_prompt()},
             {
                 "role": "user",
                 "content": self._user_content(
-                    goal, observation, history, remaining_steps
+                    goal,
+                    observation,
+                    history,
+                    remaining_steps,
+                    instructions=instructions,
                 ),
             },
         ]
-        content, _, _ = self._chat(messages)
+        content, _, _ = self._chat(messages, on_delta=on_delta)
         parsed = self._parse_json(content)
         capability = str(parsed.get("capability") or parsed.get("tool") or "")
         if capability not in CAPABILITIES:
@@ -90,6 +116,23 @@ class OpenAICompatProvider:
             rationale=str(parsed.get("rationale", "")),
             expect=str(expect) if expect is not None else None,
         )
+
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 800,
+        on_delta: DeltaCallback | None = None,
+    ) -> str:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        text, _, _ = self._chat(
+            messages, max_tokens=max_tokens, on_delta=on_delta
+        )
+        return text
 
     def ping(self) -> dict[str, Any]:
         messages = [
@@ -107,8 +150,40 @@ class OpenAICompatProvider:
             "latency_ms": latency,
         }
 
+    def verify_completion(
+        self, goal: str, summary: str, screenshot_path: str | None
+    ) -> tuple[bool, str]:
+        image = image_data(screenshot_path) if self.vision else None
+        if image is None:
+            return False, "no vision capability or screenshot to verify"
+        mime, encoded = image
+        payload = json.dumps(
+            {"goal": goal, "claimed_summary": summary}, ensure_ascii=False
+        )
+        messages = [
+            {"role": "system", "content": VERIFY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": payload},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime};base64,{encoded}",
+                        },
+                    },
+                ],
+            },
+        ]
+        content, _, _ = self._chat(messages, max_tokens=400)
+        return parse_verdict_json(content)
+
     def _chat(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        on_delta: DeltaCallback | None = None,
     ) -> tuple[str, dict[str, int], int]:
         api_key = self._api_key()
         if self.requires_key and not api_key:
@@ -120,8 +195,13 @@ class OpenAICompatProvider:
             "model": self.model,
             "messages": messages,
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if supports_temperature(self.model):
             payload["temperature"] = self.temperature
+        stream = on_delta is not None
+        if stream:
+            payload["stream"] = True
 
         url = self.base_url
         if not url:
@@ -143,7 +223,13 @@ class OpenAICompatProvider:
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds
             ) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                content_type = response.headers.get("Content-Type", "")
+                if stream and "text/event-stream" in content_type:
+                    text, usage_raw = self._stream(response, on_delta)
+                else:
+                    data = json.loads(response.read().decode("utf-8"))
+                    text = self._message_text(data)
+                    usage_raw = data.get("usage") or {}
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:1200]
             raise ProviderError(f"model HTTP {exc.code}: {body}") from exc
@@ -152,11 +238,75 @@ class OpenAICompatProvider:
         except json.JSONDecodeError as exc:
             raise ProviderError(f"invalid model response JSON: {exc}") from exc
         latency = int((time.monotonic() - started) * 1000)
-        text = self._message_text(data)
-        usage = normalize_usage(data.get("usage"))
+        usage = normalize_usage(usage_raw)
+        if usage["total_tokens"] <= 0:
+            usage = self._estimate_usage(messages, text)
         if self.on_usage is not None:
             self.on_usage(usage_with_latency(usage, latency))
         return text, usage, latency
+
+    def _stream(
+        self,
+        response: Any,
+        on_delta: DeltaCallback,
+    ) -> tuple[str, dict[str, Any]]:
+        text_parts: list[str] = []
+        usage: dict[str, Any] = {}
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            chunk_text = line[5:].strip()
+            if chunk_text == "[DONE]":
+                break
+            try:
+                chunk = json.loads(chunk_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            choices = chunk.get("choices")
+            if not isinstance(choices, list):
+                continue
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or choice.get("message") or {}
+                if not isinstance(delta, dict):
+                    continue
+                reasoning = delta.get("reasoning_content") or delta.get(
+                    "reasoning"
+                )
+                if reasoning:
+                    on_delta("thinking", str(reasoning))
+                for part in _content_parts(delta.get("content")):
+                    if not part:
+                        continue
+                    text_parts.append(part)
+                    on_delta("text", part)
+        return "".join(text_parts), usage
+
+    def _estimate_usage(
+        self, messages: list[dict[str, Any]], text: str
+    ) -> dict[str, int]:
+        prompt_chars = 0
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str):
+                prompt_chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        prompt_chars += len(str(block.get("text", "")))
+        prompt = max(1, prompt_chars // 4)
+        completion = max(1, len(text) // 4) if text else 0
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        }
 
     def _api_key(self) -> str:
         if self.api_key is not None:
@@ -169,11 +319,18 @@ class OpenAICompatProvider:
         observation: Observation,
         history: list[StepRecord],
         remaining_steps: int,
+        *,
+        instructions: list[str] | None = None,
     ) -> str | list[dict[str, Any]]:
-        text = observation_text(goal, observation, history, remaining_steps)
-        if not self.vision:
-            return text
-        image = image_data(observation.screenshot_path)
+        image = image_data(observation.screenshot_path) if self.vision else None
+        text = observation_text(
+            goal,
+            observation,
+            history,
+            remaining_steps,
+            instructions=instructions,
+            screenshot_attached=image is not None,
+        )
         if image is None:
             return text
         mime, encoded = image

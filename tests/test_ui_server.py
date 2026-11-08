@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
 
 import pytest
 
+import xm_agent.ui.server as server_module
+from xm_agent.adapters.mock import MockAdapter
 from xm_agent.ai.crypto import decrypt_secret
 from xm_agent.config import AdapterConfig, AgentConfig
+from xm_agent.control import RunControl, RunPreempted
+from xm_agent.providers.fake import HeuristicMockProvider
+from xm_agent.types import Action
+from xm_agent.ui.hotkey import GlobalHotkey
+from xm_agent.ui.overlay import ScreenIndicator
 from xm_agent.ui.server import UiServer
 
 
@@ -57,6 +65,19 @@ def server(tmp_path):
         app.stop()
 
 
+class _RecordingIndicator:
+    available = True
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def show(self) -> None:
+        self.events.append("show")
+
+    def hide(self) -> None:
+        self.events.append("hide")
+
+
 def test_bootstrap_returns_token_and_config(server):
     app, url = server
     status, data = _request(url + "api/bootstrap")
@@ -65,6 +86,66 @@ def test_bootstrap_returns_token_and_config(server):
     assert data["profile"]["display_name"]
     assert data["config"]["adapters"] == ["mock"]
     assert data["config"]["model"]["api_key_env"]
+    assert data["hotkey"] == {"enabled": False, "key": "F8"}
+    assert data["screen_indicator"] is False
+
+
+def test_bootstrap_reports_native_hotkey(server):
+    app, url = server
+    app.native_hotkey = True
+    _, data = _request(url + "api/bootstrap")
+    assert data["hotkey"] == {"enabled": True, "key": "F8"}
+
+
+def test_screen_indicator_wraps_desktop_run(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.adapters["windows"] = AdapterConfig(kind="windows_mcp")
+    indicator = _RecordingIndicator()
+    app = UiServer(
+        config,
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+        indicator=indicator,
+    )
+    monkeypatch.setattr(server_module, "build_adapter", lambda *a, **k: MockAdapter())
+    monkeypatch.setattr(
+        server_module, "build_provider", lambda *a, **k: HeuristicMockProvider()
+    )
+    app.start()
+    try:
+        app._active.acquire()
+        run_id = app._launch_run("输入 hello 并保存", "windows", True, None, "ai")
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            stored = app.storage.get_run(run_id)
+            if stored is not None and stored["status"] != "running":
+                break
+            time.sleep(0.05)
+        assert stored["status"] == "done"
+        assert indicator.events == ["show", "hide"]
+    finally:
+        app.stop()
+
+
+def test_mock_run_does_not_show_screen_indicator(server):
+    app, url = server
+    indicator = _RecordingIndicator()
+    app.indicator = indicator
+    status, started = _request(
+        url + "api/runs",
+        method="POST",
+        body={"goal": "输入 hello 并保存", "adapter": "mock", "auto_confirm": True},
+        token=app.token,
+    )
+    assert status == 202
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        _, run = _request(url + f"api/runs/{started['id']}")
+        if run["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert run["status"] == "done"
+    assert indicator.events == []
 
 
 def test_static_index_is_served(server):
@@ -240,11 +321,12 @@ def test_ai_model_active_and_usage_endpoints(server):
             "provider_id": provider_id,
             "model_id": "llama3.2",
             "display_name": "Llama 3.2",
-            "vision": False,
+            "vision": True,
         },
         token=app.token,
     )
     assert status == 200
+    assert data["model"]["vision"] is False
     assert data["ai"]["active"]["model"] == "llama3.2"
 
     status, data = _request(
@@ -265,6 +347,433 @@ def test_ai_model_active_and_usage_endpoints(server):
     assert status == 200
     assert bootstrap["ai"]["active"]["model"] == "llama3.2"
     assert "api_key_enc" not in json.dumps(bootstrap)
+
+
+def test_conversation_crud_endpoints(server):
+    app, url = server
+    status, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"title": "清理任务", "adapter": "mock", "audit_mode": "ai"},
+        token=app.token,
+    )
+    assert status == 201
+    conversation = data["conversation"]
+    assert conversation["audit_mode"] == "ai"
+
+    status, listed = _request(url + "api/conversations")
+    assert status == 200
+    assert listed["conversations"][0]["id"] == conversation["id"]
+
+    status, data = _request(
+        url + "api/conversations/update",
+        method="POST",
+        body={"id": conversation["id"], "audit_mode": "confirm_all"},
+        token=app.token,
+    )
+    assert status == 200
+    assert data["conversation"]["audit_mode"] == "confirm_all"
+
+    status, detail = _request(url + f"api/conversations/{conversation['id']}")
+    assert status == 200
+    assert detail["messages"] == []
+    assert detail["queue"] == []
+
+    status, _ = _request(
+        url + "api/conversations/update",
+        method="POST",
+        body={"id": conversation["id"], "audit_mode": "off"},
+        token=app.token,
+    )
+    assert status == 400
+
+    status, _ = _request(
+        url + "api/conversations/delete",
+        method="POST",
+        body={"id": conversation["id"]},
+        token=app.token,
+    )
+    assert status == 200
+    status, _ = _request(url + f"api/conversations/{conversation['id']}")
+    assert status == 404
+
+
+def test_auto_confirm_does_not_bypass_mandatory_review(server, monkeypatch):
+    app, _ = server
+    calls: list[str] = []
+
+    def fake_confirm(run_id, action, prompt):
+        calls.append(prompt)
+        return False
+
+    monkeypatch.setattr(app, "request_confirmation", fake_confirm)
+    action = Action("terminal.exec", {"command": "type C:/other/notes.txt"})
+    assert (
+        app._confirm_action("run-1", action, "prompt", False, True) is True
+    )
+    assert app._confirm_action("run-1", action, "prompt", True, True) is False
+    assert calls == ["prompt"]
+
+
+def test_paused_run_state_is_reported(server):
+    app, url = server
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"title": "暂停任务", "adapter": "mock"},
+        token=app.token,
+    )
+    conversation_id = data["conversation"]["id"]
+    run_id = "run-paused"
+    app.storage.create_run(run_id, "暂停测试", "mock", conversation_id)
+    control = _register_running(app, run_id)
+    control.pause("用户暂停")
+
+    _, detail = _request(url + f"api/conversations/{conversation_id}")
+    runs = [run for run in detail["runs"] if run["id"] == run_id]
+    assert runs and runs[0]["paused"] is True
+    assert runs[0]["pause_reason"] == "用户暂停"
+
+    _, run = _request(url + f"api/runs/{run_id}")
+    assert run["paused"] is True
+
+    control.resume()
+    _, detail = _request(url + f"api/conversations/{conversation_id}")
+    runs = [run for run in detail["runs"] if run["id"] == run_id]
+    assert runs and runs[0]["paused"] is False
+
+
+def test_busy_task_is_queued_and_then_executed(server):
+    app, url = server
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"title": "", "adapter": "mock"},
+        token=app.token,
+    )
+    conversation_id = data["conversation"]["id"]
+
+    app._active.acquire()
+    try:
+        status, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "输入 hello 并保存",
+                "adapter": "mock",
+                "conversation_id": conversation_id,
+            },
+            token=app.token,
+        )
+        assert status == 202
+        assert started["queued"] is True
+        task_id = started["task"]["id"]
+
+        status, queue_data = _request(url + "api/queue")
+        assert [item["id"] for item in queue_data["queued"]] == [task_id]
+
+        status, _ = _request(
+            url + "api/queue/jump",
+            method="POST",
+            body={"id": task_id},
+            token=app.token,
+        )
+        assert status == 200
+    finally:
+        app._active.release()
+
+    app._start_next_queued()
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        task = app.storage.get_queue_task(task_id)
+        if task["status"] in {"done", "failed", "cancelled"}:
+            break
+        time.sleep(0.05)
+    assert task["status"] == "done"
+
+    _, detail = _request(url + f"api/conversations/{conversation_id}")
+    roles = [message["role"] for message in detail["messages"]]
+    assert roles == ["user", "assistant"]
+    assert detail["messages"][0]["content"] == "输入 hello 并保存"
+    assert detail["messages"][1]["payload"]["status"] == "done"
+
+
+def test_sse_replays_conversation_events(server):
+    app, url = server
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"title": "回放", "adapter": "mock"},
+        token=app.token,
+    )
+    conversation_id = data["conversation"]["id"]
+    app.storage.append_run_event(
+        "run-sse", conversation_id, "step", {"step": 1}
+    )
+
+    request = urllib.request.Request(
+        url
+        + f"api/events?token={app.token}&conversation_id={conversation_id}"
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert response.status == 200
+        assert "text/event-stream" in response.headers["Content-Type"]
+        messages = []
+        while len(messages) < 1:
+            line = response.readline()
+            if not line:
+                break
+            text = line.decode("utf-8").rstrip("\n")
+            if text.startswith("data: "):
+                messages.append(json.loads(text[6:]))
+
+    assert messages[0]["event"] == "step"
+    assert messages[0]["payload"] == {"step": 1}
+
+
+def test_sse_rejects_invalid_token(server):
+    _, url = server
+    request = urllib.request.Request(
+        url + "api/events?token=wrong&conversation_id=x"
+    )
+    with pytest.raises(urllib.error.HTTPError) as info:
+        urllib.request.urlopen(request, timeout=5)
+    assert info.value.code == 401
+
+
+def test_toggle_pause_active_follows_foreground_run(server):
+    app, _ = server
+    assert app.toggle_pause_active() is False
+
+    control = _register_running(app, "run-hotkey")
+    assert app.toggle_pause_active() is True
+    assert control.paused is True
+    assert app.toggle_pause_active() is True
+    assert control.paused is False
+
+    _register_running(app, "run-hotkey-2")
+    assert app.toggle_pause_active() is False
+
+    app._controls.pop("run-hotkey", None)
+    app._controls.pop("run-hotkey-2", None)
+
+
+def test_indicator_and_hotkey_disable_off_demand():
+    assert ScreenIndicator(enabled=False).start() is False
+    assert GlobalHotkey(lambda: None, enabled=False).start() is False
+
+
+def test_run_control_endpoints(server):
+    app, url = server
+    control = RunControl()
+    app._controls["run-control"] = control
+    try:
+        status, _ = _request(
+            url + "api/runs/run-control/pause",
+            method="POST",
+            body={},
+            token=app.token,
+        )
+        assert status == 200
+        assert control.paused is True
+
+        status, data = _request(
+            url + "api/runs/run-control/instruct",
+            method="POST",
+            body={"text": "改用其他目录"},
+            token=app.token,
+        )
+        assert status == 200
+        assert control.drain_instructions() == ["改用其他目录"]
+
+        status, _ = _request(
+            url + "api/runs/run-control/resume",
+            method="POST",
+            body={},
+            token=app.token,
+        )
+        assert status == 200
+        assert control.paused is False
+
+        status, _ = _request(
+            url + "api/runs/run-control/cancel",
+            method="POST",
+            body={},
+            token=app.token,
+        )
+        assert status == 200
+        assert control.cancelled is True
+
+        status, _ = _request(
+            url + "api/runs/missing/pause",
+            method="POST",
+            body={},
+            token=app.token,
+        )
+        assert status == 400
+    finally:
+        app._controls.pop("run-control", None)
+
+
+def _register_running(app, run_id):
+    control = RunControl()
+    app._controls[run_id] = control
+    with app._runs_lock:
+        app._runs[run_id] = {
+            "id": run_id,
+            "goal": "",
+            "adapter": "mock",
+            "status": "running",
+            "reason": "",
+            "steps": 0,
+            "model": "",
+            "conversation_id": None,
+            "audit_mode": "ai",
+            "created_at": "",
+            "events": [],
+        }
+    return control
+
+
+def _wait_for_confirmation(app, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with app._confirm_lock:
+            if app._confirm_requests:
+                return next(iter(app._confirm_requests))
+        time.sleep(0.02)
+    return None
+
+
+def _spawn_confirmation(app, run_id, results):
+    thread = threading.Thread(
+        target=lambda: results.append(
+            app.request_confirmation(
+                run_id,
+                Action("desktop.act", {"action": "type", "text": "x"}),
+                "操作：desktop.act:type x",
+            )
+        )
+    )
+    thread.start()
+    return thread
+
+
+def test_jump_preempts_direct_run_and_denies_pending_confirmation(server):
+    app, url = server
+    app._confirm_timeout = 5
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"title": "", "adapter": "mock"},
+        token=app.token,
+    )
+    conversation_id = data["conversation"]["id"]
+    app._active.acquire()
+    try:
+        _, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "排队任务",
+                "adapter": "mock",
+                "conversation_id": conversation_id,
+            },
+            token=app.token,
+        )
+    finally:
+        app._active.release()
+    assert started["queued"] is True
+
+    control = _register_running(app, "run-direct")
+    results = []
+    thread = _spawn_confirmation(app, "run-direct", results)
+    assert _wait_for_confirmation(app)
+
+    status, _ = _request(
+        url + "api/queue/jump",
+        method="POST",
+        body={"id": started["task"]["id"], "preempt": True},
+        token=app.token,
+    )
+    thread.join(timeout=5)
+    assert status == 200
+    assert results == [False]
+    with pytest.raises(RunPreempted):
+        control.checkpoint()
+
+    app._controls.pop("run-direct", None)
+    with app._runs_lock:
+        app._runs.pop("run-direct", None)
+
+
+def test_cancel_run_denies_pending_confirmation(server):
+    app, url = server
+    app._confirm_timeout = 5
+    control = _register_running(app, "run-cancel-confirm")
+    results = []
+    thread = _spawn_confirmation(app, "run-cancel-confirm", results)
+    assert _wait_for_confirmation(app)
+
+    status, _ = _request(
+        url + "api/runs/run-cancel-confirm/cancel",
+        method="POST",
+        body={},
+        token=app.token,
+    )
+    thread.join(timeout=5)
+    assert status == 200
+    assert control.cancelled is True
+    assert results == [False]
+
+    app._controls.pop("run-cancel-confirm", None)
+    with app._runs_lock:
+        app._runs.pop("run-cancel-confirm", None)
+
+
+def test_confirmation_broker_roundtrip(server):
+    app, url = server
+    app._confirm_timeout = 5
+    results = []
+
+    def worker():
+        results.append(
+            app.request_confirmation(
+                "run-confirm",
+                Action("file.transfer", {"direction": "upload"}),
+                "操作：file.transfer",
+            )
+        )
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    request_id = None
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        with app._confirm_lock:
+            if app._confirm_requests:
+                request_id = next(iter(app._confirm_requests))
+                break
+        time.sleep(0.02)
+    assert request_id
+
+    status, _ = _request(
+        url + "api/confirm",
+        method="POST",
+        body={"request_id": request_id, "approve": True},
+        token=app.token,
+    )
+    thread.join(timeout=5)
+    assert status == 200
+    assert results == [True]
+
+    status, _ = _request(
+        url + "api/confirm",
+        method="POST",
+        body={"request_id": request_id, "approve": True},
+        token=app.token,
+    )
+    assert status == 404
 
 
 def test_resource_status_and_sync(server):

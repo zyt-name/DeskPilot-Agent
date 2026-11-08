@@ -211,14 +211,11 @@ class AiService:
         provider_id: str,
         model_id: str,
         display_name: str = "",
-        vision: bool = False,
     ) -> dict[str, Any]:
         provider = self.storage.get_ai_provider(provider_id)
         if provider is None:
             raise ValueError("unknown AI provider")
-        model = self.storage.add_ai_model(
-            provider_id, model_id, display_name, vision
-        )
+        model = self.storage.add_ai_model(provider_id, model_id, display_name)
         if model is None:
             raise ValueError("failed to add model")
         if self.storage.get_active_ai() is None:

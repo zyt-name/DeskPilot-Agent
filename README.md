@@ -134,7 +134,8 @@ PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent run --goal "打开记事本�
 ## 配置
 
 - 主配置：`config/agent.example.toml`（适配器、策略、审计、默认模型）。
-- Xshell 桥接配置：`config/xshell-mcp.json`。
+- Xshell 桥接配置：`config/xshell-mcp.json`（路径相对 `vendor/xshell-mcp` 解析）。
+- 在 Xshell 标签页运行 `config/xshell-bridge-default.js` 前，先把其中的 `REPO_ROOT` 改为本仓库的绝对路径。
 - AI 厂商、密钥提示、模型与用量保存在 `.xm-agent/app.db`（SQLite，WAL）。
 - API Key 使用 DPAPI 加密；界面、日志与接口都不回显明文，只显示末尾提示。
 
@@ -162,7 +163,7 @@ start.cmd         # 资源初始化 + 桌面控制台启动
 PYTHONPATH=src .venv\Scripts\python.exe -m pytest -q
 ```
 
-当前 100 项用例通过，覆盖能力契约、策略、锁、审计、MCP 协议、适配器、AI 配置、用量、面板 API，以及资源清单、版本检测、镜像回退、安全解压与版本化安装。
+当前 173 项用例通过，覆盖能力契约、策略、锁、审计、MCP 协议、适配器、AI 配置与视觉能力判定、用量、面板 API，以及资源清单、版本检测、镜像回退、安全解压与版本化安装。
 
 ## 安全与数据
 

@@ -18,14 +18,17 @@ const state = {
 
 const STATUS_LABEL = {
   running: "运行中",
+  queued: "排队中",
   done: "已完成",
   failed: "失败",
+  aborted: "已中止",
+  cancelled: "已取消",
   needs_human: "需人工",
 };
 
 const TAB_META = {
   overview: ["总览", "本地运行，数据保存在本机 SQLite。"],
-  run: ["运行任务", "目标会被拆成带验证的动作逐步执行。"],
+  run: ["任务", "对话式任务：流式思考、顶层审计与串行队列。"],
   ai: ["AI 模型", "密钥加密入库；支持多厂商、套餐、本地 Ollama 与自定义端点。"],
   usage: [
     "用量",
@@ -117,6 +120,7 @@ function switchTab(tab) {
   const [title, sub] = TAB_META[tab] || TAB_META.overview;
   $("page-title").textContent = title;
   $("page-sub").textContent = sub;
+  if (tab === "run" && window.TaskUI) window.TaskUI.enter();
   if (tab === "history") refreshRuns();
   if (tab === "ai") loadAi();
   if (tab === "usage") loadUsage();
@@ -166,16 +170,14 @@ function applyBootstrap(data) {
   $("info-user").textContent = data.profile.display_name;
   $("set-db").textContent = data.config.db_path;
 
-  fillSelect($("run-adapter"), adapters, data.profile.default_adapter);
   fillSelect($("set-adapter"), adapters, data.profile.default_adapter);
 
-  $("run-goal").value = data.profile.default_goal || "";
-  $("run-auto-confirm").checked = Boolean(data.profile.auto_confirm);
   $("set-name").value = data.profile.display_name || "";
   $("set-goal").value = data.profile.default_goal || "";
   $("set-auto-confirm").checked = Boolean(data.profile.auto_confirm);
 
   renderRuns(data.runs || []);
+  if (window.TaskUI) window.TaskUI.onBootstrap(data);
 }
 
 function eventView(event) {
@@ -196,9 +198,15 @@ function eventView(event) {
     meta = `${payload.provider || "unknown"} · ${payload.model || "unknown"}${payload.vision ? " · 可识图" : ""}`;
   } else if (event.event === "step") {
     const receipt = payload.receipt_ok ? "回执通过" : "回执失败";
-    const verify = payload.verify_ok ? "验证通过" : "验证失败";
+    const verify = payload.verify_ok
+      ? payload.deferred
+        ? "待视觉核对"
+        : "验证通过"
+      : "验证失败";
     title = `第 ${payload.step} 步 · ${payload.capability}`;
-    meta = `${receipt} · ${verify}${payload.error ? ` · ${payload.error}` : ""}`;
+    meta = `${payload.finish_blocked ? "完成核对未通过 · " : ""}${receipt} · ${verify}${
+      payload.error ? ` · ${payload.error}` : ""
+    }`;
   } else if (event.event === "result") {
     const label = STATUS_LABEL[payload.status] || payload.status;
     title = `任务结束：${label}`;
@@ -232,61 +240,6 @@ function renderTimeline(container, events, emptyText) {
   events.forEach((event) => fragment.appendChild(eventView(event)));
   container.appendChild(fragment);
   container.scrollTop = container.scrollHeight;
-}
-
-function renderRun(run) {
-  $("run-status").textContent = STATUS_LABEL[run.status] || run.status;
-  $("run-status").className = `status ${run.status}`;
-  renderTimeline($("run-timeline"), run.events, "任务正在启动…");
-  $("run-submit").disabled = run.status === "running";
-}
-
-async function pollRun() {
-  if (!state.currentRunId) return;
-  try {
-    const run = await api(`/api/runs/${state.currentRunId}`);
-    renderRun(run);
-    if (run.status === "running") {
-      state.pollTimer = setTimeout(pollRun, 700);
-    } else {
-      toast(`任务结束：${STATUS_LABEL[run.status] || run.status}`);
-      refreshRuns();
-    }
-  } catch (err) {
-    toast(`读取任务状态失败：${err.message}`, true);
-    $("run-submit").disabled = false;
-  }
-}
-
-async function startRun(event) {
-  event.preventDefault();
-  if (state.pollTimer) clearTimeout(state.pollTimer);
-  const goal = $("run-goal").value.trim();
-  if (!goal) {
-    toast("请输入任务目标", true);
-    return;
-  }
-  $("run-submit").disabled = true;
-  $("run-status").textContent = "启动中";
-  $("run-status").className = "status running";
-  try {
-    const data = await api("/api/runs", {
-      method: "POST",
-      body: JSON.stringify({
-        goal,
-        adapter: $("run-adapter").value,
-        auto_confirm: $("run-auto-confirm").checked,
-      }),
-    });
-    state.currentRunId = data.id;
-    renderTimeline($("run-timeline"), [], "任务正在启动…");
-    pollRun();
-  } catch (err) {
-    $("run-submit").disabled = false;
-    $("run-status").textContent = "启动失败";
-    $("run-status").className = "status failed";
-    toast(err.message, true);
-  }
 }
 
 function renderRuns(runs) {
@@ -369,9 +322,7 @@ async function saveSettings(event) {
     });
     state.profile = profile;
     $("info-user").textContent = profile.display_name;
-    $("run-goal").value = profile.default_goal || "";
-    $("run-adapter").value = profile.default_adapter;
-    $("run-auto-confirm").checked = Boolean(profile.auto_confirm);
+    if (window.TaskUI) window.TaskUI.applyProfile(profile);
     toast("设置已保存");
   } catch (err) {
     toast(err.message, true);
@@ -938,7 +889,6 @@ async function addCustomModel() {
     toast("请输入自定义模型 ID", true);
     return;
   }
-  const vision = $("ai-form-custom-vision").checked;
   const provider = await saveProvider(false);
   if (!provider) return;
   try {
@@ -948,7 +898,6 @@ async function addCustomModel() {
         provider_id: provider.id,
         model_id: modelId,
         display_name: modelId,
-        vision,
       }),
     });
     await api("/api/ai/active", {
@@ -956,7 +905,6 @@ async function addCustomModel() {
       body: JSON.stringify({ provider_id: provider.id, model_id: modelId }),
     });
     $("ai-form-custom-id").value = "";
-    $("ai-form-custom-vision").checked = false;
     await loadAi();
     toast(`已添加并启用 ${modelId}`);
   } catch (err) {
@@ -1288,7 +1236,6 @@ function bindResources() {
 }
 
 function bindForms() {
-  $("run-form").addEventListener("submit", startRun);
   $("settings-form").addEventListener("submit", saveSettings);
   $("history-refresh").addEventListener("click", refreshRuns);
   $("history-close").addEventListener("click", () => {

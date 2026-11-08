@@ -16,7 +16,7 @@
       </div>
       <nav class="nav">
         <button class="nav-item active" data-tab="overview">总览</button>
-        <button class="nav-item" data-tab="run">运行任务</button>
+        <button class="nav-item" data-tab="run">任务</button>
         <button class="nav-item" data-tab="ai">AI 模型</button>
         <button class="nav-item" data-tab="usage">用量</button>
         <button class="nav-item" data-tab="history">历史记录</button>
@@ -92,34 +92,90 @@
       </section>
 
       <section class="view hidden" id="view-run">
-        <div class="panel">
-          <form id="run-form">
-            <label class="field">
-              <span>目标</span>
-              <textarea id="run-goal" rows="3" maxlength="500" placeholder="例如：在记事本中输入 hello 并保存" required></textarea>
-            </label>
-            <div class="row">
-              <label class="field compact">
-                <span>桌面后端</span>
-                <select id="run-adapter"></select>
-              </label>
-              <label class="check">
-                <input type="checkbox" id="run-auto-confirm" />
-                <span>自动确认需确认的动作</span>
-              </label>
-              <button class="btn btn-primary" id="run-submit" type="submit">运行</button>
+        <div class="task-workspace">
+          <div class="task-chat">
+            <div class="pause-banner hidden" id="task-pause-banner">
+              <div>
+                <strong>AI 已暂停</strong>
+                <span>桌面操作已停住，你可以输入指令后继续。</span>
+              </div>
+              <div class="row">
+                <button class="btn btn-ghost" id="task-banner-resume" type="button">继续</button>
+                <button class="btn btn-danger-ghost" id="task-banner-cancel" type="button">结束控制</button>
+              </div>
             </div>
-          </form>
-        </div>
 
-        <div class="panel">
-          <div class="panel-head">
-            <h2>执行过程</h2>
-            <span class="status" id="run-status">空闲</span>
+            <header class="chat-head">
+              <div class="chat-head-title">
+                <h2 id="task-conversation-title">新任务</h2>
+                <p class="hint" id="task-conversation-sub">敏感操作由顶层审计 AI 判断，涉及用户数据时请你确认。</p>
+              </div>
+              <div class="chat-head-actions">
+                <label class="field compact inline">
+                  <span>审计</span>
+                  <select id="task-audit-mode">
+                    <option value="ai">AI 审计</option>
+                    <option value="confirm_all">每次确认</option>
+                  </select>
+                </label>
+                <label class="field compact inline">
+                  <span>后端</span>
+                  <select id="task-adapter"></select>
+                </label>
+                <button class="btn btn-ghost" id="task-new-conversation" type="button">新任务</button>
+              </div>
+            </header>
+
+            <div class="chat-scroll" id="task-chat-scroll">
+              <div class="chat-messages" id="task-messages">
+                <div class="chat-empty" id="task-chat-empty">
+                  <h3>开始一个桌面任务</h3>
+                  <p>描述目标，AI 会逐步操作并验证。敏感操作先由顶层审计 AI 判断；涉及其他项目或用户数据时，系统会请你审计目的、流程与影响。</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="composer-wrap">
+              <div class="run-controls hidden" id="task-run-controls">
+                <span class="run-pill" id="task-run-pill">运行中</span>
+                <button class="btn btn-ghost" id="task-pause" type="button">暂停 (F8)</button>
+                <button class="btn btn-ghost hidden" id="task-resume" type="button">继续</button>
+                <button class="btn btn-danger-ghost" id="task-cancel" type="button">结束控制</button>
+              </div>
+              <form class="composer" id="task-form">
+                <textarea id="task-goal" rows="2" maxlength="500" placeholder="描述任务，例如：在记事本中输入 hello 并保存"></textarea>
+                <div class="composer-side">
+                  <label class="check">
+                    <input type="checkbox" id="task-auto-confirm" />
+                    <span>自动确认</span>
+                  </label>
+                  <button class="btn btn-primary" id="task-submit" type="submit">发送</button>
+                </div>
+              </form>
+              <p class="hint" id="task-composer-hint">运行中可按 F8 暂停，暂停后可注入新指令。</p>
+            </div>
           </div>
-          <div class="timeline" id="run-timeline">
-            <p class="empty">运行任务后，这里会实时显示每一步。</p>
-          </div>
+
+          <aside class="task-side">
+            <div class="task-side-block">
+              <div class="panel-head small">
+                <h3>任务</h3>
+                <button class="btn btn-ghost mini" id="task-refresh" type="button">刷新</button>
+              </div>
+              <div class="conversation-list" id="task-conversation-list">
+                <p class="empty">还没有任务。</p>
+              </div>
+            </div>
+            <div class="task-side-block">
+              <div class="panel-head small">
+                <h3>队列</h3>
+                <span class="hint" id="task-queue-count"></span>
+              </div>
+              <div class="queue-list" id="task-queue-list">
+                <p class="empty">队列为空。</p>
+              </div>
+            </div>
+          </aside>
         </div>
       </section>
 
@@ -213,16 +269,12 @@
                 </select>
               </label>
               <button class="btn btn-ghost" type="button" id="ai-form-fetch">获取模型列表</button>
-              <span class="hint" id="ai-form-model-note">先填写 API Key，再从官方接口获取后选择模型。</span>
+              <span class="hint" id="ai-form-model-note">先填写 API Key，再从官方接口获取后选择模型；图像能力由后端自动识别。</span>
             </div>
             <div class="row hidden" id="ai-form-custom-row">
               <label class="field compact">
                 <span>自定义模型 ID</span>
                 <input id="ai-form-custom-id" placeholder="例如 my-model-v1" />
-              </label>
-              <label class="check">
-                <input type="checkbox" id="ai-form-custom-vision" />
-                <span>支持图像输入</span>
               </label>
               <button class="btn btn-ghost" type="button" id="ai-form-custom-add">添加并启用</button>
             </div>
@@ -411,7 +463,25 @@
       <div class="resource-list" id="resource-list"></div>
     </div>
   </div>
+  <div class="modal-backdrop hidden" id="confirm-modal">
+    <div class="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div class="modal-head">
+        <div class="modal-title">
+          <h2 id="confirm-title">需要你确认这个操作</h2>
+          <span class="chip warn" id="confirm-risk">需确认</span>
+        </div>
+      </div>
+      <p class="modal-sub" id="confirm-summary">请审计操作目的、流程与可能影响后决定。</p>
+      <pre class="confirm-prompt" id="confirm-prompt"></pre>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="confirm-deny" type="button">拒绝</button>
+        <button class="btn btn-primary" id="confirm-approve" type="button">允许本次执行</button>
+      </div>
+      <p class="hint">确认只对当前这一步有效。系统不会向 AI 开放完全访问权限。</p>
+    </div>
+  </div>
   <div class="toast hidden" id="toast"></div>
   <script src="/static/app.js"></script>
+  <script src="/static/task.js"></script>
 </body>
 </html>

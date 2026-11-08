@@ -85,9 +85,15 @@ class Verification:
     ok: bool
     detail: str = ""
     evidence: dict[str, Any] = field(default_factory=dict)
+    deferred: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "detail": self.detail, "evidence": self.evidence}
+        return {
+            "ok": self.ok,
+            "detail": self.detail,
+            "evidence": self.evidence,
+            "deferred": self.deferred,
+        }
 
 
 @dataclass(frozen=True)
@@ -105,6 +111,7 @@ class StepRecord:
     observation: Observation
     action: Action
     policy: PolicyDecision | None = None
+    audit: dict[str, Any] | None = None
     receipt: Receipt | None = None
     verification: Verification | None = None
     error: str | None = None
@@ -115,6 +122,7 @@ class StepRecord:
             "observation": self.observation.to_dict(),
             "action": self.action.to_dict(),
             "policy": self.policy.to_dict() if self.policy else None,
+            "audit": self.audit,
             "receipt": self.receipt.to_dict() if self.receipt else None,
             "verification": self.verification.to_dict() if self.verification else None,
             "error": self.error,

@@ -1,5 +1,5 @@
 {
-  "bridgeRootDir": "D:/xm/agent/.xm-agent/xshell-bridge",
+  "bridgeRootDir": "../../.xm-agent/xshell-bridge",
   "defaultSessionId": "default",
   "sessionStaleAfterMs": 15000,
   "dangerousCommands": {

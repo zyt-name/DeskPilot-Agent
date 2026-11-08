@@ -14,5 +14,18 @@ class Provider(Protocol):
         observation: Observation,
         history: list[StepRecord],
         remaining_steps: int,
+        *,
+        instructions: list[str] | None = None,
+        on_delta=None,
     ) -> Action:
+        ...
+
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 800,
+        on_delta=None,
+    ) -> str:
         ...

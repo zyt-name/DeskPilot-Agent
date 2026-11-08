@@ -54,6 +54,18 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
                 "text": {"type": "string"},
                 "keys": {"type": "string"},
                 "amount": {"type": "integer"},
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle", "double"],
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "Clear the field before typing (UIA backends).",
+                },
+                "press_enter": {
+                    "type": "boolean",
+                    "description": "Press Enter after typing (UIA backends).",
+                },
             },
             "required": ["action"],
         },

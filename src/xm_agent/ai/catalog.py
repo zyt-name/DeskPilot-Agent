@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass
 from typing import Any
+
+from ..model_caps import vision_from_name
 
 
 @dataclass(frozen=True)
@@ -280,41 +281,6 @@ PRESETS: tuple[Preset, ...] = (
 
 _BY_ID = {preset.id: preset for preset in PRESETS}
 
-_VISION_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"(^|/)gpt-(4o|4\.1|4\.5|5|chatgpt)",
-        r"(^|/)chatgpt-4o",
-        r"(^|/)o[1-9]($|[-.])",
-        r"claude-(3|4|sonnet|opus|haiku)",
-        r"gemini",
-        r"gemma-3",
-        r"llama-?4",
-        r"glm-4(\.\d+)?v",
-        r"glm-4v",
-        r"kimi.*(vision|vl)",
-        r"moonshot.*(vision|vl)",
-        r"kimi-latest",
-        r"deepseek.*(vl|vision)",
-        r"grok.*vision",
-        r"qwen.*(vl|vision)",
-        r"(^|/)qvq",
-        r"llava",
-        r"pixtral",
-        r"internvl",
-        r"minicpm.*v",
-        r"cogvlm",
-        r"molmo",
-        r"idefics",
-        r"phi-.*vision",
-        r"mistral.*vision",
-        r"mistral-small-3",
-        r"step-1v",
-        r"yi-vision",
-        r"doubao.*vision",
-    )
-)
-
 _NON_CHAT_MARKERS = (
     "embedding",
     "embed-",
@@ -364,10 +330,7 @@ def preset_endpoint(preset_id: str, plan_id: str) -> dict[str, Any] | None:
 
 
 def is_vision_model(model_id: str) -> bool:
-    name = model_id.strip()
-    if not name:
-        return False
-    return any(pattern.search(name) for pattern in _VISION_PATTERNS)
+    return vision_from_name(model_id)
 
 
 def is_chat_model(model_id: str) -> bool:

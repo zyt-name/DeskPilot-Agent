@@ -1,7 +1,7 @@
 # 实施进度
 
 > 最后更新：2026-11-08
-> 当前阶段：P0 桌面链路（Windows-MCP 主通道 + Computer-Use MCP 视觉通道已接框架）；本地桌面控制台可用；多厂商 AI 配置、DPAPI 加密密钥与 Token 用量面板已可用；第三方 MCP 资源支持启动自动初始化、版本化安装与国内镜像回退；Xshell 仅保留框架
+> 当前阶段：P0 桌面链路（Windows-MCP 主通道 + Computer-Use MCP 视觉通道已接框架）；本地桌面控制台可用；多厂商 AI 配置、DPAPI 加密密钥与 Token 用量面板已可用；第三方 MCP 资源支持启动自动初始化、版本化安装与国内镜像回退；Xshell 仅保留框架。任务式界面、流式思考/输出、会话与事件持久化、串行队列与插队、暂停/继续/结束控制、可复用确认弹窗、顶层 AI 审计与两种用户审计模式已落地（TECH_DESIGN 4.14 / 4.15）。原生覆盖层（全局 F8、顶部提示、边缘发光、右上 HUD、WDA 截图排除）尚未实现，当前 F8 仅在控制台窗口聚焦时生效。
 > 设计文档：[TECH_DESIGN.md](TECH_DESIGN.md)
 
 ## 1. 已完成
@@ -14,28 +14,32 @@
 | MCP stdio 客户端 | `src/xm_agent/mcp_stdio.py` | 完成 | 对 fake Server 与真实 Windows-MCP 完成握手与调用 |
 | 通用能力适配层 | `src/xm_agent/adapters/mcp_tool.py` | 完成 | 工具名与参数重命名由配置驱动 |
 | Windows-MCP 适配器 | `src/xm_agent/adapters/windows_mcp.py` | 完成 | 真实 `Snapshot` 文本解析、坐标点击、WaitFor 条件 |
-| Computer-Use MCP 适配器 | `src/xm_agent/adapters/computer_use_mcp.py` | 完成 | 截图保存、坐标动作映射、视觉验证降级；真实服务待构建 |
+| Computer-Use MCP 适配器 | `src/xm_agent/adapters/computer_use_mcp.py` | 完成 | 截图保存、坐标动作映射、`clear`/`press_enter`、视觉验证标记延迟；无视觉模型拒绝启动 |
 | Xshell MCP 适配器 | `src/xm_agent/adapters/xshell_mcp.py` | 完成，框架保留 | 单测覆盖；本机未安装 Xshell，不验证真实会话 |
 | Mock 执行器 | `src/xm_agent/adapters/mock.py` | 完成 | demo 与测试使用 |
 | 策略引擎 | `src/xm_agent/policy.py` | 完成 | 默认拒绝、命令白名单、危险命令确认、路径根限制 |
 | 租约锁 | `src/xm_agent/lock.py` | 完成 | 获取/释放/争用/过期接管/心跳 |
 | 审计日志 | `src/xm_agent/audit.py` | 完成 | JSONL、敏感字段脱敏、按 trace_id 归档 |
+| 顶层 AI 审计 | `src/xm_agent/guard/` | 完成 | 操作描述符归一化、确定性敏感识别、盲审（无工具/无任务上下文）、固定 JSON 判决、失败关闭、TOCTOU 复核、120s 缓存 |
+| 运行控制 | `src/xm_agent/control.py` | 完成 | 暂停/继续/取消/插队抢占/指令注入，步骤边界生效 |
+| 流式输出 | `src/xm_agent/providers/` | 完成 | OpenAI SSE（`reasoning_content` / `content`）与 Anthropic `thinking_delta` / `text_delta`，usage 归一化 |
 | 模型提供方 | `src/xm_agent/providers/` | 完成 | OpenAI 兼容 + Anthropic Messages + fake / scripted；支持视觉消息与 usage 回调 |
-| AI 厂商目录 | `src/xm_agent/ai/catalog.py` | 完成 | 18 个预设、OpenAI/Anthropic 协议、套餐差异（GLM Coding Plan、OpenCode Go 等）、可识图启发式 |
+| AI 厂商目录 | `src/xm_agent/ai/catalog.py`、`src/xm_agent/model_caps.py` | 完成 | 18 个预设、OpenAI/Anthropic 协议、套餐差异（GLM Coding Plan、OpenCode Go 等）；图像能力由官方元数据与模型家族表自动判定 |
 | 密钥加密 | `src/xm_agent/ai/crypto.py` | 完成 | Windows DPAPI + 固定 entropy，密文入库，界面只显示末尾提示 |
-| 模型列表 | `src/xm_agent/ai/models.py` | 完成 | OpenAI/Anthropic/Gemini/Ollama 四种接口风格，按套餐自动选择；识别 200 业务错误、Coding Plan 回退标准端点；过滤非对话模型并标注视觉能力 |
+| 模型列表 | `src/xm_agent/ai/models.py` | 完成 | OpenAI/Anthropic/Gemini/Ollama 四种接口风格，按套餐自动选择；识别 200 业务错误、Coding Plan 回退标准端点；过滤非对话模型；优先读取官方模态元数据，缺失时按模型家族表判定视觉能力 |
 | 预设端点隔离 | `src/xm_agent/ai/service.py`、`factory.py` | 完成 | 预设提供商的协议、Base URL、模型列表接口与凭据要求由套餐强制决定，忽略前端传值；历史错误记录在读取时自动修复 |
 | AI 装配与用量 | `src/xm_agent/ai/factory.py`、`service.py` | 完成 | 活动模型装配、加密读写、连通性测试、usage 回调入库 |
 | CLI | `src/xm_agent/cli.py` | 完成 | `demo` / `run` / `gui`、交互确认、UTF-8、四种适配器；`run` 自动读取本地库中的活动模型 |
 | 构建装配 | `src/xm_agent/bootstrap.py` | 完成 | 优先使用活动 AI，未配置时回退配置/启发式；CLI 与 UI 共用 |
-| SQLite 持久化 | `src/xm_agent/storage.py` | 完成 | 用户偏好、任务历史、AI 提供商/模型/用量；WAL，按模型聚合用量 |
-| 本地面板后端 | `src/xm_agent/ui/server.py` | 完成 | 回环 HTTP、随机 token、静态资源、运行线程、事件轮询、AI 配置与用量 API |
+| SQLite 持久化 | `src/xm_agent/storage.py` | 完成 | 用户偏好、任务历史、AI 提供商/模型/用量、会话/消息、`run_events`、`task_queue`、`audit_decisions`；WAL |
+| 本地面板后端 | `src/xm_agent/ui/server.py` | 完成 | 回环 HTTP、随机 token、静态资源、SSE 事件通道（断线重放）、会话 CRUD、串行队列与插队、确认代理、暂停/继续/结束/指令接口 |
+| 任务式前端 | `src/xm_agent/ui/static/task.js`、`index.html`、`styles.css` | 完成 | 三段布局、流式思考/输出、思考默认折叠、审计卡片、确认弹窗、会话列表、队列列表、F8（窗口内）暂停与指令注入 |
 | 桌面窗口 | `src/xm_agent/ui/window.py`、`start.cmd` | 完成 | pywebview 6.2.1 + WebView2，cmd 一键启动；启动前自动执行资源初始化 |
 | 资源管理 | `src/xm_agent/resources/`、CLI `resources`、设置页「MCP 资源」 | 完成 | 固定版本清单、版本化目录 + junction、GitHub/国内镜像回退、安全解压、venv/npm 构建、检测悬浮窗 |
-| 前端页面 | `src/xm_agent/ui/static/` | 完成 | 总览 / 运行 / AI 模型 / 用量 / 历史 / 设置；饼图、分模型统计与资源检测悬浮窗 |
+| 面板其余页面 | `src/xm_agent/ui/static/app.js` | 完成 | 总览 / AI 模型 / 用量 / 历史 / 设置；饼图、分模型统计与资源检测悬浮窗 |
 | 配置 | `config/agent.example.toml`、`config/xshell-mcp.json` | 完成 | TOML 适配器映射、子进程 env/cwd、`model` 回退配置 |
 | 只读探测脚本 | `scripts/probe_windows_mcp.py`、`scripts/probe_computer_use_mcp.py`、`scripts/probe_xshell_mcp.py` | 完成 | Windows 端到端只读；Computer-Use 已构建；Xshell 框架保留 |
-| 测试 | `tests/` | 完成 | 100 个用例全部通过 |
+| 测试 | `tests/` | 完成 | 154 个用例全部通过 |
 | 测试用 MCP Server | `examples/fake_mcp_server.py` | 完成 | 无第三方依赖，stdio JSON-RPC |
 
 ### 已接入的第三方 MCP
@@ -56,7 +60,7 @@
 PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 ```
 
-结果：`100 passed`
+结果：`173 passed`
 
 覆盖范围：
 
@@ -66,7 +70,7 @@ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 - MCP stdio 握手、工具列表、工具调用、错误工具
 - Windows-MCP Snapshot 文本解析（中文控件类型、JSON 数组包裹、空窗口）
 - Computer-Use 截图内容解析与落盘、坐标动作映射、滚轮方向/步长、验证降级
-- 视觉消息仅在 `model.vision=true` 且存在截图时附加
+- 截图仅在活动模型被判定支持图像输入且观测包含截图时附加
 - 元素 ID → 坐标解析、显式坐标、未知元素报错
 - Type / Shortcut / Scroll 参数映射、WaitFor 条件构造
 - Xshell `xshell_exec` 会话与毫秒超时换算、屏幕读取、SFTP 能力缺口、等待超时
@@ -75,11 +79,15 @@ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 - SQLite 用户资料读写、任务历史排序与截断
 - 面板 API：token 校验、Host 校验、静态资源、任务启动/轮询/落库
 - 资源清单版本固定、版本化目录/legacy 检测、过期版本识别、zip 越界拒绝、镜像回退下载与构建链接、面板资源状态/同步 API
-- AI 厂商目录、GLM/OpenCode 套餐差异、可识图模型识别
+- AI 厂商目录、GLM/OpenCode 套餐差异、图像能力自动识别（官方模态元数据、Ollama families/capabilities、模型家族表、未知模型保守判文本、历史手动标记不采信）
 - DPAPI 密钥加密往返、更新时保留旧 Key、清除 Key
 - OpenAI 兼容与 Anthropic Messages 的模型拉取、连通性测试、usage 归一化
 - 面板 AI API：密钥不回显、模型添加/激活、Token 用量聚合
 - 活动模型优先装配、未配置时回退 mock、Ollama 无密钥模式
+- 顶层审计：只读动作免审、策略拒绝不送审、硬拦截路径、AI allow/deny/ask_user、用户拒绝、审计模型缺失时升级确认、TOCTOU 变更阻止、缓存、声明式敏感并入、审计器盲性（看不到任务目标与理由）、跨项目/用户数据读取强制用户确认、AI `allow` 不得绕过用户决定、自动确认不得跳过强制确认
+- 运行控制：暂停阻塞至继续、取消抛错、插队立即抛错并唤醒暂停线程、指令只消费一次
+- 会话与事件持久化：消息生命周期、删除会话后任务保留、事件顺序与回放、队列排序/插队/状态/移除、审计决策记录
+- 面板：会话 CRUD、忙时排队并端到端执行、SSE 回放与鉴权、暂停/指令/继续/取消、确认代理、插队时拒绝待确认并抢占直启任务
 
 离线 demo：
 
@@ -134,11 +142,31 @@ Xshell MCP（框架保留，本机未安装 Xshell）：
 - [ ] Computer-Use 接入视觉模型，跑通“截图 → 决策 → 坐标动作 → 再截图”闭环
 - [ ] 真实模型联调：OpenAI 兼容接口 + 20 个固定任务基线
 - [ ] 截图采集、DPI 缩放、多显示器坐标归一化
-- [ ] 确认交互从 CLI 文本升级为可复用的确认接口
+- [x] 确认交互从 CLI 文本升级为可复用的确认接口（确认代理 + 面板弹窗，批准仅对当前步骤生效）
 - [ ] 契约测试框架：同一组用例跑所有后端
+- [x] 任务式界面：三段布局（导航 / 对话 / 任务列表），历史并入任务页
+- [x] 流式思考与输出：Provider SSE、面板 SSE 事件通道、思考默认折叠、动作卡片
+- [x] 会话与事件持久化：`conversations` / `messages` / `run_events` / `task_queue`，支持断线重放
+- [ ] 前台独占：单任务串行已完成；运行中控制台让出桌面、结束/暂停后恢复窗口未实现
+- [x] F8（控制台窗口内）暂停、继续、结束控制与指令注入
+- [ ] F8 全局暂停、顶部「F8 暂停」提示、屏幕边缘发光
+- [ ] 右上角 HUD：实时思考/步骤、悬停滚轮、缩放、折叠与位置记忆
+- [ ] `WDA_EXCLUDEFROMCAPTURE` 截图排除：Windows-MCP 与 Computer-Use 分别实测，准备回退方案
+- [x] 暂停菜单：继续 / AI 注入 / 结束控制（截图提问待实现）
+- [ ] 截图提问（暂停后全屏截图 + 视觉模型；纯文本模型禁用）
+- [x] 串行队列、插队抢占与恢复；全程禁止并行任务
+- [x] 顶层 AI 审计：操作描述符、盲审、失败关闭、执行前复核
+- [x] 用户审计模式（AI 审计 / 每次确认）与确认弹窗
 
 ### P1
 
+- [x] 破坏性 UI 操作识别（删除/卸载/格式化类元素名与危险快捷键）
+- [ ] 审计决策面板与统计：模型、耗时、风险、用户决定回放
+- [ ] 审计 Token 用量单独统计（当前计入 usage 的 `audit` 来源）
+- [ ] 框选截图提问（多显示器负坐标与 DPI 缩放）
+- [ ] 运行中 HUD 悬停滚轮/缩放（不抢焦点、不截获点击）
+- [ ] 用户非注入输入自动暂停（宿主低级钩子 + Windows-MCP `USER_CONTROL` 合并判定）
+- [ ] 窗口归属跟踪（新建/激活窗口差集）与结束操控现场策略
 - [ ] Xshell 真实会话验证（仅在装有 Xshell 的机器上进行，框架已就绪）
 - [ ] SFTP 文件传输后端（xshell-mcp 不含 SFTP 工具）
 - [ ] SSH 作为第二终端后端，验证替换 Xshell 不改 Agent
@@ -164,29 +192,49 @@ Xshell MCP（框架保留，本机未安装 Xshell）：
 7. **真实厂商密钥尚未全面联调**：GLM Coding Plan 已用真实 Key 验证 `glm-4.5` / `glm-4.6` / `glm-5.3` 连通与用量归一化；OpenAI / Anthropic / Gemini 等仍只有本地模拟端点验证，限流、余额不足、模型下线等错误未覆盖。GLM Coding Plan 的 Anthropic 端点不提供模型列表，已自动回退到标准端点；OpenCode Zen 等网关仍可能返回空列表，此时用「使用其他模型」手动添加。
 8. **DPAPI 密文与 Windows 用户绑定**：API Key 只能由保存它的 Windows 用户在同一台机器上解密；复制 `app.db` 到其他账户/机器后需要重新填写 Key。
 9. **用量只统计 Token，不统计金额**：不同厂商/套餐计价不同，当前记录 prompt/completion/total 与延迟；费用换算需要维护价格表，暂未实现。
-10. **模型列表差异**：网关型服务（OpenCode、方舟接入点、部分 Coding Plan）可能不提供标准 `/models`；界面已允许自定义模型与手动标记「可识图」。
+10. **模型列表差异**：网关型服务（OpenCode、方舟接入点、部分 Coding Plan）可能不提供标准 `/models`；界面已允许自定义模型 ID，图像能力由后端根据官方元数据与模型名称自动判定，无需用户选择。
 11. **Computer-Use MCP 已构建，但首次初始化依赖网络与 Node.js 20+**：资源管理器会下载固定版本并执行 `npm install && npm run build`；失败时设置页会显示错误，可重试，旧目录不会被直接删除。
 12. **Computer-Use 依赖 nut.js 原生模块**：Windows 下需要可用的预编译二进制，安装失败时需要回退到 UIA 主通道。
-13. **Computer-Use 没有元素树**：只能靠截图坐标；语义验证必须由视觉模型完成，适配器当前返回“已截图、待视觉判断”的降级结果。
+13. **Computer-Use 没有元素树**：只能靠截图坐标；单步 `desktop.verify` 会标记为“待视觉核对”。无视觉模型时不再允许启动（会盲操作并虚假完成）；后端会依据官方模型元数据与模型名称自动识别图像能力，识别为纯文本时在「AI 模型」中换用多模态模型，或改用 Windows-MCP；有视觉时 `task.finish` 前会用当步截图向模型复核，判否即拒绝完成并要求继续操作。
 14. **锁是文件锁**：过期接管存在很小的竞争窗口；没有跨进程单调 fencing 计数；目前只支持单机。
 15. **审计只写不清理**：`AuditLog.prune()` 已实现，但 CLI 尚未调度执行；截图目录同样没有清理任务。
 16. **策略不是沙箱**：命令白名单是前缀匹配，无法阻止白名单命令被滥用；桌面操作仍依赖人工确认与审计。
 17. **MCP 客户端是自研最小实现**：已覆盖当前所需方法，但生产环境应迁移到官方 MCP SDK。
 18. **尚无桌面安装包**：已有 pywebview 本地面板与 `start.cmd`，但没有安装器、托盘、更新器；后期可按 Tauri + sidecar 迁移，UI 只依赖本地 HTTP API。
 19. **vendor 目录体积大**：Windows-MCP 的 venv 约数百 MB，Computer-Use 还带 Node 依赖，分发时必须换成精简依赖或预构建运行时。
-20. **面板任务历史只存元数据**：SQLite 保存目标、后端、状态、步数与原因；实时事件只保留当前进程最近 300 条，进程重启后不再提供回放（完整步骤仍在审计 JSONL）。
-21. **面板确认门未做弹窗**：当前只有“自动确认”与“一律拒绝”两种模式；需要人工确认的动作必须开自动确认，后续接入可复用确认接口。
+20. **流式增量不落库**：`thinking` / `assistant` 增量事件只走 SSE，`run_events` 持久化其余事件；切换会话或重启后只能看到最终消息里截断的思考（前 8000 字），不能逐 token 回放。
+21. **确认等待有时限**：单次用户确认最长等待 300 秒，超时按拒绝处理；确认只对当前操作哈希有效，操作变化会重新确认。
+22. **真正的多桌面隔离不可行**：Windows 虚拟桌面共享同一交互会话，只有当前桌面渲染并接收输入；隐藏 `CreateDesktop` 桌面不渲染；RDP 单客户端只允许一个交互会话。因此采用前台独占 + 单任务串行，真隔离只能上 Windows Sandbox / Hyper-V，且无法与宿主应用共享窗口。
+23. **`WDA_EXCLUDEFROMCAPTURE` 尚未实测**：顶部提示、发光层与 HUD 计划用该 API 排除出截图，但 Windows-MCP 与 Computer-Use（nut.js）的截图后端是否遵守尚未验证；失效时需回退为截图前隐藏或裁剪，可能有闪烁。
+24. **F8 有环境限制**：低级键盘钩子可能收不到 UAC/提权窗口的按键，也可能与目标应用快捷键冲突；需要可配置快捷键与 HUD/托盘暂停入口，彻底覆盖提权窗口需后期增加辅助进程。
+25. **截图提问依赖视觉模型**：活动模型 `vision=false` 时无法使用；本版本不做本地 OCR，需提示用户切换模型。
+26. **暂停与插队存在延迟**：暂停只在步骤边界生效，正在等待的模型请求需要可取消才能快速响应；单个 MCP 动作不会被强行中断。
+27. **前台独占不等于互不影响**：用户中途移动鼠标、点击或输入会改变 AI 依赖的界面状态。v1 依赖 F8 手动暂停与 Windows-MCP `USER_CONTROL` 保护；Computer-Use 没有该保护，非注入输入自动暂停列入 P1。
+28. **HUD 交互与点击穿透冲突**：运行中 HUD 必须点击穿透，否则会挡住 AI 的点击坐标；因此运行中只能悬停滚轮查看，点击/拖动 HUD 视为用户接管并暂停，暂停后才可缩放与选择文本。
+29. **被插队任务留下窗口**：插队任务可能修改或关闭前一个任务的窗口；恢复前必须重新观测，目标不存在时按失败处理，不重放旧动作。
+30. **中文输入法与注入框**：空格用于选词，回车用于换行；发送必须用按钮或 `Ctrl+Enter`，暂停面板打开时 F8 不触发恢复。
+31. **顶层审计模型未配置时敏感操作全部升级**：没有可用的审计模型时，AI 审计模式对敏感操作返回 `ask_user`（失败关闭），不会静默放行；用户需要配置模型或接受更频繁的确认。
+32. **审计器与被审计模型可能是同一个**：`[audit_ai]` 未指定独立模型时复用活动模型，隔离仅靠系统提示词与无工具调用，不能保证真正独立判断；建议生产环境指定不同厂商/模型。
+33. **审计只看单步操作**：每个操作独立评估，不感知跨步骤组合风险（例如分多步删除多个目录），也不理解任务目标；组合风险仍需用户确认兜底。
+34. **只读操作默认免审**：`desktop.observe` / `desktop.verify` / `wait.for` / `task.finish` 与滚动/移动不进入审计；执行模型可通过 `sensitive` 声明强制送审，但该声明依赖模型自觉，规则侧仍会补充检测。
+35. **审计缓存 120 秒**：仅缓存 AI 审计的 `allow` / `deny`，键包含操作哈希、策略结果、模式与关键环境；环境变化未被完全覆盖时可能复用旧判决。
+36. **插队会中止当前任务**：插队抢占通过 `RunPreempted` 结束当前运行，不会挂起并在插队任务结束后恢复；被中止任务的窗口状态可能改变，后续需重新观测。
+37. **F8 仅控制台聚焦时生效**：全局低级键盘钩子、顶部提示、边缘发光与右上 HUD 尚未实现；最小化或焦点在桌面时无法用 F8 暂停。
+38. **删除会话保留任务记录**：删除会话会把其 `runs.conversation_id` 置空，任务历史与审计仍保留；这是有意的审计留痕，不是残余数据。
 
 ## 5. 下一步
 
-1. 确认并授权构建 `domdomegg/computer-use-mcp`，跑 `tools/list` 与一次只读截图，校准返回结构与坐标。
-2. 用视觉模型跑通 Computer-Use 的“截图 → 决策 → 坐标动作 → 再截图”闭环。
-3. 继续以 Windows-MCP 为主通道，先跑 3 个固定任务，再扩到 20 个基线；UIA 失败时再切视觉通道。
-4. 补截图与坐标归一化（DPI、多显示器），为通道切换做准备。
-5. Xshell 等有安装环境的机器再做真实会话验证；当前不阻塞主线。
-6. 再决定是否引入网关与多客户端。
-7. 用真实厂商 Key 验证模型列表、限流与错误提示；对不提供 `/models` 的网关完善手动模型流程。
-8. 如需费用面板，再增加各厂商/套餐价格表，把 Token 换算成金额。
+1. 原生覆盖层：全局低价键盘钩子（F8）、顶部「AI 正在操作 · F8 暂停」、屏幕边缘发光、右上角 HUD（思考/步骤、悬停滚动、折叠）；用 `WDA_EXCLUDEFROMCAPTURE` 排除截图，并在 Windows-MCP 与 Computer-Use 上分别实测，准备失效回退。
+2. 暂停菜单补「截图提问」：全屏截图 + 视觉模型问答；`vision=false` 时禁用并提示切换模型；框选提问列入 P1。
+3. 用视觉模型跑通 Computer-Use 的“截图 → 决策 → 坐标动作 → 再截图”闭环。
+4. 前台独占收尾：运行中让出桌面、结束/暂停后恢复窗口；窗口归属跟踪与结束操控现场策略。
+5. 继续以 Windows-MCP 为主通道，先跑 3 个固定任务，再扩到 20 个基线；UIA 失败时再切视觉通道。
+6. 补截图与坐标归一化（DPI、多显示器），为覆盖层定位与通道切换做准备。
+7. 为顶层审计指定独立模型，补充审计决策面板、耗时与 Token 统计；用真实模型验证 `allow/ask_user/deny` 判决质量。
+8. Xshell 等有安装环境的机器再做真实会话验证；当前不阻塞主线。
+9. 再决定是否引入网关与多客户端。
+10. 用真实厂商 Key 验证模型列表、限流与错误提示；对不提供 `/models` 的网关完善手动模型流程。
+11. 如需费用面板，再增加各厂商/套餐价格表，把 Token 换算成金额。
 
 ## 6. 运行方式
 
@@ -209,7 +257,7 @@ PYTHONPATH=src .venv/Scripts/python.exe -m xm_agent resources ensure --only comp
 # 桌面控制台内的 AI 配置流程：
 # 1) 「AI 模型」→ 选择厂商与套餐 → 填入 API Key（协议/URL/模型列表接口自动配置）
 # 2) 点击「获取模型列表」拉取官方模型，在「模型名称」下拉中选择
-# 3) 需要非列表内模型时选「使用其他模型」，填写 ID 并勾选是否识图
+# 3) 需要非列表内模型时选「使用其他模型」，只填模型 ID，图像能力自动判定
 # 4) 「保存并测试」发送一次真实请求，「用量」查看 Token 与占比
 # 5) 仅「自定义 / 其他」端点才会显示协议、Base URL 与模型列表接口
 
@@ -266,6 +314,7 @@ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 
 ## 7. 变更日志
 
+- 2026-11-08：确认下一阶段交互方案并写入 TECH_DESIGN 4.14：任务式界面 + 流式思考/输出、前台独占 + F8 暂停、顶部提示/边缘发光/右上 HUD（`WDA_EXCLUDEFROMCAPTURE` 排除截图）、暂停菜单 AI 注入、全屏截图提问、串行队列与插队；明确不做多桌面隔离、多任务并行与 Windows 多鼠标，框选截图与用户输入自动暂停列入 P1；同步更新任务级状态机、非目标、P0/P1 待办与已知问题。
 - 2026-11-08：完成 P0 骨架、能力契约、MCP stdio 客户端、mock 适配器、策略、锁、审计、CLI 与 29 个测试。
 - 2026-11-08：克隆并安装 Windows-MCP 0.8.8（独立 venv），完成 `tools/list`、`Snapshot`、observe-only 运行时只读验证。
 - 2026-11-08：新增 `WindowsMcpAdapter` 与 `XshellMcpAdapter`，配置支持子进程 env/cwd，测试增至 44 个。
@@ -281,4 +330,10 @@ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 - 2026-11-08：模型列表改为按套餐自动选择接口风格并锁定（仅自定义端点可手选）；识别 HTTP 200 包裹的业务错误（如 GLM Coding Plan 的 `success:false`），不再误报「0 个模型」；GLM Coding Plan 自动回退到标准端点取模型；空结果不再清空已有模型，错误响应兼容 GBK 文本；浏览器验证正常/错误/空三种场景，测试增至 86。
 - 2026-11-08：新增第三方 MCP 资源管理：固定版本清单（含提交 SHA）、`vendor/<名称>-<版本>` 版本化目录 + Windows junction、GitHub/ghproxy.net/gh-proxy.com/ghfast.top 归档回退、PyPI/清华/阿里/腾讯与 npm/npmmirror 构建回退、zip 越界校验、启动脚本自动初始化、`resources status/ensure` CLI、设置页资源检测悬浮窗与进度条；实测下载并构建 Computer-Use MCP 1.8.0，`tools/list` 返回 1 个工具、截图 1464×823 通过；测试增至 100；新增 README 标注上游仓库、版本与镜像源。
 - 2026-11-08：修正用量口径：仅在模型响应通过形状校验后记录 `usage`，HTTP 200 包裹的业务错误不再产生 0 Token 调用；用量汇总、分模型/提供商与最近记录只统计 `total_tokens > 0` 的成功调用；用量页标注 Token 为计费单位；测试增至 93。
+- 2026-11-08：修复任务执行链路：Runtime 现在自行处理模型请求的 `desktop.observe`（不再转发给只实现 act/verify 的后端）；Windows 适配器在 `USER_CONTROL` 时按 `wait_seconds` 在 30 秒内等待重试；`desktop.act` 契约补充 `button` / `clear` / `press_enter`，避免 Run 输入框历史文本被追加；Windows 验证从整句期望中提取引号文本或 URL；Anthropic 决策输出上限由 2048 提高到 8192，默认模型超时改为 120 秒；提示词明确用 Win+R 打开网页、终端后端不执行桌面目标。实测 `windows` 与 `computer_use` 均以“打开github”完成，`xshell` 在桥接不可用时给出明确结束说明；测试增至 103。
 - 2026-11-08：修复所有模型 404 的根因：GLM Coding Plan 的 Anthropic Base URL 缺少 `/v1`，且旧记录把协议存成了 `openai`，导致请求发到 `/api/anthropic/chat/completions`。预设提供商的协议/Base URL/模型列表接口/凭据要求改由套餐在后端强制决定，历史错误记录读取时自动修复；界面仅对「自定义」显示这些字段。连通性测试改用短系统提示并兼容仅返回 `thinking` 块推理模型（GLM-4.5）。真实 Key 验证 `glm-4.5` / `glm-4.6` / `glm-5.3` 均通过，测试增至 91。
+- 2026-11-08：落地 TECH_DESIGN 4.14 / 4.15。新增顶层审计 `guard/`（操作描述符、确定性命中、盲审、固定判决、失败关闭、TOCTOU、120s 缓存）、运行控制 `control.py`（暂停/继续/取消/插队/指令注入）、Provider 流式（OpenAI `reasoning_content` / Anthropic thinking）、SQLite 会话/消息/事件/队列/审计决策表、面板 SSE（Last-Event-ID 重放）、会话 CRUD、串行队列与插队、确认代理与运行控制接口；前端「运行任务」改为「任务」三段布局（对话流 + 任务列表 + 队列），思考默认折叠，审计卡片、确认弹窗、F8 窗口内暂停与指令注入。浏览器实测：mock 任务流式完成、思考折叠、`confirm_all` 弹窗、批准后审计卡片、F8 暂停/继续、指令注入、忙时排队、插队中止当前任务并启动队列、会话切换与历史回放；会话详情与运行详情补充暂停状态，切换回暂停中的任务会恢复暂停横幅；测试增至 149。
+- 2026-11-08：修复桌面控制体验：新增仓库级 `config/windows-mcp.toml` 并通过 `--config` 传入，关闭 Windows-MCP 自带的同意弹窗与所有权输入钩子（其低层钩子会吞 F8），任务执行期间不再逐次询问；新增任务级屏幕占用边缘高亮（点击穿透、呼吸动画、`WDA_EXCLUDEFROMCAPTURE`，Windows-MCP/Computer-Use 任务显示，任务结束/失败/取消后隐藏），不再随单次工具调用闪烁；新增全局 F8（`RegisterHotKey` 独立消息循环，窗口失焦仍可暂停/继续），注册失败自动回退窗口内 F8；新增 `/api/bootstrap` 热键能力标记避免重复触发；新增 5 个回归测试，测试增至 159，Windows-MCP 实测 `ControlStatus` 为 `disabled`。
+- 2026-11-08：把“涉及其他项目/用户数据由用户决定”固化进顶层审计：操作描述符新增 `user_data` 目标识别（文档/下载/桌面/图片/视频/音乐/OneDrive 等，且不在当前项目/工作区内），跨项目访问现在包含只读；`Sensitivity.requires_user` 由跨项目、用户数据、受保护路径、凭据访问确定性触发；审计提示词与 JSON scope 增加 `user_data` / `requires_user`，审计模型返回 `allow` 但 scope 或类别涉及跨项目/用户数据时自动升级 `ask_user`；Gate 再次兜底，AI `allow` 不能绕过用户确认；确认回调新增 `mandatory` 参数，任务界面“自动确认”与 CLI `--yes` 只能跳过普通确认，不能批准跨项目/用户数据的强制用户决定。新增 5 个回归测试，测试增至 154。
+- 2026-11-08：修复 Computer-Use 虚假完成。根因：`glm-5.3-flash` 的 `vision=false`，截图从未发给模型；`desktop.act` 的 `type` 忽略 `clear`/`press_enter`，URL 写入 Run 对话框后从未回车；`wait.for`/`desktop.verify` 返回延迟成功，`task.finish` 又只看模型声明。现在：computer_use 无视觉模型直接拒绝启动并提示切换模型或 Windows-MCP；`type` 支持 `ctrl+a` 清空与回车提交；`Verification` 新增 `deferred` 标记并在界面显示“待视觉核对”；`task.finish` 前用当步截图调用视觉模型复核，判否即阻止完成并写入历史，连续两次判否按失败结束；提示词按 UIA/视觉后端分流，禁止盲操作与虚假完成，并告知模型是否真的附带了截图。新增 9 个回归测试，测试总数 168。
+- 2026-11-08：图像输入能力改为后端自动判定，不再由用户勾选。新增 `src/xm_agent/model_caps.py`：优先读取官方模型列表的模态/能力元数据（OpenAI 兼容 `architecture.input_modalities` / `supported_input_modalities` / `modality` / `supports_image_in` / `capabilities`、Anthropic `capabilities.image_input.supported`、Ollama `capabilities` 与 `details.families`），缺失时按维护的官方模型家族表从模型 ID 推导，未知模型保守判为纯文本。`ai_models` 新增 `vision_source` 记录来源，读取时不再信任历史界面写入的 `vision`；新增/获取模型接口移除 `vision` 参数，界面删除「支持图像输入」勾选；`computer_use` 的拒绝提示改为说明当前模型被自动识别为纯文本。同步更新配置示例与文档，新增 5 个能力判定回归测试，测试总数 173。
