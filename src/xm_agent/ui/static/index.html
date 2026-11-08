@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>XM Agent</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">XM</span>
+        <span class="brand-text">Agent<small>桌面控制台</small></span>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-tab="overview">总览</button>
+        <button class="nav-item" data-tab="run">运行任务</button>
+        <button class="nav-item" data-tab="ai">AI 模型</button>
+        <button class="nav-item" data-tab="usage">用量</button>
+        <button class="nav-item" data-tab="history">历史记录</button>
+        <button class="nav-item" data-tab="settings">设置</button>
+      </nav>
+      <div class="side-foot">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-text">连接中…</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">总览</h1>
+          <p id="page-sub">本地运行，数据保存在本机 SQLite。</p>
+        </div>
+        <span class="badge" id="model-badge">—</span>
+      </header>
+
+      <section class="view" id="view-overview">
+        <div class="cards">
+          <div class="card">
+            <div class="card-label">模型</div>
+            <div class="card-value" id="stat-model">—</div>
+            <div class="card-note" id="stat-model-note">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">视觉通道</div>
+            <div class="card-value" id="stat-vision">—</div>
+            <div class="card-note" id="stat-vision-note">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">桌面后端</div>
+            <div class="card-value" id="stat-adapters">—</div>
+            <div class="card-note" id="stat-adapters-note">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">历史任务</div>
+            <div class="card-value" id="stat-runs">—</div>
+            <div class="card-note">最近 20 条记录</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Token 消耗</div>
+            <div class="card-value" id="stat-tokens">—</div>
+            <div class="card-note" id="stat-tokens-note">累计调用</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>快速开始</h2>
+            <button class="btn btn-ghost" data-jump="run">去运行任务</button>
+          </div>
+          <ol class="guide">
+            <li>在「AI 模型」中选择厂商与套餐，填入 API Key 并保存；密钥会加密存入本机 SQLite。</li>
+            <li>点击「获取模型列表」拉取官方模型，随后在「模型名称」下拉中选择；支持图像输入的模型会标注 <code>可识图</code>。</li>
+            <li>点击「保存并测试」发送一次真实请求，确认接口与密钥可用。</li>
+            <li>首次体验可用 <code>mock</code> 后端；未配置模型时自动使用内置演示策略。</li>
+            <li>在「设置 → MCP 资源」点击「检测并修复资源」，系统会自动下载并构建缺失的桌面组件。</li>
+          </ol>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>本机信息</h2></div>
+          <dl class="kv">
+            <dt>数据库</dt><dd id="info-db">—</dd>
+            <dt>审计目录</dt><dd id="info-audit">—</dd>
+            <dt>默认后端</dt><dd id="info-default-adapter">—</dd>
+            <dt>当前用户</dt><dd id="info-user">—</dd>
+          </dl>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-run">
+        <div class="panel">
+          <form id="run-form">
+            <label class="field">
+              <span>目标</span>
+              <textarea id="run-goal" rows="3" maxlength="500" placeholder="例如：在记事本中输入 hello 并保存" required></textarea>
+            </label>
+            <div class="row">
+              <label class="field compact">
+                <span>桌面后端</span>
+                <select id="run-adapter"></select>
+              </label>
+              <label class="check">
+                <input type="checkbox" id="run-auto-confirm" />
+                <span>自动确认需确认的动作</span>
+              </label>
+              <button class="btn btn-primary" id="run-submit" type="submit">运行</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>执行过程</h2>
+            <span class="status" id="run-status">空闲</span>
+          </div>
+          <div class="timeline" id="run-timeline">
+            <p class="empty">运行任务后，这里会实时显示每一步。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-ai">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>当前模型</h2>
+            <span class="badge" id="ai-active-badge">未配置</span>
+          </div>
+          <dl class="kv">
+            <dt>提供商</dt><dd id="ai-active-provider">—</dd>
+            <dt>模型</dt><dd id="ai-active-model">—</dd>
+            <dt>视觉能力</dt><dd id="ai-active-vision">—</dd>
+          </dl>
+          <p class="hint">API Key 使用 Windows DPAPI 加密后写入本机 SQLite，仅在本机解密；界面与日志不会回显明文。</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>已保存的提供商</h2>
+            <button class="btn btn-ghost" id="ai-new">新增提供商</button>
+          </div>
+          <div class="provider-list" id="ai-provider-list">
+            <p class="empty">还没有配置提供商。</p>
+          </div>
+        </div>
+
+        <div class="panel" id="ai-editor-panel">
+          <div class="panel-head">
+            <h2 id="ai-editor-title">新增提供商</h2>
+            <span class="hint" id="ai-editor-hint"></span>
+          </div>
+          <form id="ai-form">
+            <div class="grid-2">
+              <label class="field">
+                <span>厂商预设</span>
+                <select id="ai-preset"></select>
+              </label>
+              <label class="field">
+                <span>套餐 / 端点</span>
+                <select id="ai-plan"></select>
+              </label>
+            </div>
+            <p class="hint preset-note" id="ai-preset-note"></p>
+            <div class="grid-2">
+              <label class="field">
+                <span>API Key</span>
+                <input type="password" id="ai-api-key" autocomplete="off" spellcheck="false" placeholder="留空表示保持已保存的 Key" />
+              </label>
+              <label class="field">
+                <span>显示名称（可选）</span>
+                <input id="ai-name" maxlength="128" placeholder="留空自动使用厂商 · 套餐" />
+              </label>
+            </div>
+            <div class="hidden" id="ai-advanced-fields">
+              <div class="grid-2">
+                <label class="field">
+                  <span>协议</span>
+                  <select id="ai-protocol">
+                    <option value="openai">OpenAI 兼容</option>
+                    <option value="anthropic">Anthropic 兼容</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Base URL</span>
+                  <input id="ai-base-url" placeholder="https://api.example.com/v1" />
+                </label>
+              </div>
+              <div class="grid-2">
+                <label class="field">
+                  <span>模型列表接口</span>
+                  <select id="ai-models-style">
+                    <option value="openai">OpenAI /v1/models</option>
+                    <option value="anthropic">Anthropic /v1/models</option>
+                    <option value="gemini">Gemini v1beta/models</option>
+                    <option value="ollama">Ollama /api/tags</option>
+                  </select>
+                  <small class="hint" id="ai-models-style-note">自定义端点可按接口实际风格选择。</small>
+                </label>
+                <label class="check">
+                  <input type="checkbox" id="ai-requires-key" checked />
+                  <span>需要 API Key（本地服务可关闭）</span>
+                </label>
+              </div>
+            </div>
+            <div class="row model-picker">
+              <label class="field compact">
+                <span>模型名称</span>
+                <select id="ai-form-model" disabled>
+                  <option value="">填写 Key 后获取官方模型</option>
+                </select>
+              </label>
+              <button class="btn btn-ghost" type="button" id="ai-form-fetch">获取模型列表</button>
+              <span class="hint" id="ai-form-model-note">先填写 API Key，再从官方接口获取后选择模型。</span>
+            </div>
+            <div class="row hidden" id="ai-form-custom-row">
+              <label class="field compact">
+                <span>自定义模型 ID</span>
+                <input id="ai-form-custom-id" placeholder="例如 my-model-v1" />
+              </label>
+              <label class="check">
+                <input type="checkbox" id="ai-form-custom-vision" />
+                <span>支持图像输入</span>
+              </label>
+              <button class="btn btn-ghost" type="button" id="ai-form-custom-add">添加并启用</button>
+            </div>
+            <p class="hint">保存并测试会发起一次真实请求，消耗少量模型 Token。</p>
+            <div class="row">
+              <label class="check">
+                <input type="checkbox" id="ai-clear-key" />
+                <span>清除已保存的 Key</span>
+              </label>
+              <button class="btn btn-primary" type="submit">保存</button>
+              <button class="btn btn-ghost" type="button" id="ai-save-test">保存并测试</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel" id="ai-models-panel">
+          <div class="panel-head">
+            <h2 id="ai-models-title">模型明细</h2>
+          </div>
+          <p class="hint" id="ai-models-status">请选择一个提供商。</p>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>启用</th><th>模型 ID</th><th>显示名称</th>
+                  <th>能力</th><th>来源</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="ai-models-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-usage">
+        <div class="cards">
+          <div class="card">
+            <div class="card-label">总 Token</div>
+            <div class="card-value" id="usage-total">0</div>
+            <div class="card-note" id="usage-total-note">累计 0 次调用</div>
+          </div>
+          <div class="card">
+            <div class="card-label">输入 Token</div>
+            <div class="card-value" id="usage-prompt">0</div>
+            <div class="card-note">prompt / input</div>
+          </div>
+          <div class="card">
+            <div class="card-label">输出 Token</div>
+            <div class="card-value" id="usage-completion">0</div>
+            <div class="card-note">completion / output</div>
+          </div>
+          <div class="card">
+            <div class="card-label">今日 Token</div>
+            <div class="card-value" id="usage-today">0</div>
+            <div class="card-note" id="usage-today-note">今日 0 次调用</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>模型占比</h2>
+            <button class="btn btn-ghost" id="usage-refresh">刷新</button>
+          </div>
+          <div class="usage-layout">
+            <div class="pie-box" id="usage-pie"></div>
+            <div class="legend" id="usage-legend">
+              <p class="empty">还没有用量记录。配置模型并运行任务或测试后，这里会自动统计。</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>分模型统计</h2></div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>模型</th><th>提供商</th><th>调用</th>
+                  <th>输入</th><th>输出</th><th>合计</th><th>占比</th>
+                </tr>
+              </thead>
+              <tbody id="usage-models-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>提供商统计</h2></div>
+          <div class="provider-stats" id="usage-providers"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>最近调用</h2></div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>时间</th><th>提供商</th><th>模型</th>
+                  <th>输入</th><th>输出</th><th>合计</th><th>来源</th><th>耗时</th>
+                </tr>
+              </thead>
+              <tbody id="usage-recent-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-history">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>历史记录</h2>
+            <button class="btn btn-ghost" id="history-refresh">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr><th>时间</th><th>目标</th><th>后端</th><th>状态</th><th>步数</th></tr>
+              </thead>
+              <tbody id="history-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel hidden" id="history-detail">
+          <div class="panel-head">
+            <h2 id="history-detail-title">任务详情</h2>
+            <button class="btn btn-ghost" id="history-close">关闭</button>
+          </div>
+          <div class="kv-block" id="history-meta"></div>
+          <div class="timeline" id="history-events"></div>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-settings">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>MCP 资源</h2>
+            <button class="btn btn-primary" id="resource-check">检测并修复资源</button>
+          </div>
+          <p class="hint">
+            检查 Windows-MCP、Computer-Use MCP 与 xshell-mcp 的本地安装。缺失时会自动从 GitHub
+            或已验证的国内镜像下载，并按版本号安装到 <code>vendor/&lt;名称&gt;-&lt;版本&gt;</code>。
+          </p>
+          <div class="resource-summary" id="resource-summary">
+            <span class="muted">尚未检测。</span>
+          </div>
+        </div>
+        <div class="panel">
+          <form id="settings-form">
+            <label class="field">
+              <span>显示名称</span>
+              <input id="set-name" maxlength="64" />
+            </label>
+            <label class="field">
+              <span>默认桌面后端</span>
+              <select id="set-adapter"></select>
+            </label>
+            <label class="field">
+              <span>默认目标</span>
+              <textarea id="set-goal" rows="3" maxlength="500"></textarea>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="set-auto-confirm" />
+              <span>默认自动确认需确认的动作</span>
+            </label>
+            <div class="row end">
+              <button class="btn btn-primary" type="submit">保存</button>
+            </div>
+          </form>
+        </div>
+        <p class="hint">用户信息、任务历史与模型配置保存在本机 SQLite（<span id="set-db">—</span>），不会上传。API Key 使用 Windows DPAPI 加密入库，界面只显示末尾提示。</p>
+      </section>
+    </main>
+  </div>
+  <div class="modal-backdrop hidden" id="resource-modal">
+    <div class="modal resource-modal" role="dialog" aria-modal="true" aria-labelledby="resource-modal-title">
+      <div class="modal-head">
+        <div class="modal-title">
+          <span class="spinner" id="resource-spinner"></span>
+          <h2 id="resource-modal-title">正在检测资源完整性</h2>
+        </div>
+        <button class="btn btn-ghost" id="resource-modal-close">关闭</button>
+      </div>
+      <p class="modal-sub" id="resource-modal-note">正在检查本地 MCP 组件…</p>
+      <div class="progress"><div class="progress-bar" id="resource-progress"></div></div>
+      <div class="resource-list" id="resource-list"></div>
+    </div>
+  </div>
+  <div class="toast hidden" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
