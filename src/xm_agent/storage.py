@@ -45,12 +45,20 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT NOT NULL DEFAULT '',
     adapter TEXT NOT NULL DEFAULT 'mock',
     audit_mode TEXT NOT NULL DEFAULT 'ai',
+    title_source TEXT NOT NULL DEFAULT 'auto',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_updated
     ON conversations(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS task_memory (
+    conversation_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL DEFAULT '',
+    covered_message_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +94,8 @@ CREATE TABLE IF NOT EXISTS task_queue (
     goal TEXT NOT NULL,
     adapter TEXT NOT NULL,
     audit_mode TEXT NOT NULL DEFAULT 'ai',
+    model_provider_id TEXT NOT NULL DEFAULT '',
+    model_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'queued',
     position INTEGER NOT NULL DEFAULT 0,
     run_id TEXT,
@@ -233,6 +243,16 @@ class Storage:
         }
         if queue_columns and "run_id" not in queue_columns:
             conn.execute("ALTER TABLE task_queue ADD COLUMN run_id TEXT")
+        if queue_columns and "model_provider_id" not in queue_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN model_provider_id "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if queue_columns and "model_id" not in queue_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN model_id "
+                "TEXT NOT NULL DEFAULT ''"
+            )
         audit_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(audit_decisions)")
@@ -241,6 +261,15 @@ class Storage:
             conn.execute(
                 "ALTER TABLE audit_decisions ADD COLUMN verdict_json "
                 "TEXT NOT NULL DEFAULT ''"
+            )
+        conversation_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(conversations)")
+        }
+        if conversation_columns and "title_source" not in conversation_columns:
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN title_source "
+                "TEXT NOT NULL DEFAULT 'auto'"
             )
         model_columns = {
             row["name"]
@@ -388,8 +417,9 @@ class Storage:
             conn.execute(
                 """
                 INSERT INTO conversations
-                    (id, title, adapter, audit_mode, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (id, title, adapter, audit_mode, title_source,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'auto', ?, ?)
                 """,
                 (
                     conversation_id,
@@ -474,6 +504,9 @@ class Storage:
             for key in ("title", "adapter", "audit_mode")
             if key in fields and fields[key] is not None
         }
+        if "title" in allowed:
+            allowed["title"] = str(allowed["title"]).strip()[:120]
+            allowed["title_source"] = "user"
         if allowed:
             assignments = ", ".join(f"{key} = ?" for key in allowed)
             values = list(allowed.values()) + [_now(), conversation_id]
@@ -485,6 +518,17 @@ class Storage:
                 )
         return self.get_conversation(conversation_id, include_messages=False)
 
+    def set_auto_title(self, conversation_id: str, title: str) -> None:
+        title = " ".join(str(title).split())[:120]
+        if not title:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? "
+                "WHERE id = ? AND title_source = 'auto'",
+                (title, _now(), conversation_id),
+            )
+
     def touch_conversation(self, conversation_id: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -492,10 +536,47 @@ class Storage:
                 (_now(), conversation_id),
             )
 
+    def get_task_memory(self, conversation_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_memory WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return {"summary": "", "covered_message_id": 0}
+        return dict(row)
+
+    def save_task_memory(
+        self, conversation_id: str, summary: str, covered_message_id: int
+    ) -> None:
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_memory
+                    (conversation_id, summary, covered_message_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    summary = excluded.summary,
+                    covered_message_id = excluded.covered_message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_id,
+                    str(summary)[:8000],
+                    max(0, int(covered_message_id)),
+                    now,
+                ),
+            )
+
     def delete_conversation(self, conversation_id: str) -> None:
         with self._connect() as conn:
             conn.execute(
                 "DELETE FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "DELETE FROM task_memory WHERE conversation_id = ?",
                 (conversation_id,),
             )
             conn.execute(
@@ -661,6 +742,8 @@ class Storage:
         goal: str,
         adapter: str,
         audit_mode: str = "ai",
+        model_provider_id: str = "",
+        model_id: str = "",
     ) -> dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
         with self._connect() as conn:
@@ -672,8 +755,9 @@ class Storage:
                 """
                 INSERT INTO task_queue
                     (id, conversation_id, goal, adapter, audit_mode,
-                     status, position, created_at)
-                VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                     model_provider_id, model_id, status, position,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (
                     task_id,
@@ -681,6 +765,8 @@ class Storage:
                     goal[:500],
                     adapter[:64],
                     "confirm_all" if audit_mode == "confirm_all" else "ai",
+                    model_provider_id[:64],
+                    model_id[:128],
                     int(position),
                     _now(),
                 ),
@@ -1012,6 +1098,14 @@ class Storage:
                     "DELETE FROM app_state WHERE key IN "
                     "('active_provider_id', 'active_model_id')"
                 )
+            audit = conn.execute(
+                "SELECT value FROM app_state WHERE key = 'audit_provider_id'"
+            ).fetchone()
+            if audit is not None and audit["value"] == provider_id:
+                conn.execute(
+                    "DELETE FROM app_state WHERE key IN "
+                    "('audit_provider_id', 'audit_model_id')"
+                )
 
     def replace_fetched_models(
         self, provider_id: str, models: list[dict[str, Any]]
@@ -1131,6 +1225,22 @@ class Storage:
                     "DELETE FROM app_state WHERE key IN "
                     "('active_provider_id', 'active_model_id')"
                 )
+            audit = conn.execute(
+                "SELECT value FROM app_state WHERE key = 'audit_provider_id'"
+            ).fetchone()
+            audit_model = conn.execute(
+                "SELECT value FROM app_state WHERE key = 'audit_model_id'"
+            ).fetchone()
+            if (
+                audit is not None
+                and audit_model is not None
+                and audit["value"] == provider_id
+                and audit_model["value"] == model_id
+            ):
+                conn.execute(
+                    "DELETE FROM app_state WHERE key IN "
+                    "('audit_provider_id', 'audit_model_id')"
+                )
 
     def set_active_ai(self, provider_id: str, model_id: str) -> dict[str, Any]:
         with self._connect() as conn:
@@ -1208,6 +1318,56 @@ class Storage:
         provider["requires_key"] = bool(provider.get("requires_key"))
         model = _model_record(model_row)
         return {"provider": provider, "model": model}
+
+    def get_audit_model(self) -> tuple[str, str]:
+        """Return the user-selected audit (provider_id, model_id).
+
+        Empty provider_id means the audit model follows the executor model.
+        """
+        with self._connect() as conn:
+            state = {
+                row["key"]: row["value"]
+                for row in conn.execute(
+                    "SELECT key, value FROM app_state WHERE key IN "
+                    "('audit_provider_id', 'audit_model_id')"
+                ).fetchall()
+            }
+            provider_id = str(state.get("audit_provider_id") or "")
+            model_id = str(state.get("audit_model_id") or "")
+            if not provider_id:
+                return "", ""
+            exists = conn.execute(
+                "SELECT 1 FROM ai_models WHERE provider_id = ? AND model_id = ?",
+                (provider_id, model_id),
+            ).fetchone()
+            if exists is None:
+                conn.execute(
+                    "DELETE FROM app_state WHERE key IN "
+                    "('audit_provider_id', 'audit_model_id')"
+                )
+                return "", ""
+        return provider_id, model_id
+
+    def set_audit_model(self, provider_id: str = "", model_id: str = "") -> None:
+        with self._connect() as conn:
+            if not provider_id:
+                conn.execute(
+                    "DELETE FROM app_state WHERE key IN "
+                    "('audit_provider_id', 'audit_model_id')"
+                )
+                return
+            conn.execute(
+                "INSERT INTO app_state (key, value) "
+                "VALUES ('audit_provider_id', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (provider_id,),
+            )
+            conn.execute(
+                "INSERT INTO app_state (key, value) "
+                "VALUES ('audit_model_id', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (model_id,),
+            )
 
     def record_ai_usage(
         self,

@@ -17,6 +17,7 @@ class Provider(Protocol):
         *,
         instructions: list[str] | None = None,
         on_delta=None,
+        context: str = "",
     ) -> Action:
         ...
 

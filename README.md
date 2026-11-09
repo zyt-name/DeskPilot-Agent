@@ -7,7 +7,10 @@
 - Windows-MCP 主通道：UIA 元素树、截图、鼠标键盘、PowerShell。
 - Computer-Use MCP 视觉通道：基于截图的坐标级操作（可选）。
 - xshell-mcp 终端通道：Xshell 会话桥接（可选，需本机安装 Xshell）。
+- auto 模式：模型按任务自动选择通道——普通桌面任务优先 Windows-MCP，SSH / 远程 / Linux 任务走 xshell，Windows-MCP 观测失败时回退 Computer-Use（需可识图模型）。
+- 发送框内按厂商分组的模型选择（仅影响本次任务）；任务标题右侧「审计模型」可选择顶层审计 AI 使用的模型，默认跟随执行模型。
 - 本地桌面控制台（pywebview + WebView2）：任务运行、历史、AI 模型配置、Token 用量、MCP 资源检测。
+- 任务收尾：结束时生成中文任务总结（成功说明当前状态，失败说明原因），工具步骤折叠为「执行工具 N 次」，并发送 Windows 系统通知。
 - 多厂商 AI 配置：OpenAI 兼容 / Anthropic Messages / Gemini / Ollama，API Key 使用 Windows DPAPI 加密入库。
 - 第三方 MCP 资源自动初始化：启动时检测、缺失时自动下载并构建，支持版本化目录与国内镜像回退。
 
@@ -17,14 +20,14 @@
 
 | 组件 | 上游仓库 | 版本 | 固定提交 | 本地目录（稳定入口） | 用途 | 许可 |
 |---|---|---|---|---|---|---|
-| Windows-MCP | <https://github.com/CursorTouch/Windows-MCP> | 0.8.8 | `6613da7248cea1c22ac89ea9fdf74f11cfbecac8` | `vendor/Windows-MCP-0.8.8` → `vendor/Windows-MCP` | 主桌面通道 | MIT |
+| Windows-MCP | <https://github.com/CursorTouch/Windows-MCP> | 0.8.5 | `30c1472f807eefa44774a2fe23a5b10502a59f23` | `vendor/Windows-MCP-0.8.5` → `vendor/Windows-MCP` | 主桌面通道 | MIT |
 | computer-use-mcp | <https://github.com/domdomegg/computer-use-mcp> | 1.8.0 | `a41523056a4373984dc1faddbe757346fe480189` | `vendor/computer-use-mcp-1.8.0` → `vendor/computer-use-mcp` | 视觉通道 | MIT |
 | xshell-mcp | <https://github.com/2head1i/xshell-mcp> | 0.1.0 | `709a5f59bc18a19feb8fb2237bef664d60717961` | `vendor/xshell-mcp-0.1.0` → `vendor/xshell-mcp` | 终端通道 | 上游未声明，见仓库 README |
 
 对应的源码归档地址（版本号与提交均来自上述仓库）：
 
 ```text
-https://github.com/CursorTouch/Windows-MCP/archive/6613da7248cea1c22ac89ea9fdf74f11cfbecac8.zip
+https://github.com/CursorTouch/Windows-MCP/archive/30c1472f807eefa44774a2fe23a5b10502a59f23.zip
 https://github.com/domdomegg/computer-use-mcp/archive/a41523056a4373984dc1faddbe757346fe480189.zip
 https://github.com/2head1i/xshell-mcp/archive/709a5f59bc18a19feb8fb2237bef664d60717961.zip
 ```
@@ -53,14 +56,16 @@ https://github.com/2head1i/xshell-mcp/archive/709a5f59bc18a19feb8fb2237bef664d60
 
 - 已就绪的资源只做本地版本/入口检查，不访问网络。
 - 缺失、版本不符或缺少运行环境时，自动下载、解压并构建；失败不会阻止控制台启动，可在界面中重试。
+- 需要同时验证「服务能不能真的启动」时，用界面检测或 `resources check`。
 
 ### 界面检测
 
 「设置 → MCP 资源 → 检测并修复资源」会弹出悬浮窗：
 
-1. 显示「正在检测资源完整性」，逐项检查版本与入口文件。
+1. 显示「正在检测资源完整性」，逐项检查版本、安装阶段与入口文件。
 2. 发现缺失项后自动开始下载，显示总体进度条与每项状态。
-3. 完成后列出每项资源的版本和结果；失败项会保留错误信息。
+3. 结构检查通过后启动对应 MCP 服务，完成一次真实的 `initialize` + `tools/list` 握手，显示「运行可用 / 运行不可用」及工具数量。
+4. 失败项会保留错误信息；点击「强制重装失败项」可跳过“已就绪”判断重新安装。
 
 ### 命令行
 
@@ -73,6 +78,9 @@ PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent resources ensure
 
 # 只安装某一项
 PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent resources ensure --only computer_use_mcp
+
+# 结构检查 + 真实 MCP 握手（必需资源不可用时退出码为 1）
+PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent resources check
 ```
 
 ### 版本化目录
@@ -81,8 +89,8 @@ PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent resources ensure --only comp
 
 ```text
 vendor/
-  Windows-MCP-0.8.8/        # 固定版本源码 + 独立 .venv
-  Windows-MCP               # junction -> Windows-MCP-0.8.8
+  Windows-MCP-0.8.5/        # 固定版本源码 + 独立 .venv
+  Windows-MCP               # junction -> Windows-MCP-0.8.5
   computer-use-mcp-1.8.0/
   computer-use-mcp          # junction -> computer-use-mcp-1.8.0
 ```
@@ -115,7 +123,7 @@ vendor/
 ## 环境要求
 
 - Windows 10/11，x64。
-- Python 3.14（Windows-MCP 要求 `>=3.14`；项目自身 `>=3.12`）。
+- Python 3.12+（项目与 Windows-MCP 0.8.5 均使用项目内 `.venv`）。
 - Node.js 20+（仅 Computer-Use MCP 与 xshell-mcp 需要）。
 - WebView2 Runtime（pywebview 桌面窗口）。
 - 本机安装 Xshell 后，xshell-mcp 才能执行真实终端命令。

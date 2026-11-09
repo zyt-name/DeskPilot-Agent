@@ -61,6 +61,33 @@ class RecordingProvider:
         return Action("task.finish", {"summary": "done"})
 
 
+class ContextProvider(RecordingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.context = ""
+
+    def decide(
+        self,
+        goal,
+        observation: Observation,
+        history: list[StepRecord],
+        remaining_steps: int,
+        *,
+        instructions=None,
+        on_delta=None,
+        context="",
+    ) -> Action:
+        self.context = context
+        return super().decide(
+            goal,
+            observation,
+            history,
+            remaining_steps,
+            instructions=instructions,
+            on_delta=on_delta,
+        )
+
+
 class AgentRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
@@ -81,6 +108,7 @@ class AgentRuntimeTests(unittest.TestCase):
         actions: list[Action],
         confirm: bool = True,
         max_failures: int = 2,
+        on_event=None,
     ) -> AgentRuntime:
         return AgentRuntime(
             adapter=self.adapter,
@@ -91,6 +119,7 @@ class AgentRuntimeTests(unittest.TestCase):
             max_steps=6,
             max_consecutive_failures=max_failures,
             confirm=lambda action, reason, mandatory=False: confirm,
+            on_event=on_event,
         )
 
     def test_done_flow_writes_audit_and_releases_lock(self):
@@ -188,8 +217,48 @@ class AgentRuntimeTests(unittest.TestCase):
                 [Action("task.finish", {"summary": "done"})]
             ).run("task")
             self.assertEqual(result.status, "needs_human")
+            self.assertIn("桌面正被另一个进程控制", result.summary)
         finally:
             self.lock.release(token)
+
+    def test_declared_failure_ends_with_chinese_summary(self):
+        events = []
+        declared = "未能完成：登录窗口没有出现，账号仍未登录。"
+        result = self._runtime(
+            [
+                Action(
+                    "task.finish",
+                    {"success": False, "summary": declared},
+                )
+            ],
+            on_event=lambda event, payload: events.append((event, payload)),
+        ).run("登录账号")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.summary, declared)
+        self.assertEqual(result.reason, declared)
+        step_event = [
+            payload
+            for event, payload in events
+            if event == "step" and payload.get("declared_failure")
+        ]
+        self.assertTrue(step_event)
+        self.assertFalse(step_event[0]["verify_ok"])
+        result_event = [payload for event, payload in events if event == "result"]
+        self.assertEqual(result_event[-1]["summary"], declared)
+
+    def test_result_event_carries_final_summary(self):
+        events = []
+        self._runtime(
+            [Action("task.finish", {"summary": "已在桌面创建 hello.txt。"})],
+            on_event=lambda event, payload: events.append((event, payload)),
+        ).run("创建文件")
+
+        result_event = [payload for event, payload in events if event == "result"]
+        self.assertEqual(result_event[-1]["status"], "done")
+        self.assertEqual(
+            result_event[-1]["summary"], "已在桌面创建 hello.txt。"
+        )
 
     def _audited_runtime(
         self,
@@ -349,6 +418,15 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "done")
         self.assertEqual(provider.instructions, ["改用其他目录"])
         self.assertIn("instructions", events)
+
+    def test_task_context_reaches_provider(self):
+        provider = ContextProvider()
+        result = self._audited_runtime([], provider=provider).run(
+            "继续整理", context="任务记忆：上次已整理下载目录"
+        )
+
+        self.assertEqual(result.status, "done")
+        self.assertIn("下载目录", provider.context)
 
     def test_streaming_deltas_are_emitted(self):
         events = []

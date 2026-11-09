@@ -60,6 +60,7 @@ class AnthropicProvider:
         *,
         instructions: list[str] | None = None,
         on_delta: DeltaCallback | None = None,
+        context: str = "",
     ) -> Action:
         content: list[dict[str, Any]] = []
         image = image_data(observation.screenshot_path) if self.vision else None
@@ -85,6 +86,7 @@ class AnthropicProvider:
                     remaining_steps,
                     instructions=instructions,
                     screenshot_attached=image is not None,
+                    task_context=context,
                 ),
             }
         )

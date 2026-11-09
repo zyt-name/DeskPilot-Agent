@@ -87,6 +87,7 @@ class OpenAICompatProvider:
         *,
         instructions: list[str] | None = None,
         on_delta: DeltaCallback | None = None,
+        context: str = "",
     ) -> Action:
         messages = [
             {"role": "system", "content": system_prompt()},
@@ -98,6 +99,7 @@ class OpenAICompatProvider:
                     history,
                     remaining_steps,
                     instructions=instructions,
+                    task_context=context,
                 ),
             },
         ]
@@ -321,6 +323,7 @@ class OpenAICompatProvider:
         remaining_steps: int,
         *,
         instructions: list[str] | None = None,
+        task_context: str = "",
     ) -> str | list[dict[str, Any]]:
         image = image_data(observation.screenshot_path) if self.vision else None
         text = observation_text(
@@ -330,6 +333,7 @@ class OpenAICompatProvider:
             remaining_steps,
             instructions=instructions,
             screenshot_attached=image is not None,
+            task_context=task_context,
         )
         if image is None:
             return text

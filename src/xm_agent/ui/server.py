@@ -15,6 +15,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from ..adapters.auto import (
+    AUTO_ADAPTER,
+    SCREEN_KINDS,
+    AutoAdapter,
+    adapter_kind,
+    auto_available,
+    auto_chain,
+    choose_primary,
+)
 from ..ai.catalog import is_vision_model
 from ..ai.service import AiService
 from ..audit import AuditLog
@@ -22,14 +31,18 @@ from ..bootstrap import (
     build_adapter,
     build_audit_gate,
     build_provider,
+    ensure_vision,
     policy_from_config,
+    probe_adapter_kind,
 )
 from ..config import AgentConfig
+from ..context import compact_context, snapshot_context
 from ..control import RunControl
 from ..lock import LeaseLock
 from ..resources import ResourceManager
 from ..runtime import AgentRuntime
 from ..storage import Storage
+from ..summary import FINISH_LABELS, final_summary, one_line
 
 STATIC_DIR = Path(__file__).parent / "static"
 _ASSETS = {
@@ -41,10 +54,26 @@ _ASSETS = {
 }
 _MAX_BODY = 64 * 1024
 _MAX_EVENTS = 300
+_TITLE_SYSTEM_PROMPT = (
+    "你是任务命名助手。根据用户目标和执行结果，用不超过 16 个汉字概括任务。"
+    "只输出任务名称，不要引号、标点或解释。"
+)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _clean_task_title(text: str) -> str:
+    line = " ".join(str(text or "").strip().split())
+    if not line:
+        return ""
+    if line.startswith(("{", "[")) or '"verdict"' in line or "```" in line:
+        return ""
+    line = line.strip(" \t\"'“”‘’《》【】[]()（）:：-—.")
+    if len(line) < 2:
+        return ""
+    return line[:20]
 
 
 class _QuietThreadingHTTPServer(ThreadingHTTPServer):
@@ -76,10 +105,12 @@ class UiServer:
         port: int = 0,
         resources_root: str | Path | None = None,
         indicator: Any | None = None,
+        notifier: Any | None = None,
     ) -> None:
         self.config = config
         self.storage = Storage(db_path)
         self.indicator = indicator
+        self.notifier = notifier
         self.native_hotkey = False
         self.ai = AiService(self.storage)
         self.host = host
@@ -93,6 +124,7 @@ class UiServer:
         self._active = threading.Lock()
         self._resource_lock = threading.Lock()
         self._resource_job: dict[str, Any] | None = None
+        self._resource_probes: dict[str, dict[str, Any]] = {}
         self._run_conversations: dict[str, str | None] = {}
         self._controls: dict[str, RunControl] = {}
         self._control_lock = threading.Lock()
@@ -136,6 +168,40 @@ class UiServer:
         if self._thread is not None:
             self._thread.join(timeout=3)
 
+    def audit_snapshot(self) -> dict[str, Any]:
+        provider_id, model_id = self.storage.get_audit_model()
+        follow = not bool(provider_id)
+        if follow:
+            provider_id = self.config.audit_ai.model_provider_id
+            model_id = self.config.audit_ai.model_id
+            follow = not bool(provider_id)
+        return {
+            "mode": self.config.audit_ai.mode,
+            "modes": ["ai", "confirm_all"],
+            "model_provider_id": provider_id,
+            "model_id": model_id,
+            "follow_executor": follow,
+            "fail_closed": self.config.audit_ai.fail_closed,
+        }
+
+    def ai_choices(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": provider["id"],
+                "name": provider["name"],
+                "models": [
+                    {
+                        "model_id": model["model_id"],
+                        "display_name": model.get("display_name")
+                        or model["model_id"],
+                        "vision": bool(model.get("vision")),
+                    }
+                    for model in provider.get("models", [])
+                ],
+            }
+            for provider in self.storage.list_ai_providers()
+        ]
+
     def bootstrap(self) -> dict[str, Any]:
         api_key = os.environ.get(self.config.model.api_key_env)
         return {
@@ -145,6 +211,7 @@ class UiServer:
             "conversations": self.storage.list_conversations(30),
             "queue": self.queue_snapshot(),
             "ai": self.ai.bootstrap_summary(),
+            "ai_choices": self.ai_choices(),
             "hotkey": {
                 "enabled": bool(self.native_hotkey),
                 "key": "F8",
@@ -152,15 +219,10 @@ class UiServer:
             "screen_indicator": bool(
                 self.indicator is not None and self.indicator.available
             ),
-            "audit": {
-                "mode": self.config.audit_ai.mode,
-                "modes": ["ai", "confirm_all"],
-                "model_provider_id": self.config.audit_ai.model_provider_id,
-                "model_id": self.config.audit_ai.model_id,
-                "fail_closed": self.config.audit_ai.fail_closed,
-            },
+            "audit": self.audit_snapshot(),
             "config": {
                 "adapters": sorted(self.config.adapters),
+                "auto_available": auto_available(self.config),
                 "default_adapter": self.config.default_adapter,
                 "model": {
                     "provider": self.config.model.provider,
@@ -168,14 +230,25 @@ class UiServer:
                     "vision": is_vision_model(self.config.model.model),
                     "api_key_env": self.config.model.api_key_env,
                     "api_key_present": bool(api_key),
+                    "context_window": self.config.model.context_window,
                 },
                 "audit_root": self.config.audit.root,
                 "db_path": str(self.storage.path.resolve()),
             },
         }
 
+    def _resource_dict(self, state: Any) -> dict[str, Any]:
+        data = state.to_dict()
+        probe = self._resource_probes.get(state.id) if state.ok else None
+        if probe:
+            data["runtime_ok"] = probe.get("ok")
+            data["runtime_detail"] = probe.get("detail", "")
+            data["runtime_tools"] = list(probe.get("tools") or [])
+            data["runtime_checked_at"] = probe.get("checked_at", "")
+        return data
+
     def resources_snapshot(self) -> dict[str, Any]:
-        states = [state.to_dict() for state in self.resources.status()]
+        states = [self._resource_dict(state) for state in self.resources.status()]
         with self._resource_lock:
             job = copy.deepcopy(self._resource_job)
         return {
@@ -192,7 +265,7 @@ class UiServer:
         with self._resource_lock:
             if self._resource_job and self._resource_job.get("running"):
                 return self.resources_snapshot()
-            states = [state.to_dict() for state in self.resources.status()]
+            states = [self._resource_dict(state) for state in self.resources.status()]
             job_id = uuid.uuid4().hex[:12]
             self._resource_job = {
                 "id": job_id,
@@ -264,8 +337,24 @@ class UiServer:
             states = self.resources.ensure(
                 only=only or None, force=force, progress=on_progress
             )
+            with self._resource_lock:
+                job = self._resource_job
+                if job is not None and job.get("id") == job_id:
+                    job["percent"] = 90
+                    job["phase"] = "probe"
+                    job["message"] = "结构检查完成，正在检测运行可用性"
+            self._probe_resources(states, job_id, on_progress)
             failed = [
-                state for state in states if not state.ok and state.required
+                state
+                for state in states
+                if state.required
+                and (not state.ok or state.runtime_ok is False)
+            ]
+            optional_failed = [
+                state
+                for state in states
+                if not state.required
+                and (not state.ok or state.runtime_ok is False)
             ]
             with self._resource_lock:
                 job = self._resource_job
@@ -278,11 +367,17 @@ class UiServer:
                 job["ok"] = not failed
                 if failed:
                     job["message"] = (
-                        "检测完成，以下必需资源未就绪："
+                        "检测完成，以下必需资源不可用："
                         + "、".join(state.name for state in failed)
+                        + "（可强制重装失败项）"
+                    )
+                elif optional_failed:
+                    job["message"] = (
+                        "检测完成，必需资源可用；可选资源未就绪："
+                        + "、".join(state.name for state in optional_failed)
                     )
                 else:
-                    job["message"] = "检测完成，资源已就绪"
+                    job["message"] = "检测完成，资源结构完整且运行可用"
         except Exception as exc:
             with self._resource_lock:
                 job = self._resource_job
@@ -295,11 +390,79 @@ class UiServer:
                 job["error"] = str(exc)
                 job["message"] = f"资源检测失败：{exc}"
 
+    def _probe_resources(
+        self,
+        states: list[Any],
+        job_id: str,
+        on_progress: Any,
+    ) -> None:
+        ready = [state for state in states if state.ok]
+        total = len(ready)
+        for index, state in enumerate(ready):
+            with self._resource_lock:
+                job = self._resource_job
+                if job is None or job.get("id") != job_id:
+                    return
+                job["message"] = f"正在检测 {state.name} 运行可用性"
+                job["percent"] = max(
+                    int(job.get("percent") or 0),
+                    90 + int(index / max(1, total) * 9),
+                )
+            try:
+                result = probe_adapter_kind(self.config, state.id, timeout=20)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "detail": f"检测异常：{exc}",
+                    "tools": [],
+                }
+            state.runtime_ok = bool(result.get("ok"))
+            state.runtime_detail = str(result.get("detail") or "")
+            state.runtime_tools = list(result.get("tools") or [])
+            state.runtime_checked_at = _now()
+            self._resource_probes[state.id] = {
+                "ok": state.runtime_ok,
+                "detail": state.runtime_detail,
+                "tools": list(state.runtime_tools),
+                "checked_at": state.runtime_checked_at,
+            }
+            on_progress(
+                {
+                    "event": "probe",
+                    "resource": state.id,
+                    "state": state.to_dict(),
+                    "message": f"{state.name} 运行可用性："
+                    + ("通过" if state.runtime_ok else "失败"),
+                    "percent": min(99, 90 + int((index + 1) / max(1, total) * 9)),
+                }
+            )
+
+    def _adapter_allowed(self, name: str) -> bool:
+        if name in self.config.adapters:
+            return True
+        return name == AUTO_ADAPTER and auto_available(self.config)
+
+    def _validate_model_selection(
+        self, provider_id: str, model_id: str
+    ) -> None:
+        if not provider_id and not model_id:
+            return
+        if not provider_id or not model_id:
+            raise ValueError("model provider and model must be selected together")
+        if self.storage.get_ai_provider(provider_id) is None:
+            raise ValueError("unknown AI provider")
+        models = {
+            item["model_id"]
+            for item in self.storage.list_ai_models(provider_id)
+        }
+        if model_id not in models:
+            raise ValueError("unknown model for this provider")
+
     def save_profile(self, fields: dict[str, Any]) -> dict[str, Any]:
         adapter = str(
             fields.get("default_adapter", self.config.default_adapter)
         )
-        if adapter not in self.config.adapters:
+        if not self._adapter_allowed(adapter):
             raise ValueError(f"unknown adapter: {adapter}")
         allowed = {
             "display_name": fields.get("display_name"),
@@ -314,9 +477,12 @@ class UiServer:
     # -- conversations ------------------------------------------------
 
     def create_conversation(self, fields: dict[str, Any]) -> dict[str, Any]:
+        adapter = str(fields.get("adapter") or self.config.default_adapter)
+        if not self._adapter_allowed(adapter):
+            raise ValueError(f"unknown adapter: {adapter}")
         return self.storage.create_conversation(
             title=str(fields.get("title") or ""),
-            adapter=str(fields.get("adapter") or self.config.default_adapter),
+            adapter=adapter,
             audit_mode=str(fields.get("audit_mode") or self.config.audit_ai.mode),
         )
 
@@ -325,8 +491,15 @@ class UiServer:
     ) -> dict[str, Any]:
         if fields.get("audit_mode") not in {None, "ai", "confirm_all"}:
             raise ValueError("audit_mode must be ai or confirm_all")
-        if "adapter" in fields and fields["adapter"] not in self.config.adapters:
+        if "adapter" in fields and not self._adapter_allowed(
+            str(fields["adapter"])
+        ):
             raise ValueError(f"unknown adapter: {fields['adapter']}")
+        if "title" in fields:
+            title = str(fields.get("title") or "").strip()
+            if not title:
+                raise ValueError("title must not be empty")
+            fields = {**fields, "title": title[:60]}
         updated = self.storage.update_conversation(conversation_id, fields)
         if updated is None:
             raise ValueError("conversation not found")
@@ -354,6 +527,21 @@ class UiServer:
                 run["pause_reason"] = snapshot["pause_reason"]
                 run["pending_instructions"] = snapshot["pending_instructions"]
         return conversation
+
+    def conversation_context(
+        self, conversation_id: str
+    ) -> dict[str, Any] | None:
+        conversation = self.storage.get_conversation(
+            conversation_id, include_messages=False
+        )
+        if conversation is None:
+            return None
+        snapshot = snapshot_context(
+            self.storage,
+            conversation_id,
+            context_window=self.config.model.context_window,
+        )
+        return {"conversation_id": conversation_id, **snapshot.to_dict()}
 
     # -- live events --------------------------------------------------
 
@@ -505,6 +693,11 @@ class UiServer:
         if control is None:
             raise ValueError("run is not active")
         control.pause("用户暂停")
+        if self.indicator is not None:
+            try:
+                self.indicator.set_paused(True)
+            except Exception:
+                pass
         self._publish(
             "pause",
             {"run_id": run_id, "paused": True},
@@ -519,6 +712,11 @@ class UiServer:
         if control is None:
             raise ValueError("run is not active")
         control.resume()
+        if self.indicator is not None:
+            try:
+                self.indicator.set_paused(False)
+            except Exception:
+                pass
         self._publish(
             "pause",
             {"run_id": run_id, "paused": False},
@@ -553,11 +751,13 @@ class UiServer:
         return True
 
     def _uses_screen(self, adapter_name: str) -> bool:
+        if adapter_name == AUTO_ADAPTER:
+            return any(
+                adapter.kind in SCREEN_KINDS
+                for adapter in self.config.adapters.values()
+            )
         adapter = self.config.adapters.get(adapter_name)
-        return adapter is not None and adapter.kind in {
-            "windows_mcp",
-            "computer_use_mcp",
-        }
+        return adapter is not None and adapter.kind in SCREEN_KINDS
 
     def instruct_run(self, run_id: str, text: str) -> str:
         control = self._control_for(run_id)
@@ -627,6 +827,8 @@ class UiServer:
         *,
         conversation_id: str | None = None,
         audit_mode: str | None = None,
+        model_provider_id: str = "",
+        model_id: str = "",
     ) -> dict[str, Any]:
         goal = goal.strip()
         if not goal:
@@ -640,7 +842,7 @@ class UiServer:
                 raise ValueError("conversation not found")
             if not adapter_name:
                 adapter_name = conversation["adapter"]
-        if adapter_name not in self.config.adapters:
+        if not self._adapter_allowed(adapter_name):
             raise ValueError(f"unknown adapter: {adapter_name}")
         mode = (
             audit_mode
@@ -649,10 +851,18 @@ class UiServer:
         )
         if mode not in {"ai", "confirm_all"}:
             raise ValueError("audit_mode must be ai or confirm_all")
+        model_provider_id = str(model_provider_id or "")
+        model_id = str(model_id or "")
+        self._validate_model_selection(model_provider_id, model_id)
 
         if not self._active.acquire(blocking=False):
             task = self.storage.enqueue_task(
-                conversation_id or "", goal, adapter_name, mode
+                conversation_id or "",
+                goal,
+                adapter_name,
+                mode,
+                model_provider_id,
+                model_id,
             )
             self._publish(
                 "queue_added",
@@ -668,6 +878,8 @@ class UiServer:
                 bool(auto_confirm),
                 conversation_id,
                 mode,
+                model_provider_id=model_provider_id,
+                model_id=model_id,
             )
         except Exception:
             self._active.release()
@@ -682,10 +894,14 @@ class UiServer:
         conversation_id: str | None,
         audit_mode: str,
         task_id: str | None = None,
+        model_provider_id: str = "",
+        model_id: str = "",
     ) -> str:
         run_id = uuid.uuid4().hex[:12]
         active = self.ai.active_summary()
-        if active is not None:
+        if model_id:
+            run_model = model_id
+        elif active is not None:
             run_model = active["model"]
         elif self.config.model.provider in {"openai_compat", "openai"}:
             run_model = self.config.model.model
@@ -695,10 +911,13 @@ class UiServer:
             "id": run_id,
             "goal": goal[:500],
             "adapter": adapter_name,
+            "resolved_adapter": "",
             "status": "running",
             "reason": "",
             "steps": 0,
             "model": run_model,
+            "model_provider_id": model_provider_id,
+            "model_id": model_id,
             "conversation_id": conversation_id,
             "audit_mode": audit_mode,
             "created_at": _now(),
@@ -715,8 +934,8 @@ class UiServer:
                 if conversation is None:
                     raise ValueError("conversation not found")
                 if not conversation["title"]:
-                    self.storage.update_conversation(
-                        conversation_id, {"title": goal[:60]}
+                    self.storage.set_auto_title(
+                        conversation_id, goal.strip()[:24]
                     )
                 self.storage.add_message(
                     conversation_id,
@@ -727,6 +946,8 @@ class UiServer:
                         "run_id": run_id,
                         "adapter": adapter_name,
                         "audit_mode": audit_mode,
+                        "model_provider_id": model_provider_id,
+                        "model_id": model_id,
                     },
                 )
             self.storage.create_run(
@@ -745,6 +966,8 @@ class UiServer:
                     conversation_id,
                     audit_mode,
                     task_id,
+                    model_provider_id,
+                    model_id,
                 ),
                 daemon=True,
             ).start()
@@ -771,6 +994,8 @@ class UiServer:
                 conversation_id,
                 task["audit_mode"],
                 task_id=task["id"],
+                model_provider_id=task.get("model_provider_id") or "",
+                model_id=task.get("model_id") or "",
             )
             self._publish(
                 "queue",
@@ -796,10 +1021,13 @@ class UiServer:
                 "id": entry["id"],
                 "goal": entry["goal"],
                 "adapter": entry["adapter"],
+                "resolved_adapter": entry.get("resolved_adapter", ""),
                 "status": entry["status"],
                 "reason": entry["reason"],
                 "steps": entry["steps"],
                 "model": entry["model"],
+                "model_provider_id": entry.get("model_provider_id", ""),
+                "model_id": entry.get("model_id", ""),
                 "conversation_id": entry.get("conversation_id"),
                 "audit_mode": entry.get("audit_mode"),
                 "created_at": entry["created_at"],
@@ -816,6 +1044,8 @@ class UiServer:
         conversation_id: str | None = None,
         audit_mode: str | None = None,
         task_id: str | None = None,
+        model_provider_id: str = "",
+        model_id: str = "",
     ) -> None:
         thinking: list[str] = []
         assistant: list[str] = []
@@ -837,7 +1067,7 @@ class UiServer:
                 payload,
                 run_id=run_id,
                 conversation_id=conversation_id,
-                persist=event not in {"thinking", "assistant"},
+                persist=event not in {"thinking", "assistant", "context"},
             )
 
         def confirm(action, prompt: str, mandatory: bool = False) -> bool:
@@ -849,36 +1079,93 @@ class UiServer:
         with self._control_lock:
             self._controls[run_id] = control
         adapter = None
-        status, reason, steps = "failed", "", 0
-        screen = self.indicator is not None and self._uses_screen(adapter_name)
-        if screen:
-            try:
-                self.indicator.show()
-            except Exception:
-                pass
+        status, reason, steps, summary = "failed", "", 0, ""
+        screen = False
         try:
-            adapter = build_adapter(self.config, adapter_name)
             provider = build_provider(
                 self.config,
                 adapter_name,
                 storage=self.storage,
                 source="ui",
                 run_id=run_id,
+                model_provider_id=model_provider_id,
+                model_id=model_id,
+            )
+            provider_model = str(
+                getattr(provider, "provider_model", "")
+                or getattr(provider, "model", "")
+                or provider.name
+            )
+            provider_name = str(
+                getattr(provider, "provider_name", "") or provider.name
+            )
+            vision = bool(
+                getattr(provider, "provider_vision", False)
+                or getattr(provider, "vision", False)
             )
             on_event(
                 "model",
                 {
-                    "model": getattr(provider, "provider_model", "")
-                    or getattr(provider, "model", "")
-                    or provider.name,
-                    "provider": getattr(provider, "provider_name", "")
-                    or provider.name,
-                    "vision": bool(
-                        getattr(provider, "provider_vision", False)
-                        or getattr(provider, "vision", False)
-                    ),
+                    "model": provider_model,
+                    "provider": provider_name,
+                    "vision": vision,
                 },
             )
+            if adapter_name == AUTO_ADAPTER:
+                primary, route_reason = choose_primary(
+                    self.config, goal, provider, vision_available=vision
+                )
+                ensure_vision(self.config, primary, provider)
+                chain = auto_chain(
+                    self.config, primary, vision_available=vision
+                )
+                with self._runs_lock:
+                    entry = self._runs.get(run_id)
+                    if entry is not None:
+                        entry["resolved_adapter"] = primary
+                on_event(
+                    "route",
+                    {
+                        "mode": "auto",
+                        "adapter": primary,
+                        "reason": route_reason,
+                        "chain": chain,
+                    },
+                )
+                adapter = AutoAdapter(
+                    lambda name: build_adapter(self.config, name),
+                    chain,
+                    on_switch=lambda payload: on_event(
+                        "route", {**payload, "mode": "auto"}
+                    ),
+                )
+                needs_screen = any(
+                    adapter_kind(self.config, name) in SCREEN_KINDS
+                    for name in chain
+                )
+            else:
+                adapter = build_adapter(self.config, adapter_name)
+                needs_screen = self._uses_screen(adapter_name)
+            if self.indicator is not None and needs_screen:
+                screen = True
+                try:
+                    self.indicator.show()
+                except Exception:
+                    pass
+            task_context = ""
+            if conversation_id:
+                try:
+                    snapshot = compact_context(
+                        self.storage,
+                        conversation_id,
+                        goal=goal,
+                        context_window=self.config.model.context_window,
+                        provider=provider,
+                    )
+                    task_context = snapshot.prompt()
+                    on_event("context", snapshot.to_dict())
+                except Exception:
+                    task_context = ""
             gate = build_audit_gate(
                 self.config,
                 self.storage,
@@ -889,6 +1176,7 @@ class UiServer:
                 project_root=os.getcwd(),
                 workspace_roots=list(self.config.policy.allowed_paths)
                 or None,
+                executor=(provider, provider_name, provider_model),
             )
             runtime = AgentRuntime(
                 adapter=adapter,
@@ -910,12 +1198,16 @@ class UiServer:
                 gate=gate,
                 control=control,
             )
-            result = runtime.run(goal)
+            result = runtime.run(goal, context=task_context)
             status = result.status
             reason = result.reason
             steps = len(result.steps)
+            summary = result.summary or final_summary(
+                status, reason, result.steps
+            )
         except Exception as exc:
             reason = str(exc)
+            summary = final_summary("failed", reason, [])
             on_event("error", {"message": reason})
         finally:
             if screen:
@@ -938,7 +1230,12 @@ class UiServer:
                     entry["reason"] = reason
                     entry["steps"] = steps
             if conversation_id:
-                text = "".join(assistant).strip() or reason or status
+                text = (
+                    summary
+                    or "".join(assistant).strip()
+                    or reason
+                    or status
+                )
                 self.storage.add_message(
                     conversation_id,
                     "assistant",
@@ -948,6 +1245,7 @@ class UiServer:
                         "run_id": run_id,
                         "status": status,
                         "reason": reason,
+                        "summary": summary,
                         "steps": steps,
                         "thinking": "".join(thinking)[:8000],
                     },
@@ -969,8 +1267,116 @@ class UiServer:
                 conversation_id=conversation_id,
                 persist=False,
             )
+            self._notify_finished(goal, status, summary, reason)
             self._active.release()
             self._start_next_queued()
+            if conversation_id:
+                threading.Thread(
+                    target=self._after_run,
+                    args=(run_id, conversation_id, goal),
+                    daemon=True,
+                ).start()
+
+    def _notify_finished(
+        self,
+        goal: str,
+        status: str,
+        summary: str,
+        reason: str,
+    ) -> None:
+        if self.notifier is None:
+            return
+        label = FINISH_LABELS.get(status, "任务结束")
+        goal_text = one_line(goal, 28)
+        title = f"{label} · {goal_text}" if goal_text else label
+        body = one_line(summary or reason or "任务已结束", 200)
+        try:
+            self.notifier.notify(title, body)
+        except Exception:
+            return
+
+    def _after_run(
+        self, run_id: str, conversation_id: str, goal: str
+    ) -> None:
+        provider = None
+        try:
+            conversation = self.storage.get_conversation(
+                conversation_id, include_messages=False
+            )
+            if conversation is not None:
+                provider = build_provider(
+                    self.config,
+                    conversation["adapter"],
+                    storage=self.storage,
+                    source="context",
+                    run_id=run_id,
+                )
+        except Exception:
+            provider = None
+        try:
+            snapshot = compact_context(
+                self.storage,
+                conversation_id,
+                context_window=self.config.model.context_window,
+                provider=provider,
+            )
+            self._publish(
+                "context",
+                {"conversation_id": conversation_id, **snapshot.to_dict()},
+                conversation_id=conversation_id,
+                persist=False,
+            )
+        except Exception:
+            pass
+        self._suggest_title(run_id, conversation_id, goal, provider)
+
+    def _suggest_title(
+        self,
+        run_id: str,
+        conversation_id: str,
+        goal: str,
+        provider: Any | None = None,
+    ) -> None:
+        try:
+            conversation = self.storage.get_conversation(
+                conversation_id, include_messages=False
+            )
+            if (
+                conversation is None
+                or conversation.get("title_source") == "user"
+                or len(conversation.get("runs") or []) != 1
+            ):
+                return
+            messages = self.storage.list_messages(conversation_id)
+            result = ""
+            for message in reversed(messages):
+                if message["role"] == "assistant":
+                    result = str(message.get("content") or "")
+                    break
+            if provider is None:
+                provider = build_provider(
+                    self.config,
+                    conversation["adapter"],
+                    storage=self.storage,
+                    source="title",
+                    run_id=run_id,
+                )
+            prompt = f"目标：{goal.strip()[:500]}\n结果：{result.strip()[:600]}"
+            text = provider.complete(
+                _TITLE_SYSTEM_PROMPT, prompt, max_tokens=32
+            )
+            title = _clean_task_title(text)
+            if not title:
+                return
+            self.storage.set_auto_title(conversation_id, title)
+            self._publish(
+                "conversation_title",
+                {"conversation_id": conversation_id, "title": title},
+                conversation_id=conversation_id,
+                persist=False,
+            )
+        except Exception:
+            return
 
 
 def _make_handler(app: UiServer):
@@ -1022,6 +1428,13 @@ def _make_handler(app: UiServer):
                 return
             if path.startswith("/api/conversations/"):
                 parts = path.strip("/").split("/")
+                if len(parts) == 4 and parts[3] == "context":
+                    snapshot = app.conversation_context(parts[2])
+                    if snapshot is None:
+                        self._json({"error": "conversation not found"}, 404)
+                    else:
+                        self._json(snapshot)
+                    return
                 if len(parts) == 3:
                     conversation = app.conversation_detail(parts[2])
                     if conversation is None:
@@ -1067,8 +1480,22 @@ def _make_handler(app: UiServer):
                             str(conversation_id) if conversation_id else None
                         ),
                         audit_mode=str(audit_mode) if audit_mode else None,
+                        model_provider_id=str(
+                            body.get("model_provider_id") or ""
+                        ),
+                        model_id=str(body.get("model_id") or ""),
                     )
                     self._json(result, 202)
+                    return
+                if path == "/api/audit/model":
+                    provider_id = str(body.get("provider_id") or "")
+                    model_id = str(body.get("model_id") or "")
+                    if provider_id:
+                        app._validate_model_selection(provider_id, model_id)
+                    app.storage.set_audit_model(
+                        provider_id, model_id if provider_id else ""
+                    )
+                    self._json({"audit": app.audit_snapshot()})
                     return
                 if path == "/api/conversations":
                     self._json(

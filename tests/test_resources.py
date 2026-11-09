@@ -96,12 +96,14 @@ def test_status_reads_versioned_install(tmp_path):
     manager = ResourceManager(tmp_path)
     resource = next(r for r in manager.resources if r.id == "windows_mcp")
     dest = tmp_path / resource.dest
-    _write(dest / "manifest.json", json.dumps({"version": "0.8.8"}))
+    _write(dest / "manifest.json", json.dumps({"version": resource.version}))
     _write(dest / "src/windows_mcp/__main__.py", "")
     _write(dest / ".venv/Scripts/python.exe", "")
     _write(
         dest / ".xm-agent-resource.json",
-        json.dumps({"version": "0.8.8", "stage": "ready", "source": "ghfast.top"}),
+        json.dumps(
+            {"version": resource.version, "stage": "ready", "source": "ghfast.top"}
+        ),
     )
 
     state = next(
@@ -110,6 +112,35 @@ def test_status_reads_versioned_install(tmp_path):
     assert state.status == "ready"
     assert state.source == "ghfast.top"
     assert state.stage == "ready"
+
+
+def test_status_treats_unfinished_build_as_incomplete(tmp_path):
+    manager = ResourceManager(tmp_path)
+    resource = next(r for r in manager.resources if r.id == "windows_mcp")
+    dest = tmp_path / resource.dest
+    _write(dest / "manifest.json", json.dumps({"version": resource.version}))
+    _write(dest / resource.entry, "")
+    for check in resource.runtime_checks:
+        _write(dest / check, "")
+    _write(
+        dest / ".xm-agent-resource.json",
+        json.dumps({"version": resource.version, "stage": "source"}),
+    )
+
+    state = next(item for item in manager.status() if item.id == resource.id)
+    assert state.status == "incomplete"
+    assert "未完成" in state.detail
+
+    calls: list[list[str]] = []
+
+    def runner(command, cwd, env, timeout):
+        calls.append(list(command))
+        raise AssertionError("unfinished resource must be rebuilt")
+
+    manager.runner = runner
+    states = manager.ensure(only=[resource.id])
+    assert calls
+    assert states[0].status == "error"
 
 
 def test_status_reports_outdated_legacy_clone(tmp_path):

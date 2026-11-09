@@ -41,6 +41,7 @@ class ModelConfig:
     api_key_env: str = "OPENAI_API_KEY"
     timeout_seconds: int = 60
     temperature: float = 0.0
+    context_window: int = 32768
 
 
 @dataclass
@@ -181,6 +182,9 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         ),
         temperature=float(
             model_raw.get("temperature", defaults.model.temperature)
+        ),
+        context_window=int(
+            model_raw.get("context_window", defaults.model.context_window)
         ),
     )
     policy = PolicyConfig(

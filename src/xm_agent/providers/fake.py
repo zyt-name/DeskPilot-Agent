@@ -23,6 +23,7 @@ class ScriptedProvider:
         *,
         instructions: list[str] | None = None,
         on_delta=None,
+        context: str = "",
     ) -> Action:
         if self.index >= len(self._actions):
             action = Action("task.finish", {"summary": "script complete"})
@@ -58,6 +59,7 @@ class HeuristicMockProvider:
         *,
         instructions: list[str] | None = None,
         on_delta=None,
+        context: str = "",
     ) -> Action:
         action = self._decide(goal, observation, instructions)
         if on_delta is not None:

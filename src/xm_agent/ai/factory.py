@@ -78,6 +78,58 @@ def build_ai_provider(
     return _attach(provider, row, model, vision)
 
 
+def build_model_provider(
+    storage: Storage,
+    provider_id: str,
+    model_id: str,
+    *,
+    timeout_seconds: int = 60,
+    temperature: float = 0.0,
+    source: str = "ui",
+    run_id: str | None = None,
+    vision: bool | None = None,
+):
+    """Build a provider for an explicit (provider, model) pair."""
+    row = storage.get_ai_provider(provider_id, include_secret=True)
+    if row is None:
+        raise ValueError("unknown AI provider")
+    endpoint = preset_endpoint(
+        str(row.get("preset_id") or ""), str(row.get("plan_id") or "")
+    )
+    if endpoint is not None:
+        row = {**row, **endpoint}
+    models = {
+        str(item["model_id"]): item
+        for item in storage.list_ai_models(provider_id)
+    }
+    model = models.get(model_id)
+    if model is None:
+        raise ValueError("unknown model for this provider")
+    api_key = decrypt_secret(str(row.get("api_key_enc") or ""))
+    if row.get("requires_key") and not api_key:
+        raise RuntimeError(
+            f"AI provider '{row.get('name')}' has no API key; "
+            "configure it in AI 模型"
+        )
+    recorder = usage_recorder(
+        storage,
+        provider_id,
+        str(row.get("name") or ""),
+        model_id,
+        source,
+        run_id,
+    )
+    return build_ai_provider(
+        row,
+        model_id,
+        api_key=api_key,
+        vision=bool(model.get("vision")) if vision is None else bool(vision),
+        timeout_seconds=timeout_seconds,
+        temperature=temperature,
+        on_usage=recorder,
+    )
+
+
 def build_active_provider(
     storage: Storage,
     *,
@@ -121,4 +173,9 @@ def build_active_provider(
     )
 
 
-__all__ = ["build_active_provider", "build_ai_provider", "usage_recorder"]
+__all__ = [
+    "build_active_provider",
+    "build_ai_provider",
+    "build_model_provider",
+    "usage_recorder",
+]

@@ -2,7 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from xm_agent.mcp_stdio import StdioMCPClient
+from xm_agent.mcp_stdio import MCPError, StdioMCPClient
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "examples" / "fake_mcp_server.py"
@@ -28,6 +28,19 @@ class StdioMCPClientTests(unittest.TestCase):
         self.addCleanup(client.close)
         result = client.call_tool("NoSuchTool", {})
         self.assertTrue(result.get("isError"))
+
+    def test_startup_failure_includes_stderr_and_exit_code(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('boom: missing dependency\\n'); sys.exit(3)",
+        ]
+        with self.assertRaises(MCPError) as caught:
+            StdioMCPClient(command, default_timeout=10)
+        message = str(caught.exception)
+        self.assertIn("closed stdout", message)
+        self.assertIn("boom: missing dependency", message)
+        self.assertIn("3", message)
 
 
 if __name__ == "__main__":

@@ -7,25 +7,66 @@
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
-<body>
+<body data-tab="overview">
   <div class="app">
-    <aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">XM</span>
-        <span class="brand-text">Agent<small>桌面控制台</small></span>
+    <aside class="rail">
+      <div class="rail-head">
+        <div class="rail-brand-row">
+          <button class="brand" type="button" data-jump="run" title="返回任务">
+            <span class="brand-mark">XM</span>
+            <span class="brand-text">Agent<small>桌面控制台</small></span>
+          </button>
+          <button class="icon-btn rail-toggle" id="rail-toggle" type="button" title="收起任务栏" aria-label="收起任务栏">
+            <svg class="rail-icon-collapse" viewBox="0 0 20 20" aria-hidden="true"><path d="M11.5 5.5L7 10l4.5 4.5" /><path d="M15.5 5.5L11 10l4.5 4.5" /></svg>
+            <svg class="rail-icon-expand" viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 5.5L13 10l-4.5 4.5" /><path d="M4.5 5.5L9 10l-4.5 4.5" /></svg>
+          </button>
+        </div>
+        <button class="btn btn-primary rail-new" id="task-new-conversation" type="button">
+          <span class="plus">＋</span> 新建任务
+        </button>
       </div>
-      <nav class="nav">
-        <button class="nav-item active" data-tab="overview">总览</button>
-        <button class="nav-item" data-tab="run">任务</button>
-        <button class="nav-item" data-tab="ai">AI 模型</button>
-        <button class="nav-item" data-tab="usage">用量</button>
-        <button class="nav-item" data-tab="history">历史记录</button>
-        <button class="nav-item" data-tab="settings">设置</button>
-      </nav>
-      <div class="side-foot">
-        <span class="dot" id="conn-dot"></span>
-        <span id="conn-text">连接中…</span>
+
+      <div class="rail-tasks">
+        <div class="rail-section-head">
+          <span>任务</span>
+          <button class="icon-btn" id="task-refresh" type="button" title="刷新任务列表" aria-label="刷新任务列表">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.6 6.4A6.4 6.4 0 1 0 16 11" /><path d="M16 3.6V7h-3.4" /></svg>
+          </button>
+        </div>
+        <div class="conversation-list" id="task-conversation-list">
+          <p class="empty">还没有任务。</p>
+        </div>
       </div>
+
+      <div class="rail-foot">
+        <nav class="rail-nav" aria-label="主导航">
+          <button class="nav-item rail-nav-item active" data-tab="overview" type="button" title="总览" aria-label="总览">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.4" /><rect x="11" y="3" width="6" height="6" rx="1.4" /><rect x="3" y="11" width="6" height="6" rx="1.4" /><rect x="11" y="11" width="6" height="6" rx="1.4" /></svg>
+            <span class="nav-label">总览</span>
+          </button>
+          <button class="nav-item rail-nav-item" data-tab="ai" type="button" title="AI 模型" aria-label="AI 模型">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8l1.7 4.4 4.4 1.7-4.4 1.7L10 15l-1.7-4.4L3.9 8.9l4.4-1.7z" /><path d="M15.4 13.2l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" /></svg>
+            <span class="nav-label">AI 模型</span>
+          </button>
+          <button class="nav-item rail-nav-item" data-tab="usage" type="button" title="用量" aria-label="用量">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 16V9" /><path d="M10 16V4" /><path d="M16 16v-5" /></svg>
+            <span class="nav-label">用量</span>
+          </button>
+          <button class="nav-item rail-nav-item" data-tab="history" type="button" title="历史记录" aria-label="历史记录">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.6" /><path d="M10 6.2V10l2.6 1.7" /></svg>
+            <span class="nav-label">历史</span>
+          </button>
+          <button class="nav-item rail-nav-item" data-tab="settings" type="button" title="设置" aria-label="设置">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h9" /><path d="M15 6h2" /><circle cx="13" cy="6" r="1.8" /><path d="M3 14h4" /><path d="M10 14h7" /><circle cx="8" cy="14" r="1.8" /></svg>
+            <span class="nav-label">设置</span>
+          </button>
+        </nav>
+        <div class="side-foot">
+          <span class="dot" id="conn-dot"></span>
+          <span id="conn-text">连接中…</span>
+        </div>
+      </div>
+      <div class="rail-resizer" id="rail-resizer" role="separator" aria-orientation="vertical" aria-label="调整任务栏宽度" title="拖动调整宽度，双击收起" tabindex="0"></div>
     </aside>
 
     <main class="main">
@@ -92,7 +133,7 @@
       </section>
 
       <section class="view hidden" id="view-run">
-        <div class="task-workspace">
+        <div class="task-workspace" id="task-workspace">
           <div class="task-chat">
             <div class="pause-banner hidden" id="task-pause-banner">
               <div>
@@ -107,8 +148,21 @@
 
             <header class="chat-head">
               <div class="chat-head-title">
-                <h2 id="task-conversation-title">新任务</h2>
+                <div class="chat-title-row">
+                  <h2 id="task-conversation-title">新任务</h2>
+                  <button class="icon-btn title-edit" id="task-title-edit" type="button" title="重命名任务" aria-label="重命名任务" disabled>
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 13.8V16h2.2l8-8-2.2-2.2-8 8Z" /><path d="M12.6 4.6l2.8 2.8" /></svg>
+                  </button>
+                  <label class="field compact inline audit-model-field" title="顶层审计 AI 使用的模型">
+                    <span>审计模型</span>
+                    <select id="task-audit-model"></select>
+                  </label>
+                </div>
                 <p class="hint" id="task-conversation-sub">敏感操作由顶层审计 AI 判断，涉及用户数据时请你确认。</p>
+                <button class="context-meter" id="task-context-open" type="button" title="查看任务上下文与压缩摘要" disabled>
+                  <span class="context-track"><span class="context-fill" id="task-context-fill"></span></span>
+                  <span class="context-label" id="task-context-label">上下文 0%</span>
+                </button>
               </div>
               <div class="chat-head-actions">
                 <label class="field compact inline">
@@ -122,7 +176,10 @@
                   <span>后端</span>
                   <select id="task-adapter"></select>
                 </label>
-                <button class="btn btn-ghost" id="task-new-conversation" type="button">新任务</button>
+                <button class="icon-btn queue-toggle" id="task-side-toggle" type="button" title="显示或隐藏队列" aria-label="显示或隐藏队列">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12" /><path d="M4 10h12" /><path d="M4 14h8" /></svg>
+                  <span class="queue-badge hidden" id="task-queue-badge">0</span>
+                </button>
               </div>
             </header>
 
@@ -143,7 +200,15 @@
                 <button class="btn btn-danger-ghost" id="task-cancel" type="button">结束控制</button>
               </div>
               <form class="composer" id="task-form">
-                <textarea id="task-goal" rows="2" maxlength="500" placeholder="描述任务，例如：在记事本中输入 hello 并保存"></textarea>
+                <div class="composer-body">
+                  <textarea id="task-goal" rows="2" maxlength="500" placeholder="描述任务，例如：在记事本中输入 hello 并保存"></textarea>
+                  <div class="composer-meta">
+                    <label class="composer-model" title="本次任务使用的执行模型">
+                      <span>模型</span>
+                      <select id="task-model"></select>
+                    </label>
+                  </div>
+                </div>
                 <div class="composer-side">
                   <label class="check">
                     <input type="checkbox" id="task-auto-confirm" />
@@ -156,23 +221,20 @@
             </div>
           </div>
 
-          <aside class="task-side">
-            <div class="task-side-block">
-              <div class="panel-head small">
-                <h3>任务</h3>
-                <button class="btn btn-ghost mini" id="task-refresh" type="button">刷新</button>
-              </div>
-              <div class="conversation-list" id="task-conversation-list">
-                <p class="empty">还没有任务。</p>
-              </div>
-            </div>
+          <aside class="task-side" id="task-side">
+            <div class="queue-resizer" id="task-side-resizer" role="separator" aria-orientation="vertical" aria-label="调整队列宽度" title="拖动调整宽度，双击收起" tabindex="0"></div>
             <div class="task-side-block">
               <div class="panel-head small">
                 <h3>队列</h3>
-                <span class="hint" id="task-queue-count"></span>
+                <div class="row tight">
+                  <span class="hint" id="task-queue-count"></span>
+                  <button class="icon-btn" id="task-side-close" type="button" title="收起队列" aria-label="收起队列">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7.5 5.5L12 10l-4.5 4.5" /></svg>
+                  </button>
+                </div>
               </div>
               <div class="queue-list" id="task-queue-list">
-                <p class="empty">队列为空。</p>
+                <p class="empty">队列为空。运行中的任务与排队任务会显示在这里。</p>
               </div>
             </div>
           </aside>
@@ -415,8 +477,9 @@
             <button class="btn btn-primary" id="resource-check">检测并修复资源</button>
           </div>
           <p class="hint">
-            检查 Windows-MCP、Computer-Use MCP 与 xshell-mcp 的本地安装。缺失时会自动从 GitHub
-            或已验证的国内镜像下载，并按版本号安装到 <code>vendor/&lt;名称&gt;-&lt;版本&gt;</code>。
+            检查 Windows-MCP、Computer-Use MCP 与 xshell-mcp 的本地安装，并实际启动 MCP
+            服务完成一次握手以验证可用性。缺失时会自动从 GitHub 或已验证的国内镜像下载，并按版本号安装到
+            <code>vendor/&lt;名称&gt;-&lt;版本&gt;</code>。
           </p>
           <div class="resource-summary" id="resource-summary">
             <span class="muted">尚未检测。</span>
@@ -461,6 +524,45 @@
       <p class="modal-sub" id="resource-modal-note">正在检查本地 MCP 组件…</p>
       <div class="progress"><div class="progress-bar" id="resource-progress"></div></div>
       <div class="resource-list" id="resource-list"></div>
+      <div class="modal-actions">
+        <button class="btn btn-danger-ghost hidden" id="resource-force" type="button">强制重装失败项</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-backdrop hidden" id="context-modal">
+    <div class="modal context-modal" role="dialog" aria-modal="true" aria-labelledby="context-title">
+      <div class="modal-head">
+        <div class="modal-title">
+          <h2 id="context-title">任务上下文</h2>
+          <span class="chip" id="context-usage">0%</span>
+        </div>
+      </div>
+      <p class="modal-sub">只向模型发送本任务的历史摘要与最近对话；较早内容会自动压缩，任务之间互不共享。</p>
+      <div class="context-block">
+        <div class="context-block-head">
+          <span>任务记忆（压缩摘要）</span>
+          <span class="hint" id="context-covered"></span>
+        </div>
+        <pre class="context-summary" id="context-summary">暂无压缩摘要。对话变长后会在这里生成。</pre>
+      </div>
+      <div class="context-block hidden" id="context-older-block">
+        <div class="context-block-head">
+          <span>较早对话（未压缩）</span>
+          <span class="hint" id="context-older-meta"></span>
+        </div>
+        <div class="context-recent" id="context-older"></div>
+      </div>
+      <div class="context-block">
+        <div class="context-block-head">
+          <span>最近对话</span>
+          <span class="hint" id="context-recent-meta"></span>
+        </div>
+        <div class="context-recent" id="context-recent"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="context-close" type="button">关闭</button>
+      </div>
+      <p class="hint">压缩摘要会随任务推进增量更新，最近对话在预算内保持原文。</p>
     </div>
   </div>
   <div class="modal-backdrop hidden" id="confirm-modal">

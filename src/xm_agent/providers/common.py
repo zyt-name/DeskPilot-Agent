@@ -27,6 +27,15 @@ Rules:
 - task.finish is only for a goal you can actually see completed. When the
   latest observation does not show the goal state, keep working instead of
   finishing. Never claim an action succeeded when its result is not visible.
+- task.finish summary must be written in Simplified Chinese and is the final
+  task report shown to the user:
+  - On success, start with "已完成" and describe the state now visible on
+    screen (what was opened, typed, saved or changed).
+  - When the task cannot be completed, call task.finish with
+    "success": false and a summary starting with "未能完成：" that explains
+    the reason and what remains.
+  - Use 2-4 short sentences or "-" bullets. Never mention tools, steps, JSON
+    or internal reasoning.
 - If observation.elements is not empty (UIA backend):
   - Click or type by element_id where possible.
   - To open a web page, use Win+R, type the URL with "clear": true and
@@ -48,8 +57,8 @@ Rules:
     the next screenshot yourself before calling task.finish.
 - Use terminal.exec only for terminal or remote-server tasks.
 - If observation.source is "terminal" and the goal needs a desktop or browser,
-  do not run a local shell command; call task.finish with a summary that this
-  backend cannot perform desktop actions.
+  do not run a local shell command; call task.finish with "success": false and
+  a Chinese summary starting "未能完成：当前终端后端无法执行桌面操作".
 
 Available capabilities:
 """
@@ -82,20 +91,21 @@ def observation_text(
     remaining_steps: int,
     instructions: list[str] | None = None,
     screenshot_attached: bool = False,
+    task_context: str = "",
 ) -> str:
     data = observation.to_dict()
     data["screenshot_attached"] = bool(screenshot_attached)
-    return json.dumps(
-        {
-            "goal": goal,
-            "observation": data,
-            "recent_history": history_compact(history),
-            "remaining_steps": remaining_steps,
-            "user_instructions": list(instructions or []),
-            "known_capabilities": list(CAPABILITIES),
-        },
-        ensure_ascii=False,
-    )
+    payload = {
+        "goal": goal,
+        "observation": data,
+        "recent_history": history_compact(history),
+        "remaining_steps": remaining_steps,
+        "user_instructions": list(instructions or []),
+        "known_capabilities": list(CAPABILITIES),
+    }
+    if task_context.strip():
+        payload["task_context"] = task_context.strip()
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def history_compact(history: list[StepRecord]) -> list[dict[str, Any]]:

@@ -76,9 +76,9 @@ RESOURCES: tuple[Resource, ...] = (
     Resource(
         id="windows_mcp",
         name="Windows-MCP",
-        version="0.8.8",
+        version="0.8.5",
         repo="CursorTouch/Windows-MCP",
-        ref="6613da7248cea1c22ac89ea9fdf74f11cfbecac8",
+        ref="30c1472f807eefa44774a2fe23a5b10502a59f23",
         kind="python",
         directory="Windows-MCP",
         entry=".venv/Scripts/python.exe",

@@ -58,7 +58,24 @@ class StdioMCPClient:
             target=self._stderr_loop, name="mcp-stderr", daemon=True
         )
         self._stderr_reader.start()
-        self.initialize()
+        try:
+            self.initialize()
+        except MCPError as exc:
+            self._stderr_reader.join(timeout=1)
+            code = self._proc.poll()
+            if code is None:
+                try:
+                    code = self._proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    code = None
+            detail = str(exc)
+            if code is not None:
+                detail += f"（退出码 {code}）"
+            tail = " | ".join(self.stderr_tail)
+            if tail:
+                detail += f"：{tail}"
+            self.close()
+            raise MCPError(detail) from None
 
     @property
     def pid(self) -> int | None:

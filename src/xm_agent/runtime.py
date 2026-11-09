@@ -11,6 +11,7 @@ from .guard.gate import AuditGate, GateDecision
 from .lock import LeaseLock
 from .policy import Policy
 from .providers.base import Provider
+from .summary import final_summary
 from .types import (
     Action,
     Observation,
@@ -55,7 +56,7 @@ class AgentRuntime:
         self.gate = gate
         self.control = control
 
-    def run(self, goal: str) -> TaskResult:
+    def run(self, goal: str, context: str = "") -> TaskResult:
         trace_id = uuid.uuid4().hex[:12]
         token = self.lock.acquire(owner=f"agent:{os.getpid()}")
         if token is None:
@@ -64,11 +65,13 @@ class AgentRuntime:
                 "needs_human",
                 [],
                 "desktop lock is held by another process",
+                "任务未启动：桌面正被另一个进程控制，请稍后重试。",
             )
             self.audit.event(trace_id, "result", result.to_dict())
             self._emit("lock_busy", {"trace_id": trace_id})
             return result
 
+        task_context = str(context or "").strip()
         history: list[StepRecord] = []
         failures = 0
         denials = 0
@@ -118,6 +121,8 @@ class AgentRuntime:
                     kwargs: dict[str, Any] = {}
                     if instructions:
                         kwargs["instructions"] = instructions
+                    if task_context:
+                        kwargs["context"] = task_context
                     if self.on_event is not None:
                         kwargs["on_delta"] = self._delta_callback(step)
                     action = self.provider.decide(
@@ -262,6 +267,40 @@ class AgentRuntime:
                             )
 
                 if action.capability == "task.finish":
+                    declared_summary = str(
+                        action.args.get("summary", "")
+                    ).strip()
+                    if action.args.get("success") is False:
+                        record.error = (
+                            declared_summary or "模型判定任务未完成"
+                        )
+                        record.receipt = Receipt(
+                            True,
+                            {"summary": declared_summary, "success": False},
+                        )
+                        record.verification = Verification(
+                            False, record.error
+                        )
+                        if gate_decision is not None:
+                            self.gate.mark_executed(gate_decision, True)
+                        history.append(record)
+                        self.audit.event(
+                            trace_id, "step", record.to_dict()
+                        )
+                        self._emit(
+                            "step",
+                            {
+                                "step": step,
+                                "capability": action.capability,
+                                "receipt_ok": True,
+                                "verify_ok": False,
+                                "declared_failure": True,
+                                "error": record.error,
+                            },
+                        )
+                        return self._finish(
+                            trace_id, "failed", record.error, history
+                        )
                     completion = self._completion_check(
                         goal, action, observation
                     )
@@ -320,7 +359,7 @@ class AgentRuntime:
                     return self._finish(
                         trace_id,
                         "done",
-                        str(action.args.get("summary", "")),
+                        declared_summary,
                         history,
                     )
 
@@ -502,7 +541,8 @@ class AgentRuntime:
         reason: str,
         history: list[StepRecord],
     ) -> TaskResult:
-        result = TaskResult(trace_id, status, history, reason)
+        summary = final_summary(status, reason, history)
+        result = TaskResult(trace_id, status, history, reason, summary)
         self.audit.event(trace_id, "result", result.to_dict())
         self._emit(
             "result",
@@ -510,6 +550,7 @@ class AgentRuntime:
                 "trace_id": trace_id,
                 "status": status,
                 "reason": reason,
+                "summary": summary,
                 "steps": len(history),
             },
         )

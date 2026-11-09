@@ -135,11 +135,13 @@ class TaskResult:
     status: TaskStatus
     steps: list[StepRecord] = field(default_factory=list)
     reason: str = ""
+    summary: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "trace_id": self.trace_id,
             "status": self.status,
             "reason": self.reason,
+            "summary": self.summary,
             "steps": [step.to_dict() for step in self.steps],
         }

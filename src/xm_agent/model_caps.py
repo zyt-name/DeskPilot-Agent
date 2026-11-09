@@ -43,7 +43,8 @@ _VISION_PATTERNS = tuple(
         r"^mistral.*vision",
         r"^phi-.*vision",
         r"^phi-4-multimodal",
-        # Zhipu
+        # Zhipu: the whole GLM-5.3-Flash line (Flash/FlashX/FlashX-Legal) is natively multimodal
+        r"^glm-5\.3-flash",
         r"^glm-\d+(?:\.\d+)?v(?=$|[-_.@])",
         # Alibaba
         r"^qwen.*(vl|vision|omni)",
@@ -53,6 +54,8 @@ _VISION_PATTERNS = tuple(
         r"^moonshot.*(vision|vl)",
         r"^kimi-latest$",
         r"^deepseek.*(vl|vision)",
+        # DeepSeek-V4.1-Flash takes text plus images (versioned ids such as -1017 included)
+        r"^deepseek-v4\.1-flash",
         r"^minimax.*(vl|vision)",
         # xAI / ByteDance / StepFun / 01.AI
         r"^grok.*vision",

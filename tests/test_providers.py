@@ -89,6 +89,38 @@ class ProviderTests(unittest.TestCase):
         content = captured["messages"][1]["content"]
         self.assertEqual(content[1]["type"], "image_url")
 
+    def test_user_content_injects_task_context(self):
+        provider = OpenAICompatProvider("http://model", "m")
+        text = provider._user_content(
+            "goal",
+            Observation(step=1),
+            [],
+            3,
+            task_context="任务记忆：用户先整理了下载目录",
+        )
+        payload = json.loads(text)
+        assert "下载目录" in payload["task_context"]
+
+    def test_decide_sends_task_context_to_model(self):
+        provider = OpenAICompatProvider("http://model", "m")
+        captured = {}
+
+        def fake_chat(messages, *, max_tokens=None, on_delta=None):
+            captured["messages"] = messages
+            return '{"capability": "task.finish", "args": {"summary": "ok"}}', {}, 1
+
+        provider._chat = fake_chat  # type: ignore[method-assign]
+        action = provider.decide(
+            "整理桌面",
+            Observation(step=1),
+            [],
+            3,
+            context="任务记忆：上一次已完成下载目录整理",
+        )
+        assert action.capability == "task.finish"
+        payload = json.loads(captured["messages"][1]["content"])
+        assert "下载目录" in payload["task_context"]
+
     def test_parse_verdict_json_is_conservative(self):
         self.assertEqual(
             parse_verdict_json('{"done": true, "reason": "visible"}'),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from ..config import AgentConfig
+from ..notify import SystemNotifier
 from .hotkey import GlobalHotkey
 from .overlay import ScreenIndicator
 from .server import STATIC_DIR, UiServer
@@ -18,7 +19,13 @@ def run_gui(
 ) -> int:
     indicator = ScreenIndicator()
     indicator.start()
-    server = UiServer(config, db_path=db_path, port=port, indicator=indicator)
+    server = UiServer(
+        config,
+        db_path=db_path,
+        port=port,
+        indicator=indicator,
+        notifier=SystemNotifier(),
+    )
     url = server.start()
     hotkey = GlobalHotkey(server.toggle_pause_active)
     server.native_hotkey = hotkey.start()

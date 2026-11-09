@@ -14,6 +14,7 @@ const state = {
   resourcePollTimer: null,
   resourceJobId: "",
   resourceModalOpen: false,
+  resourceSnapshot: null,
 };
 
 const STATUS_LABEL = {
@@ -111,6 +112,7 @@ function fillSelect(select, names, selected) {
 }
 
 function switchTab(tab) {
+  document.body.dataset.tab = tab;
   document.querySelectorAll(".nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.tab === tab);
   });
@@ -133,6 +135,123 @@ function bindNavigation() {
   });
   document.querySelectorAll("[data-jump]").forEach((button) => {
     button.addEventListener("click", () => switchTab(button.dataset.jump));
+  });
+}
+
+const RAIL_MIN = 200;
+const RAIL_MAX = 440;
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function setRailWidth(width) {
+  document.documentElement.style.setProperty(
+    "--rail-width",
+    `${Math.round(width)}px`,
+  );
+}
+
+function setRailCollapsed(collapsed) {
+  document.querySelector(".app").classList.toggle("rail-collapsed", collapsed);
+  const toggle = $("rail-toggle");
+  if (toggle) {
+    const label = collapsed ? "展开任务栏" : "收起任务栏";
+    toggle.title = label;
+    toggle.setAttribute("aria-label", label);
+  }
+  try {
+    localStorage.setItem("xm.railCollapsed", collapsed ? "1" : "0");
+  } catch (err) {
+    void err;
+  }
+}
+
+function restoreRail() {
+  try {
+    const saved = Number(localStorage.getItem("xm.railWidth"));
+    if (saved >= RAIL_MIN && saved <= RAIL_MAX) setRailWidth(saved);
+    if (localStorage.getItem("xm.railCollapsed") === "1") {
+      setRailCollapsed(true);
+    }
+  } catch (err) {
+    void err;
+  }
+}
+
+function bindRail() {
+  const handle = $("rail-resizer");
+  const toggle = $("rail-toggle");
+  const rail = document.querySelector(".rail");
+  if (!handle || !toggle || !rail) return;
+  let dragging = false;
+  let startX = 0;
+  let startWidth = 0;
+  const currentWidth = () => rail.getBoundingClientRect().width;
+  const preferredWidth = () => {
+    const value = parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue(
+        "--rail-width",
+      ),
+    );
+    return Number.isFinite(value) ? value : currentWidth();
+  };
+  let latestWidth = preferredWidth();
+  const saveWidth = () => {
+    try {
+      localStorage.setItem("xm.railWidth", String(Math.round(latestWidth)));
+    } catch (err) {
+      void err;
+    }
+  };
+
+  toggle.addEventListener("click", () => {
+    const collapsed = document
+      .querySelector(".app")
+      .classList.contains("rail-collapsed");
+    setRailCollapsed(!collapsed);
+  });
+
+  handle.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    startX = event.clientX;
+    startWidth = preferredWidth();
+    latestWidth = startWidth;
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing");
+    event.preventDefault();
+  });
+
+  handle.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    latestWidth = clamp(startWidth + (event.clientX - startX), RAIL_MIN, RAIL_MAX);
+    setRailWidth(latestWidth);
+  });
+
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    saveWidth();
+  };
+
+  handle.addEventListener("pointerup", stop);
+  handle.addEventListener("pointercancel", stop);
+  handle.addEventListener("dblclick", () => {
+    const collapsed = document
+      .querySelector(".app")
+      .classList.contains("rail-collapsed");
+    setRailCollapsed(!collapsed);
+  });
+  handle.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const delta = event.key === "ArrowLeft" ? -16 : 16;
+    latestWidth = clamp(preferredWidth() + delta, RAIL_MIN, RAIL_MAX);
+    setRailWidth(latestWidth);
+    saveWidth();
   });
 }
 
@@ -170,7 +289,10 @@ function applyBootstrap(data) {
   $("info-user").textContent = data.profile.display_name;
   $("set-db").textContent = data.config.db_path;
 
-  fillSelect($("set-adapter"), adapters, data.profile.default_adapter);
+  const adapterOptions = data.config.auto_available
+    ? ["auto", ...adapters]
+    : adapters;
+  fillSelect($("set-adapter"), adapterOptions, data.profile.default_adapter);
 
   $("set-name").value = data.profile.display_name || "";
   $("set-goal").value = data.profile.default_goal || "";
@@ -196,6 +318,15 @@ function eventView(event) {
   } else if (event.event === "model") {
     title = "使用模型";
     meta = `${payload.provider || "unknown"} · ${payload.model || "unknown"}${payload.vision ? " · 可识图" : ""}`;
+  } else if (event.event === "route") {
+    const switching = Number(payload.index) > 0;
+    const chain = Array.isArray(payload.chain)
+      ? payload.chain.join(" → ")
+      : "";
+    title = switching ? "自动切换后端" : "自动选择后端";
+    meta = `${payload.adapter || ""} · ${payload.reason || ""}${
+      chain ? ` · 链路 ${chain}` : ""
+    }`;
   } else if (event.event === "step") {
     const receipt = payload.receipt_ok ? "回执通过" : "回执失败";
     const verify = payload.verify_ok
@@ -210,7 +341,7 @@ function eventView(event) {
   } else if (event.event === "result") {
     const label = STATUS_LABEL[payload.status] || payload.status;
     title = `任务结束：${label}`;
-    meta = `${payload.reason || ""} · ${payload.steps ?? 0} 步 · trace ${payload.trace_id || ""}`;
+    meta = `${payload.summary || payload.reason || ""} · ${payload.steps ?? 0} 步 · trace ${payload.trace_id || ""}`;
     row.classList.add(String(payload.status || ""));
   } else if (event.event === "error") {
     title = "执行异常";
@@ -1090,6 +1221,38 @@ function resourceStatus(status) {
   return RESOURCE_STATUS[status] || [status || "未知", "pending"];
 }
 
+function resourceRuntime(row) {
+  if (row.runtime_ok === true) {
+    const count = (row.runtime_tools || []).length;
+    return {
+      label: "运行可用",
+      tone: "ok",
+      detail: `MCP 握手通过 · ${count} 个工具`,
+    };
+  }
+  if (row.runtime_ok === false) {
+    return {
+      label: "运行不可用",
+      tone: "bad",
+      detail: row.runtime_detail || "MCP 启动失败",
+    };
+  }
+  if (row.status === "ready") {
+    return {
+      label: "运行未验证",
+      tone: "pending",
+      detail: "尚未执行 MCP 握手检测",
+    };
+  }
+  return { label: "", tone: "pending", detail: "" };
+}
+
+function failingResourceIds(rows) {
+  return (rows || [])
+    .filter((row) => row.status !== "ready" || row.runtime_ok === false)
+    .map((row) => row.id);
+}
+
 function renderResourceSummary(rows) {
   const box = $("resource-summary");
   box.replaceChildren();
@@ -1099,10 +1262,21 @@ function renderResourceSummary(rows) {
   }
   rows.forEach((row) => {
     const [label, tone] = resourceStatus(row.status);
+    const runtime = resourceRuntime(row);
     const chip = el("span", `resource-chip ${tone}`);
     chip.appendChild(el("span", "chip-dot"));
-    chip.appendChild(el("span", "", `${row.name} ${row.version} · ${label}`));
-    chip.title = row.detail || row.location || "";
+    const runtimeLabel =
+      row.runtime_ok === true
+        ? " · 可用"
+        : row.runtime_ok === false
+          ? " · 不可用"
+          : "";
+    chip.appendChild(
+      el("span", "", `${row.name} ${row.version} · ${label}${runtimeLabel}`),
+    );
+    chip.title = [row.detail, runtime.detail, row.location]
+      .filter(Boolean)
+      .join("\n");
     box.appendChild(chip);
   });
 }
@@ -1112,10 +1286,19 @@ function renderResourceRows(rows) {
   box.replaceChildren();
   (rows || []).forEach((row) => {
     const [label, tone] = resourceStatus(row.status);
+    const runtime = resourceRuntime(row);
     const item = el("div", "resource-row");
     const name = el("div", "r-name");
     name.appendChild(el("strong", "", row.name));
-    name.appendChild(el("span", "", row.detail || row.purpose || ""));
+    name.appendChild(
+      el(
+        "span",
+        "",
+        [row.detail || row.purpose || "", runtime.detail]
+          .filter(Boolean)
+          .join(" · "),
+      ),
+    );
     item.appendChild(name);
     item.appendChild(el("span", "r-version", `v${row.version}`));
     item.appendChild(el("span", `r-status ${tone}`, label));
@@ -1124,6 +1307,7 @@ function renderResourceRows(rows) {
 }
 
 function renderResourceJob(snapshot) {
+  state.resourceSnapshot = snapshot;
   const job = snapshot.job;
   const rows = job ? job.resources : snapshot.resources;
   const running = Boolean(job && job.running);
@@ -1132,6 +1316,11 @@ function renderResourceJob(snapshot) {
   $("resource-spinner").classList.toggle("hidden", !running);
   renderResourceRows(rows);
   renderResourceSummary(rows);
+  const failedIds = failingResourceIds(rows);
+  $("resource-force").classList.toggle(
+    "hidden",
+    running || !failedIds.length,
+  );
 
   if (!job) {
     $("resource-modal-title").textContent = "资源状态";
@@ -1139,12 +1328,15 @@ function renderResourceJob(snapshot) {
     return;
   }
   $("resource-modal-note").textContent =
-    job.message || (running ? "正在检测资源完整性…" : "已完成");
+    job.message || (running ? "正在检测资源完整性与可用性…" : "已完成");
   if (running) {
     const detecting = job.phase === "detecting";
+    const probing = job.phase === "probe";
     $("resource-modal-title").textContent = detecting
       ? "正在检测资源完整性"
-      : "正在修复资源";
+      : probing
+        ? "正在检测资源可用性"
+        : "正在修复资源";
   } else if (job.ok) {
     $("resource-modal-title").textContent = "资源检测完成";
   } else {
@@ -1193,7 +1385,8 @@ async function checkResources() {
   stopResourcePolling();
   $("resource-spinner").classList.remove("hidden");
   $("resource-modal-title").textContent = "正在检测资源完整性";
-  $("resource-modal-note").textContent = "正在检查本地 MCP 组件…";
+  $("resource-modal-note").textContent =
+    "正在检查本地 MCP 组件，并验证服务能否实际启动…";
   $("resource-progress").style.width = "1%";
   try {
     const snapshot = await api("/api/resources/sync", {
@@ -1210,9 +1403,40 @@ async function checkResources() {
   }
 }
 
+async function forceRepairResources() {
+  const snapshot = state.resourceSnapshot;
+  const rows = snapshot
+    ? snapshot.job
+      ? snapshot.job.resources
+      : snapshot.resources
+    : [];
+  const ids = failingResourceIds(rows);
+  if (!ids.length) return;
+  openResourceModal();
+  stopResourcePolling();
+  $("resource-spinner").classList.remove("hidden");
+  $("resource-modal-title").textContent = "正在强制重装资源";
+  $("resource-modal-note").textContent = `重新安装：${ids.join("、")}`;
+  $("resource-progress").style.width = "1%";
+  try {
+    const started = await api("/api/resources/sync", {
+      method: "POST",
+      body: JSON.stringify({ only: ids, force: true }),
+    });
+    renderResourceJob(started);
+    pollResourceJob();
+  } catch (err) {
+    $("resource-spinner").classList.add("hidden");
+    $("resource-modal-title").textContent = "资源重装失败";
+    $("resource-modal-note").textContent = err.message;
+    toast(`资源重装失败：${err.message}`, true);
+  }
+}
+
 async function loadResources() {
   try {
     const snapshot = await api("/api/resources");
+    state.resourceSnapshot = snapshot;
     renderResourceSummary(snapshot.resources);
     if (snapshot.job && snapshot.job.running) {
       openResourceModal();
@@ -1226,6 +1450,7 @@ async function loadResources() {
 
 function bindResources() {
   $("resource-check").addEventListener("click", checkResources);
+  $("resource-force").addEventListener("click", forceRepairResources);
   $("resource-modal-close").addEventListener("click", closeResourceModal);
   $("resource-modal").addEventListener("click", (event) => {
     if (event.target === $("resource-modal")) closeResourceModal();
@@ -1285,6 +1510,8 @@ function bindForms() {
 }
 
 async function init() {
+  restoreRail();
+  bindRail();
   bindNavigation();
   bindForms();
   bindResources();

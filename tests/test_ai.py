@@ -146,9 +146,13 @@ def test_catalog_covers_vendors_plans_and_vision():
     assert is_vision_model("glm-4v")
     assert is_vision_model("qwen2.5-vl-72b-instruct")
     assert is_vision_model("gemini-2.5-pro")
+    assert is_vision_model("glm-5.3-flash")
+    assert is_vision_model("glm-5.3-flashx")
+    assert is_vision_model("deepseek-v4.1-flash")
+    assert is_vision_model("deepseek-v4.1-flash-1017")
     assert not is_vision_model("deepseek-chat")
     assert not is_vision_model("gpt-3.5-turbo")
-    assert not is_vision_model("glm-5.3-flash")
+    assert not is_vision_model("glm-5.3")
     assert not is_vision_model("o1-mini")
     assert not is_vision_model("gemini-1.0-pro")
 
@@ -316,7 +320,7 @@ def test_vision_uses_provider_metadata_and_ignores_manual_flags(tmp_path):
         }
         assert stored["brand-new-model"]["vision"] is False
 
-        assert service.add_model(provider["id"], "glm-5.3-flash")["vision"] is False
+        assert service.add_model(provider["id"], "glm-5.3-flash")["vision"] is True
         assert service.add_model(provider["id"], "qwen2.5-vl-7b")["vision"] is True
 
 
@@ -728,7 +732,7 @@ def test_build_provider_requires_vision_for_computer_use():
     config.adapters["computer_use"] = AdapterConfig(kind="computer_use_mcp")
     config.model.provider = "openai_compat"
     config.model.base_url = "http://127.0.0.1:9"
-    config.model.model = "glm-5.3-flash"
+    config.model.model = "glm-4.6"
 
     with pytest.raises(RuntimeError, match="纯文本模型"):
         build_provider(config, "computer_use")

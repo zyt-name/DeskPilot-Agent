@@ -12,10 +12,12 @@ from .bootstrap import build_adapter, build_provider, policy_from_config
 from .config import AgentConfig, load_config
 from .contracts import CAPABILITIES
 from .lock import LeaseLock
+from .notify import SystemNotifier
 from .policy import Policy
 from .providers.fake import ScriptedProvider
 from .runtime import AgentRuntime
 from .storage import Storage
+from .summary import FINISH_LABELS, one_line
 from .types import Action
 
 
@@ -130,6 +132,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     print(f"trace: {result.trace_id}")
     print(f"audit: {audit.path_for(result.trace_id)}")
+    label = FINISH_LABELS.get(result.status, "任务结束")
+    goal_text = one_line(args.goal, 28)
+    SystemNotifier().send(
+        f"{label} · {goal_text}" if goal_text else label,
+        result.summary or result.reason,
+    )
     if result.status == "done":
         return 0
     if result.status == "needs_human":
@@ -141,8 +149,23 @@ def _cmd_resources(args: argparse.Namespace) -> int:
     from .resources import ResourceManager
 
     manager = ResourceManager(args.root)
-    if args.action == "status":
+    if args.action in {"status", "check"}:
         states = manager.status()
+        if args.action == "check":
+            from .bootstrap import probe_adapter_kind
+            from .config import load_config
+
+            config_path = getattr(args, "config", None)
+            if config_path is None and Path("config/agent.example.toml").is_file():
+                config_path = "config/agent.example.toml"
+            config = load_config(config_path)
+            for state in states:
+                if not state.ok:
+                    continue
+                result = probe_adapter_kind(config, state.id, timeout=20)
+                state.runtime_ok = bool(result.get("ok"))
+                state.runtime_detail = str(result.get("detail") or "")
+                state.runtime_tools = list(result.get("tools") or [])
         if args.json:
             print(
                 json.dumps(
@@ -155,11 +178,24 @@ def _cmd_resources(args: argparse.Namespace) -> int:
             print(f"资源根目录: {manager.root}")
             print(f"{'资源':<22}{'版本':<10}{'状态':<10}说明")
             for state in states:
+                detail = state.detail
+                if state.runtime_ok is True:
+                    detail = f"{detail}；{state.runtime_detail}"
+                elif state.runtime_ok is False:
+                    detail = f"{detail}；运行不可用：{state.runtime_detail}"
                 print(
                     f"{state.name:<22}{state.version:<10}"
-                    f"{_resource_status_label(state.status):<10}{state.detail}"
+                    f"{_resource_status_label(state.status):<10}{detail}"
                 )
-        return 0 if all(state.ok or not state.required for state in states) else 1
+        return (
+            0
+            if all(
+                not state.required
+                or (state.ok and state.runtime_ok is not False)
+                for state in states
+            )
+            else 1
+        )
 
     last: dict[str, str] = {}
 
@@ -323,6 +359,19 @@ def main(argv: list[str] | None = None) -> int:
         "--root", default=".", help="project root (defaults to cwd)"
     )
     status_parser.set_defaults(handler=_cmd_resources)
+
+    check_parser = resources_sub.add_parser(
+        "check", help="check structure and run a real MCP handshake"
+    )
+    check_parser.add_argument("--json", action="store_true")
+    check_parser.add_argument(
+        "--root", default=".", help="project root (defaults to cwd)"
+    )
+    check_parser.add_argument(
+        "--config",
+        help="config file (defaults to config/agent.example.toml if present)",
+    )
+    check_parser.set_defaults(handler=_cmd_resources)
 
     ensure_parser = resources_sub.add_parser(
         "ensure", help="download and build missing resources"

@@ -179,6 +179,96 @@ def test_audit_decisions_are_recorded_and_marked(tmp_path):
     assert storage.list_audit_decisions(conversation_id="other") == []
 
 
+def test_conversation_title_source_and_auto_title(tmp_path):
+    storage = Storage(tmp_path / "app.db")
+    conversation = storage.create_conversation("", "mock")
+    assert conversation["title"] == ""
+    assert conversation["title_source"] == "auto"
+
+    storage.set_auto_title(conversation["id"], "自动生成的任务名")
+    stored = storage.get_conversation(
+        conversation["id"], include_messages=False
+    )
+    assert stored["title"] == "自动生成的任务名"
+    assert stored["title_source"] == "auto"
+
+    storage.update_conversation(conversation["id"], {"title": "手动命名"})
+    stored = storage.get_conversation(
+        conversation["id"], include_messages=False
+    )
+    assert stored["title"] == "手动命名"
+    assert stored["title_source"] == "user"
+
+    storage.set_auto_title(conversation["id"], "不应覆盖")
+    stored = storage.get_conversation(
+        conversation["id"], include_messages=False
+    )
+    assert stored["title"] == "手动命名"
+
+
+def test_task_memory_roundtrip_and_delete(tmp_path):
+    storage = Storage(tmp_path / "app.db")
+    conversation = storage.create_conversation("", "mock")
+    assert storage.get_task_memory(conversation["id"])["summary"] == ""
+
+    storage.save_task_memory(conversation["id"], "已完成第一步", 12)
+    memory = storage.get_task_memory(conversation["id"])
+    assert memory["summary"] == "已完成第一步"
+    assert memory["covered_message_id"] == 12
+
+    storage.save_task_memory(conversation["id"], "已更新", 20)
+    memory = storage.get_task_memory(conversation["id"])
+    assert memory["summary"] == "已更新"
+    assert memory["covered_message_id"] == 20
+
+    storage.delete_conversation(conversation["id"])
+    assert storage.get_task_memory(conversation["id"])["summary"] == ""
+
+
+def test_conversations_are_isolated(tmp_path):
+    storage = Storage(tmp_path / "app.db")
+    first = storage.create_conversation("", "mock")
+    second = storage.create_conversation("", "mock")
+    storage.add_message(first["id"], "user", "第一条任务的目标", "goal")
+    storage.add_message(first["id"], "assistant", "第一条结果", "result")
+
+    assert [
+        message["content"]
+        for message in storage.list_messages(first["id"])
+    ] == ["第一条任务的目标", "第一条结果"]
+    assert storage.list_messages(second["id"]) == []
+    assert storage.get_conversation(
+        second["id"], include_messages=False
+    )["title"] == ""
+
+
+def test_legacy_conversation_table_gets_title_source(tmp_path):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            adapter TEXT NOT NULL DEFAULT 'mock',
+            audit_mode TEXT NOT NULL DEFAULT 'ai',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO conversations
+            (id, title, adapter, audit_mode, created_at, updated_at)
+        VALUES ('c1', '旧任务', 'mock', 'ai', '2026-01-01', '2026-01-01');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage = Storage(path)
+    stored = storage.get_conversation("c1", include_messages=False)
+    assert stored["title"] == "旧任务"
+    assert stored["title_source"] == "auto"
+
+
 def test_legacy_vision_flag_is_recomputed_on_migration(tmp_path):
     path = tmp_path / "legacy.db"
     conn = sqlite3.connect(path)
@@ -195,7 +285,7 @@ def test_legacy_vision_flag_is_recomputed_on_migration(tmp_path):
         );
         INSERT INTO ai_models
             (provider_id, model_id, display_name, vision, source, created_at)
-        VALUES ('p1', 'glm-5.3-flash', 'GLM', 1, 'custom', '2026-01-01');
+        VALUES ('p1', 'glm-4.6', 'GLM', 1, 'custom', '2026-01-01');
         """
     )
     conn.commit()
@@ -203,7 +293,7 @@ def test_legacy_vision_flag_is_recomputed_on_migration(tmp_path):
 
     storage = Storage(path)
     models = storage.list_ai_models("p1")
-    assert models[0]["model_id"] == "glm-5.3-flash"
+    assert models[0]["model_id"] == "glm-4.6"
     assert models[0]["vision"] is False
 
     with storage._connect() as conn:

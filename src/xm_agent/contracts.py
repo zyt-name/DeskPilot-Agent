@@ -166,11 +166,15 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
     "task.finish": CapabilitySpec(
         name="task.finish",
         version="1.0",
-        description="Finish the task with a short summary. Use only when the goal is verified.",
+        description=(
+            "Finish the task with a short Chinese summary. Set success=false "
+            "when the goal cannot be completed."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "summary": {"type": "string"},
+                "success": {"type": "boolean"},
             },
             "required": ["summary"],
         },

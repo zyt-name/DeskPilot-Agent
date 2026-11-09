@@ -14,6 +14,7 @@ from xm_agent.ai.crypto import decrypt_secret
 from xm_agent.config import AdapterConfig, AgentConfig
 from xm_agent.control import RunControl, RunPreempted
 from xm_agent.providers.fake import HeuristicMockProvider
+from xm_agent.resources import RESOURCES, ResourceState
 from xm_agent.types import Action
 from xm_agent.ui.hotkey import GlobalHotkey
 from xm_agent.ui.overlay import ScreenIndicator
@@ -70,12 +71,19 @@ class _RecordingIndicator:
 
     def __init__(self) -> None:
         self.events: list[str] = []
+        self.paused = False
 
     def show(self) -> None:
+        self.paused = False
         self.events.append("show")
 
     def hide(self) -> None:
+        self.paused = False
         self.events.append("hide")
+
+    def set_paused(self, paused: bool) -> None:
+        self.paused = bool(paused)
+        self.events.append("paused" if paused else "resumed")
 
 
 def test_bootstrap_returns_token_and_config(server):
@@ -146,6 +154,314 @@ def test_mock_run_does_not_show_screen_indicator(server):
         time.sleep(0.05)
     assert run["status"] == "done"
     assert indicator.events == []
+
+
+def _wait_run(app, run_id, timeout=10.0):
+    deadline = time.time() + timeout
+    stored = app.storage.get_run(run_id)
+    while time.time() < deadline:
+        stored = app.storage.get_run(run_id)
+        if stored is not None and stored["status"] != "running":
+            break
+        time.sleep(0.05)
+    return stored
+
+
+def _create_provider_model(app, url, *, model_id="llama3.2"):
+    status, data = _request(
+        url + "api/ai/providers/save",
+        method="POST",
+        body={
+            "preset_id": "ollama",
+            "plan_id": "local",
+            "name": "本机 Ollama",
+        },
+        token=app.token,
+    )
+    assert status == 200
+    provider_id = data["provider"]["id"]
+    status, data = _request(
+        url + "api/ai/models/add",
+        method="POST",
+        body={"provider_id": provider_id, "model_id": model_id},
+        token=app.token,
+    )
+    assert status == 200
+    return provider_id, model_id
+
+
+def test_first_run_uses_goal_fallback_title(server):
+    app, url = server
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"adapter": "mock"},
+        token=app.token,
+    )
+    conversation_id = data["conversation"]["id"]
+    goal = "输入 hello 并保存到桌面文件"
+    _, started = _request(
+        url + "api/runs",
+        method="POST",
+        body={
+            "goal": goal,
+            "adapter": "mock",
+            "auto_confirm": True,
+            "conversation_id": conversation_id,
+        },
+        token=app.token,
+    )
+    assert started["queued"] is False
+    _wait_run(app, started["id"])
+    stored = app.storage.get_conversation(
+        conversation_id, include_messages=False
+    )
+    assert stored["title"] == goal[:24]
+    assert stored["title_source"] == "auto"
+
+
+def test_ai_title_is_generated_after_first_run(tmp_path, monkeypatch):
+    class TitledProvider(HeuristicMockProvider):
+        def complete(self, system, user, *, max_tokens=800, on_delta=None):
+            return '"整理桌面文件"'
+
+    app = UiServer(
+        _config(tmp_path),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    monkeypatch.setattr(
+        server_module, "build_provider", lambda *a, **k: TitledProvider()
+    )
+    url = app.start()
+    try:
+        _, data = _request(
+            url + "api/conversations",
+            method="POST",
+            body={"adapter": "mock"},
+            token=app.token,
+        )
+        conversation_id = data["conversation"]["id"]
+        _, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "把桌面文件按类型整理到文件夹",
+                "adapter": "mock",
+                "auto_confirm": True,
+                "conversation_id": conversation_id,
+            },
+            token=app.token,
+        )
+        _wait_run(app, started["id"])
+        deadline = time.time() + 5
+        stored = app.storage.get_conversation(
+            conversation_id, include_messages=False
+        )
+        while time.time() < deadline and stored["title"] != "整理桌面文件":
+            time.sleep(0.05)
+            stored = app.storage.get_conversation(
+                conversation_id, include_messages=False
+            )
+        assert stored["title"] == "整理桌面文件"
+        assert stored["title_source"] == "auto"
+    finally:
+        app.stop()
+
+
+def test_manual_title_is_not_overwritten_by_ai(tmp_path, monkeypatch):
+    class TitledProvider(HeuristicMockProvider):
+        def complete(self, system, user, *, max_tokens=800, on_delta=None):
+            return "自动标题"
+
+    app = UiServer(
+        _config(tmp_path),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    monkeypatch.setattr(
+        server_module, "build_provider", lambda *a, **k: TitledProvider()
+    )
+    url = app.start()
+    try:
+        _, data = _request(
+            url + "api/conversations",
+            method="POST",
+            body={"adapter": "mock"},
+            token=app.token,
+        )
+        conversation_id = data["conversation"]["id"]
+        status, data = _request(
+            url + "api/conversations/update",
+            method="POST",
+            body={"id": conversation_id, "title": "我的固定标题"},
+            token=app.token,
+        )
+        assert status == 200
+        assert data["conversation"]["title_source"] == "user"
+
+        _, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "随便跑一个任务",
+                "adapter": "mock",
+                "auto_confirm": True,
+                "conversation_id": conversation_id,
+            },
+            token=app.token,
+        )
+        _wait_run(app, started["id"])
+        stored = app.storage.get_conversation(
+            conversation_id, include_messages=False
+        )
+        assert stored["title"] == "我的固定标题"
+        assert stored["title_source"] == "user"
+    finally:
+        app.stop()
+
+
+def test_runs_stay_inside_their_conversation(server):
+    app, url = server
+    ids = []
+    for _ in range(2):
+        _, data = _request(
+            url + "api/conversations",
+            method="POST",
+            body={"adapter": "mock"},
+            token=app.token,
+        )
+        ids.append(data["conversation"]["id"])
+
+    _, started = _request(
+        url + "api/runs",
+        method="POST",
+        body={
+            "goal": "只在第一个任务里执行",
+            "adapter": "mock",
+            "auto_confirm": True,
+            "conversation_id": ids[0],
+        },
+        token=app.token,
+    )
+    _wait_run(app, started["id"])
+    first = app.storage.get_conversation(ids[0])
+    second = app.storage.get_conversation(ids[1])
+    assert [message["role"] for message in first["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert second["messages"] == []
+    assert second["title"] == ""
+
+
+def test_conversation_context_endpoint(server):
+    app, url = server
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"adapter": "mock"},
+        token=app.token,
+    )
+    conversation_id = data["conversation"]["id"]
+    app.storage.add_message(conversation_id, "user", "第一步目标", "goal")
+    app.storage.add_message(conversation_id, "assistant", "第一步结果", "result")
+    app.storage.save_task_memory(conversation_id, "记忆：第一步已完成", 1)
+
+    status, context = _request(
+        url + f"api/conversations/{conversation_id}/context"
+    )
+    assert status == 200
+    assert context["conversation_id"] == conversation_id
+    assert context["summary"] == "记忆：第一步已完成"
+    assert [item["content"] for item in context["recent"]] == [
+        "第一步目标",
+        "第一步结果",
+    ]
+    assert context["budget_tokens"] > 0
+    assert context["total_messages"] == 2
+
+    status, _ = _request(url + "api/conversations/missing/context")
+    assert status == 404
+
+
+def test_second_run_receives_conversation_context(tmp_path, monkeypatch):
+    class ContextRecordingProvider(HeuristicMockProvider):
+        contexts: list[str] = []
+
+        def decide(
+            self,
+            goal,
+            observation,
+            history,
+            remaining_steps,
+            *,
+            instructions=None,
+            on_delta=None,
+            context="",
+        ):
+            type(self).contexts.append(context)
+            return super().decide(
+                goal,
+                observation,
+                history,
+                remaining_steps,
+                instructions=instructions,
+                on_delta=on_delta,
+            )
+
+    app = UiServer(
+        _config(tmp_path),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    monkeypatch.setattr(
+        server_module,
+        "build_provider",
+        lambda *a, **k: ContextRecordingProvider(),
+    )
+    url = app.start()
+    try:
+        _, data = _request(
+            url + "api/conversations",
+            method="POST",
+            body={"adapter": "mock"},
+            token=app.token,
+        )
+        conversation_id = data["conversation"]["id"]
+
+        def run(goal):
+            _, started = _request(
+                url + "api/runs",
+                method="POST",
+                body={
+                    "goal": goal,
+                    "adapter": "mock",
+                    "auto_confirm": True,
+                    "conversation_id": conversation_id,
+                },
+                token=app.token,
+            )
+            _wait_run(app, started["id"])
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                detail = app.storage.get_conversation(conversation_id)
+                if any(
+                    message["role"] == "assistant" for message in detail["messages"]
+                ) and len(detail["messages"]) >= 2:
+                    break
+                time.sleep(0.05)
+
+        run("第一步：输入 hello 并保存")
+        ContextRecordingProvider.contexts.clear()
+        run("第二步：再保存一次")
+
+        assert any(
+            "第一步：输入 hello 并保存" in context
+            for context in ContextRecordingProvider.contexts
+        )
+    finally:
+        app.stop()
 
 
 def test_static_index_is_served(server):
@@ -220,6 +536,45 @@ def test_run_completes_and_is_persisted(server):
     stored = app.storage.get_run(started["id"])
     assert stored["status"] == "done"
     assert stored["finished_at"]
+
+
+def test_finished_run_sends_system_notification(tmp_path):
+    class _RecordingNotifier:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def notify(self, title, body=""):
+            self.calls.append((title, body))
+
+    notifier = _RecordingNotifier()
+    app = UiServer(
+        _config(tmp_path),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+        notifier=notifier,
+    )
+    url = app.start()
+    try:
+        _, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "输入 hello 并保存",
+                "adapter": "mock",
+                "auto_confirm": True,
+            },
+            token=app.token,
+        )
+        stored = _wait_run(app, started["id"])
+        assert stored["status"] == "done"
+    finally:
+        app.stop()
+
+    assert len(notifier.calls) == 1
+    title, body = notifier.calls[0]
+    assert title.startswith("任务完成 · ")
+    assert "输入 hello" in title
+    assert body
 
 
 def test_run_requires_goal(server):
@@ -347,6 +702,176 @@ def test_ai_model_active_and_usage_endpoints(server):
     assert status == 200
     assert bootstrap["ai"]["active"]["model"] == "llama3.2"
     assert "api_key_enc" not in json.dumps(bootstrap)
+
+
+def test_audit_model_selection_roundtrip(server):
+    app, url = server
+    provider_id, model_id = _create_provider_model(app, url)
+
+    status, data = _request(
+        url + "api/audit/model",
+        method="POST",
+        body={"provider_id": provider_id, "model_id": model_id},
+        token=app.token,
+    )
+    assert status == 200
+    assert data["audit"]["follow_executor"] is False
+    assert data["audit"]["model_provider_id"] == provider_id
+    assert data["audit"]["model_id"] == model_id
+    assert app.storage.get_audit_model() == (provider_id, model_id)
+
+    _, bootstrap = _request(url + "api/bootstrap")
+    assert bootstrap["audit"]["follow_executor"] is False
+    assert bootstrap["ai_choices"][0]["id"] == provider_id
+    assert bootstrap["ai_choices"][0]["models"][0]["model_id"] == model_id
+
+    status, _ = _request(
+        url + "api/audit/model",
+        method="POST",
+        body={"provider_id": provider_id, "model_id": ""},
+        token=app.token,
+    )
+    assert status == 400
+    assert app.storage.get_audit_model() == (provider_id, model_id)
+
+    status, data = _request(
+        url + "api/audit/model",
+        method="POST",
+        body={"provider_id": "", "model_id": ""},
+        token=app.token,
+    )
+    assert status == 200
+    assert data["audit"]["follow_executor"] is True
+    assert app.storage.get_audit_model() == ("", "")
+
+
+def test_deleting_model_clears_audit_selection(server):
+    app, url = server
+    provider_id, model_id = _create_provider_model(app, url)
+    _request(
+        url + "api/audit/model",
+        method="POST",
+        body={"provider_id": provider_id, "model_id": model_id},
+        token=app.token,
+    )
+    assert app.storage.get_audit_model() == (provider_id, model_id)
+
+    status, _ = _request(
+        url + "api/ai/models/delete",
+        method="POST",
+        body={"provider_id": provider_id, "model_id": model_id},
+        token=app.token,
+    )
+    assert status == 200
+    assert app.storage.get_audit_model() == ("", "")
+
+
+def test_queued_run_keeps_model_selection(server):
+    app, url = server
+    provider_id, model_id = _create_provider_model(app, url)
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"adapter": "mock"},
+        token=app.token,
+    )
+    conversation_id = data["conversation"]["id"]
+
+    app._active.acquire()
+    try:
+        status, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "输入 hello",
+                "adapter": "mock",
+                "conversation_id": conversation_id,
+                "model_provider_id": provider_id,
+                "model_id": model_id,
+            },
+            token=app.token,
+        )
+        assert status == 202
+        assert started["queued"] is True
+    finally:
+        app._active.release()
+
+    task = app.storage.get_queue_task(started["task"]["id"])
+    assert task["model_provider_id"] == provider_id
+    assert task["model_id"] == model_id
+    app.storage.set_queue_status(task["id"], "cancelled")
+
+
+def test_auto_run_emits_route_event(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.adapters["windows"] = AdapterConfig(kind="windows_mcp")
+    app = UiServer(
+        config,
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    monkeypatch.setattr(
+        server_module,
+        "choose_primary",
+        lambda *a, **k: ("windows", "AI 选择 Windows-MCP"),
+    )
+    monkeypatch.setattr(
+        server_module, "build_adapter", lambda *a, **k: MockAdapter()
+    )
+    monkeypatch.setattr(
+        server_module, "build_provider", lambda *a, **k: HeuristicMockProvider()
+    )
+    url = app.start()
+    try:
+        _, bootstrap = _request(url + "api/bootstrap")
+        assert bootstrap["config"]["auto_available"] is True
+
+        status, data = _request(
+            url + "api/conversations",
+            method="POST",
+            body={"adapter": "auto"},
+            token=app.token,
+        )
+        assert status == 201
+        conversation_id = data["conversation"]["id"]
+
+        status, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "打开记事本",
+                "adapter": "auto",
+                "auto_confirm": True,
+                "conversation_id": conversation_id,
+            },
+            token=app.token,
+        )
+        assert status == 202
+        assert started["queued"] is False
+        _wait_run(app, started["id"])
+
+        run = app.get_run(started["id"])
+        assert run["resolved_adapter"] == "windows"
+        routes = [
+            event for event in run["events"] if event["event"] == "route"
+        ]
+        assert routes
+        assert routes[0]["payload"]["adapter"] == "windows"
+        assert routes[0]["payload"]["reason"] == "AI 选择 Windows-MCP"
+        assert routes[0]["payload"]["chain"] == ["windows"]
+    finally:
+        app.stop()
+
+
+def test_auto_adapter_rejected_without_real_backend(server):
+    app, url = server
+    status, _ = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"adapter": "auto"},
+        token=app.token,
+    )
+    assert status == 400
 
 
 def test_conversation_crud_endpoints(server):
@@ -556,6 +1081,20 @@ def test_toggle_pause_active_follows_foreground_run(server):
 
     app._controls.pop("run-hotkey", None)
     app._controls.pop("run-hotkey-2", None)
+
+
+def test_pause_and_resume_update_screen_indicator(server):
+    app, _ = server
+    app.indicator = _RecordingIndicator()
+    control = _register_running(app, "run-indicator")
+    try:
+        assert app.pause_run("run-indicator") is True
+        assert app.indicator.paused is True
+        assert app.resume_run("run-indicator") is True
+        assert app.indicator.paused is False
+        assert app.indicator.events == ["paused", "resumed"]
+    finally:
+        app._controls.pop("run-indicator", None)
 
 
 def test_indicator_and_hotkey_disable_off_demand():
@@ -802,3 +1341,125 @@ def test_resource_status_and_sync(server):
         time.sleep(0.05)
     assert data["job"]["ok"] is True
     assert data["job"]["percent"] == 100
+
+
+def _resource_state(
+    resource_id: str,
+    *,
+    required: bool = True,
+    status: str = "ready",
+) -> ResourceState:
+    resource = next(item for item in RESOURCES if item.id == resource_id)
+    return ResourceState(
+        id=resource.id,
+        name=resource.name,
+        version=resource.version,
+        required=required,
+        purpose=resource.purpose,
+        status=status,
+    )
+
+
+def _job(job_id: str, rows: list[dict]) -> dict:
+    return {
+        "id": job_id,
+        "running": True,
+        "phase": "detecting",
+        "percent": 1,
+        "message": "正在检测资源",
+        "resources": rows,
+    }
+
+
+def test_resources_snapshot_merges_cached_probe(server, monkeypatch):
+    app, _ = server
+    state = _resource_state("windows_mcp")
+    monkeypatch.setattr(app.resources, "status", lambda: [state])
+    app._resource_probes["windows_mcp"] = {
+        "ok": True,
+        "detail": "MCP 握手成功，共 1 个工具",
+        "tools": ["Snapshot"],
+        "checked_at": "2026-11-09T00:00:00+00:00",
+    }
+
+    row = app.resources_snapshot()["resources"][0]
+    assert row["runtime_ok"] is True
+    assert row["runtime_detail"] == "MCP 握手成功，共 1 个工具"
+    assert row["runtime_tools"] == ["Snapshot"]
+    assert row["runtime_checked_at"] == "2026-11-09T00:00:00+00:00"
+
+
+def test_resource_sync_probes_ready_resources(server, monkeypatch):
+    app, _ = server
+    state = _resource_state("windows_mcp")
+    monkeypatch.setattr(app.resources, "ensure", lambda **kwargs: [state])
+    calls: list[str] = []
+
+    def fake_probe(config, kind, timeout=20):
+        calls.append(kind)
+        return {
+            "ok": True,
+            "detail": "MCP 握手成功，共 1 个工具",
+            "tools": ["Snapshot"],
+        }
+
+    monkeypatch.setattr(server_module, "probe_adapter_kind", fake_probe)
+    job_id = "job-probe-ok"
+    app._resource_job = _job(job_id, [state.to_dict()])
+
+    app._run_resource_sync(job_id, [], False)
+
+    assert calls == ["windows_mcp"]
+    assert state.runtime_ok is True
+    assert state.runtime_tools == ["Snapshot"]
+    assert app._resource_probes["windows_mcp"]["ok"] is True
+    job = app._resource_job
+    assert job["running"] is False
+    assert job["phase"] == "done"
+    assert job["ok"] is True
+    assert job["percent"] == 100
+    assert "运行可用" in job["message"]
+    assert job["resources"][0]["runtime_ok"] is True
+
+
+def test_resource_sync_reports_runtime_failure(server, monkeypatch):
+    app, _ = server
+    state = _resource_state("windows_mcp")
+    monkeypatch.setattr(app.resources, "ensure", lambda **kwargs: [state])
+
+    def fake_probe(config, kind, timeout=20):
+        return {
+            "ok": False,
+            "detail": "握手失败：MCP server closed stdout",
+            "tools": [],
+        }
+
+    monkeypatch.setattr(server_module, "probe_adapter_kind", fake_probe)
+    job_id = "job-probe-fail"
+    app._resource_job = _job(job_id, [state.to_dict()])
+
+    app._run_resource_sync(job_id, [], False)
+
+    job = app._resource_job
+    assert job["phase"] == "done"
+    assert job["ok"] is False
+    assert "不可用" in job["message"]
+    assert "可强制重装失败项" in job["message"]
+    assert job["resources"][0]["runtime_ok"] is False
+    assert "closed stdout" in job["resources"][0]["runtime_detail"]
+
+
+def test_resources_snapshot_ignores_probe_for_missing_resource(server, monkeypatch):
+    app, _ = server
+    state = _resource_state("windows_mcp", status="missing")
+    monkeypatch.setattr(app.resources, "status", lambda: [state])
+    app._resource_probes["windows_mcp"] = {
+        "ok": True,
+        "detail": "MCP 握手成功",
+        "tools": ["Snapshot"],
+        "checked_at": "2026-11-09T00:00:00+00:00",
+    }
+
+    row = app.resources_snapshot()["resources"][0]
+    assert row["runtime_ok"] is None
+    assert row["runtime_detail"] == ""

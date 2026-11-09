@@ -23,6 +23,11 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(spec.input_schema.get("type"), "object")
             self.assertEqual(spec.output_schema.get("type"), "object")
 
+    def test_task_finish_accepts_declared_failure(self):
+        schema = get_capability("task.finish").input_schema
+        self.assertEqual(schema["properties"]["success"]["type"], "boolean")
+        self.assertIn("Chinese", get_capability("task.finish").description)
+
     def test_unknown_capability_raises(self):
         with self.assertRaises(KeyError):
             get_capability("browser.open")

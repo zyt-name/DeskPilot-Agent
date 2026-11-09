@@ -16,6 +16,7 @@ from .mcp_stdio import MCPError, StdioMCPClient
 from .ai.factory import (
     build_active_provider,
     build_ai_provider,
+    build_model_provider,
     usage_recorder,
 )
 from .policy import Policy
@@ -59,7 +60,7 @@ def build_adapter(config: AgentConfig, name: str):
     )
 
 
-def _ensure_vision(config: AgentConfig, adapter_name: str, provider):
+def ensure_vision(config: AgentConfig, adapter_name: str, provider):
     adapter = config.adapters.get(adapter_name)
     kind = adapter.kind if adapter is not None else ""
     vision = bool(
@@ -85,7 +86,20 @@ def build_provider(
     storage: Storage | None = None,
     source: str = "ui",
     run_id: str | None = None,
+    model_provider_id: str = "",
+    model_id: str = "",
 ):
+    if storage is not None and model_provider_id and model_id:
+        selected = build_model_provider(
+            storage,
+            model_provider_id,
+            model_id,
+            timeout_seconds=config.model.timeout_seconds,
+            temperature=config.model.temperature,
+            source=source,
+            run_id=run_id,
+        )
+        return ensure_vision(config, adapter_name, selected)
     if storage is not None:
         active = build_active_provider(
             storage,
@@ -95,7 +109,7 @@ def build_provider(
             run_id=run_id,
         )
         if active is not None:
-            return _ensure_vision(config, adapter_name, active)
+            return ensure_vision(config, adapter_name, active)
     if config.model.provider == "fake":
         if adapter_name != "mock":
             raise RuntimeError(
@@ -126,8 +140,47 @@ def build_provider(
             vision=is_vision_model(config.model.model),
             on_usage=recorder,
         )
-        return _ensure_vision(config, adapter_name, provider)
+        return ensure_vision(config, adapter_name, provider)
     raise RuntimeError(f"unsupported model provider: {config.model.provider}")
+
+
+def probe_adapter_kind(
+    config: AgentConfig, kind: str, timeout: float = 20.0
+) -> dict[str, Any]:
+    """Start the configured MCP backend and complete a real MCP handshake."""
+    adapter = next(
+        (item for item in config.adapters.values() if item.kind == kind),
+        None,
+    )
+    if adapter is None:
+        return {"ok": False, "detail": "配置中没有对应的后端", "tools": []}
+    if not adapter.command:
+        return {"ok": False, "detail": "后端没有配置启动命令", "tools": []}
+    env = {**os.environ, **(adapter.env or {})} if adapter.env else None
+    try:
+        client = StdioMCPClient(
+            adapter.command,
+            env=env,
+            cwd=adapter.cwd,
+            default_timeout=timeout,
+        )
+    except (OSError, MCPError) as exc:
+        return {"ok": False, "detail": f"启动失败：{exc}", "tools": []}
+    try:
+        tools = [
+            str(tool.get("name"))
+            for tool in client.list_tools()
+            if tool.get("name")
+        ]
+        return {
+            "ok": True,
+            "detail": f"MCP 握手成功，共 {len(tools)} 个工具",
+            "tools": tools,
+        }
+    except (OSError, MCPError) as exc:
+        return {"ok": False, "detail": f"握手失败：{exc}", "tools": []}
+    finally:
+        client.close()
 
 
 def policy_from_config(config: AgentConfig) -> Policy:
@@ -143,13 +196,18 @@ def _audit_provider(
     config: AgentConfig,
     storage: Storage | None,
     run_id: str | None,
+    executor: tuple[Any, str, str] | None = None,
 ) -> tuple[Any, str, str, bool]:
     audit_config = config.audit_ai
     active = storage.get_active_ai() if storage is not None else None
-    if storage is not None and audit_config.model_provider_id:
-        row = storage.get_ai_provider(
-            audit_config.model_provider_id, include_secret=True
-        )
+    selected_provider_id, selected_model_id = "", ""
+    if storage is not None:
+        selected_provider_id, selected_model_id = storage.get_audit_model()
+    if not selected_provider_id:
+        selected_provider_id = audit_config.model_provider_id
+        selected_model_id = audit_config.model_id
+    if storage is not None and selected_provider_id:
+        row = storage.get_ai_provider(selected_provider_id, include_secret=True)
         if row is not None:
             endpoint = preset_endpoint(
                 str(row.get("preset_id") or ""),
@@ -161,7 +219,7 @@ def _audit_provider(
                 item["model_id"]: item
                 for item in storage.list_ai_models(row["id"])
             }
-            model_id = audit_config.model_id
+            model_id = selected_model_id
             model = models.get(model_id)
             if model is None and models:
                 model_id, model = next(iter(models.items()))
@@ -185,11 +243,22 @@ def _audit_provider(
                     on_usage=recorder,
                 )
                 same = bool(
-                    active
-                    and active["provider"]["id"] == row.get("id")
-                    and active["model"]["model_id"] == model_id
+                    executor is not None
+                    and executor[2] == model_id
+                    and str(row.get("id") or "")
+                    == str(getattr(executor[0], "provider_id", "") or "")
                 )
+                if executor is not None and not same:
+                    same = bool(
+                        active
+                        and active["provider"]["id"] == row.get("id")
+                        and active["model"]["model_id"] == model_id
+                    )
                 return provider, model_id, str(row.get("name") or ""), same
+
+    if executor is not None:
+        provider, model_id, provider_name = executor
+        return provider, model_id, provider_name, True
 
     if storage is not None:
         provider = build_active_provider(
@@ -243,9 +312,10 @@ def build_audit_gate(
     mode: str | None = None,
     project_root: str | None = None,
     workspace_roots: list[str] | None = None,
+    executor: tuple[Any, str, str] | None = None,
 ) -> AuditGate:
     provider, model_id, provider_name, same = _audit_provider(
-        config, storage, run_id
+        config, storage, run_id, executor
     )
     auditor = (
         TopLevelAuditor(
@@ -290,5 +360,6 @@ __all__ = [
     "build_adapter",
     "build_audit_gate",
     "build_provider",
+    "ensure_vision",
     "policy_from_config",
 ]

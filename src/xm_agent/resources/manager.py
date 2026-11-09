@@ -55,6 +55,10 @@ class ResourceState:
     source: str = ""
     stage: str = ""
     license: str = ""
+    runtime_ok: bool | None = None
+    runtime_detail: str = ""
+    runtime_tools: list[str] = field(default_factory=list)
+    runtime_checked_at: str = ""
 
     @property
     def ok(self) -> bool:
@@ -243,6 +247,7 @@ class ResourceManager:
             if (
                 record["version"] == resource.version
                 and not record["missing"]
+                and record["stage"] in {"", "ready"}
             ):
                 layout_label = (
                     "版本化目录" if record["layout"] == "versioned" else "本地已有安装"
@@ -261,11 +266,19 @@ class ResourceManager:
         ]
         if matching_version:
             record = matching_version[0]
-            missing = ", ".join(record["missing"])
+            if record["stage"] and record["stage"] != "ready":
+                detail = (
+                    f"上次安装未完成（阶段：{record['stage']}），需要重新安装"
+                )
+            else:
+                detail = (
+                    "版本匹配但缺少运行文件："
+                    + ", ".join(record["missing"])
+                )
             return self._state(
                 resource,
                 INCOMPLETE,
-                f"版本匹配但缺少运行文件：{missing}",
+                detail,
                 record["path"],
                 record["source"],
                 record["stage"],

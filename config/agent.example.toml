@@ -3,6 +3,8 @@ max_steps = 12
 max_consecutive_failures = 2
 lock_path = ".xm-agent/agent.lock"
 lock_ttl_seconds = 60
+# auto = 由模型按任务自动挑后端：普通桌面任务优先 Windows-MCP；SSH、远程主机、
+# Linux 等任务走 xshell；Windows-MCP 观测失败时回退 computer_use（需可识图模型）。
 default_adapter = "mock"
 
 [audit]
@@ -14,6 +16,7 @@ keep_days = 7
 # 不提供关闭审计或完全访问的选项。
 mode = "ai"
 # 留空时使用当前活动的执行模型（独立性较弱，界面会标注）。
+# 界面里的「审计模型」选择保存在数据库中，会覆盖这里；选择「跟随执行模型」则继续按下面回退。
 model_provider_id = ""
 model_id = ""
 timeout_seconds = 12
@@ -32,6 +35,8 @@ model = "gpt-4.1"
 api_key_env = "OPENAI_API_KEY"
 timeout_seconds = 120
 temperature = 0.0
+# 任务上下文预算按窗口的 35% 计算；超出后较早对话会自动压缩成摘要。
+context_window = 32768
 # 图像输入能力由官方模型列表/模型名称自动判定，不在这里手动开关。
 
 [policy]
