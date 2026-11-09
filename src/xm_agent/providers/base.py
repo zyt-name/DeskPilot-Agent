@@ -28,5 +28,6 @@ class Provider(Protocol):
         *,
         max_tokens: int = 800,
         on_delta=None,
+        image_path: str | None = None,
     ) -> str:
         ...

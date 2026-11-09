@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import queue as queue_module
+import re
 import secrets
 import sys
 import threading
@@ -58,6 +59,12 @@ _TITLE_SYSTEM_PROMPT = (
     "你是任务命名助手。根据用户目标和执行结果，用不超过 16 个汉字概括任务。"
     "只输出任务名称，不要引号、标点或解释。"
 )
+_RESUME_TEXT = re.compile(
+    r"^(继续|继续任务|继续吧|可以继续|已登录|已经登录|登录好了|登录完成|"
+    r"我登录好了|我登录完成了|好了|弄好了|ok|okay|continue|resume)"
+    r"\s*[。.!！]?$",
+    re.IGNORECASE,
+)
 
 
 def _now() -> str:
@@ -106,11 +113,13 @@ class UiServer:
         resources_root: str | Path | None = None,
         indicator: Any | None = None,
         notifier: Any | None = None,
+        desktop: Any | None = None,
     ) -> None:
         self.config = config
         self.storage = Storage(db_path)
         self.indicator = indicator
         self.notifier = notifier
+        self.desktop = desktop
         self.native_hotkey = False
         self.ai = AiService(self.storage)
         self.host = host
@@ -128,6 +137,8 @@ class UiServer:
         self._run_conversations: dict[str, str | None] = {}
         self._controls: dict[str, RunControl] = {}
         self._control_lock = threading.Lock()
+        self._screen_runs: set[str] = set()
+        self._screen_lock = threading.Lock()
         self._subscribers: dict[int, tuple[str | None, queue_module.Queue]] = {}
         self._subscriber_lock = threading.Lock()
         self._subscriber_seq = 0
@@ -168,19 +179,51 @@ class UiServer:
         if self._thread is not None:
             self._thread.join(timeout=3)
 
+    def _vision_models(self) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        for provider in self.storage.list_ai_providers():
+            for model in provider.get("models", []):
+                if model.get("vision"):
+                    found.append(
+                        (str(provider["id"]), str(model["model_id"]))
+                    )
+        return found
+
+    def _is_vision_model(self, provider_id: str, model_id: str) -> bool:
+        return any(
+            item["model_id"] == model_id and item.get("vision")
+            for item in self.storage.list_ai_models(provider_id)
+        )
+
     def audit_snapshot(self) -> dict[str, Any]:
         provider_id, model_id = self.storage.get_audit_model()
-        follow = not bool(provider_id)
-        if follow:
-            provider_id = self.config.audit_ai.model_provider_id
-            model_id = self.config.audit_ai.model_id
-            follow = not bool(provider_id)
+        explicit = bool(provider_id) and self._is_vision_model(
+            provider_id, model_id
+        )
+        follow = False
+        if not explicit:
+            provider_id = model_id = ""
+            active = self.storage.get_active_ai()
+            if (
+                active is not None
+                and active["model"].get("vision")
+            ):
+                provider_id = str(active["provider"]["id"])
+                model_id = str(active["model"]["model_id"])
+                follow = True
+        if not provider_id:
+            vision_models = self._vision_models()
+            if vision_models:
+                provider_id, model_id = vision_models[0]
         return {
             "mode": self.config.audit_ai.mode,
             "modes": ["ai", "confirm_all"],
             "model_provider_id": provider_id,
             "model_id": model_id,
             "follow_executor": follow,
+            "vision": bool(provider_id),
+            "vision_required": True,
+            "vision_available": bool(self._vision_models()),
             "fail_closed": self.config.audit_ai.fail_closed,
         }
 
@@ -218,6 +261,11 @@ class UiServer:
             },
             "screen_indicator": bool(
                 self.indicator is not None and self.indicator.available
+            ),
+            "desktop_handoff": bool(
+                self.config.runtime.release_desktop
+                and self.desktop is not None
+                and self.desktop.available
             ),
             "audit": self.audit_snapshot(),
             "config": {
@@ -458,6 +506,15 @@ class UiServer:
         if model_id not in models:
             raise ValueError("unknown model for this provider")
 
+    def _validate_audit_model_selection(
+        self, provider_id: str, model_id: str
+    ) -> None:
+        if not provider_id and not model_id:
+            return
+        self._validate_model_selection(provider_id, model_id)
+        if not self._is_vision_model(provider_id, model_id):
+            raise ValueError("顶层审计模型必须支持图像输入（识图）")
+
     def save_profile(self, fields: dict[str, Any]) -> dict[str, Any]:
         adapter = str(
             fields.get("default_adapter", self.config.default_adapter)
@@ -645,6 +702,13 @@ class UiServer:
             run_id=run_id,
             conversation_id=conversation_id,
         )
+        # The user cannot answer from a minimised window, so bring the
+        # console back for the duration of the prompt.
+        if self.desktop is not None and self._run_owns_screen(run_id):
+            try:
+                self.desktop.reclaim()
+            except Exception:
+                pass
         signalled = signal.wait(timeout=self._confirm_timeout)
         with self._confirm_lock:
             self._confirm_requests.pop(request_id, None)
@@ -656,6 +720,16 @@ class UiServer:
             run_id=run_id,
             conversation_id=conversation_id,
         )
+        control = self._control_for(run_id)
+        if (
+            self.desktop is not None
+            and self._run_owns_screen(run_id)
+            and (control is None or not control.paused)
+        ):
+            try:
+                self.desktop.release()
+            except Exception:
+                pass
         return approved
 
     def resolve_confirmation(self, request_id: str, approved: bool) -> bool:
@@ -698,6 +772,11 @@ class UiServer:
                 self.indicator.set_paused(True)
             except Exception:
                 pass
+        if self.desktop is not None and self._run_owns_screen(run_id):
+            try:
+                self.desktop.reclaim()
+            except Exception:
+                pass
         self._publish(
             "pause",
             {"run_id": run_id, "paused": True},
@@ -715,6 +794,11 @@ class UiServer:
         if self.indicator is not None:
             try:
                 self.indicator.set_paused(False)
+            except Exception:
+                pass
+        if self.desktop is not None and self._run_owns_screen(run_id):
+            try:
+                self.desktop.release()
             except Exception:
                 pass
         self._publish(
@@ -758,6 +842,39 @@ class UiServer:
             )
         adapter = self.config.adapters.get(adapter_name)
         return adapter is not None and adapter.kind in SCREEN_KINDS
+
+    # -- desktop handoff ----------------------------------------------
+
+    def _release_desktop(self, run_id: str) -> None:
+        """Minimise the console so a screen run owns the desktop."""
+        if not self.config.runtime.release_desktop:
+            return
+        with self._screen_lock:
+            self._screen_runs.add(run_id)
+        if self.desktop is None:
+            return
+        try:
+            self.desktop.release()
+        except Exception:
+            pass
+
+    def _reclaim_desktop(self, run_id: str) -> None:
+        """Bring the console back once no screen run is left."""
+        if not self.config.runtime.release_desktop:
+            return
+        with self._screen_lock:
+            self._screen_runs.discard(run_id)
+            busy = bool(self._screen_runs)
+        if busy or self.desktop is None:
+            return
+        try:
+            self.desktop.reclaim()
+        except Exception:
+            pass
+
+    def _run_owns_screen(self, run_id: str) -> bool:
+        with self._screen_lock:
+            return run_id in self._screen_runs
 
     def instruct_run(self, run_id: str, text: str) -> str:
         control = self._control_for(run_id)
@@ -819,6 +936,21 @@ class UiServer:
 
     # -- runs ---------------------------------------------------------
 
+    def _pending_await_user(
+        self, conversation_id: str
+    ) -> dict[str, Any] | None:
+        runs = self.storage.list_runs(1, conversation_id)
+        if not runs or runs[0].get("status") != "needs_human":
+            return None
+        for message in reversed(self.storage.list_messages(conversation_id)):
+            if message.get("role") == "user":
+                return None
+            if message.get("role") == "assistant":
+                info = (message.get("payload") or {}).get("await_user")
+                if info:
+                    return {"run": runs[0], "await_user": info}
+        return None
+
     def start_run(
         self,
         goal: str,
@@ -829,6 +961,7 @@ class UiServer:
         audit_mode: str | None = None,
         model_provider_id: str = "",
         model_id: str = "",
+        resume: bool = False,
     ) -> dict[str, Any]:
         goal = goal.strip()
         if not goal:
@@ -842,6 +975,21 @@ class UiServer:
                 raise ValueError("conversation not found")
             if not adapter_name:
                 adapter_name = conversation["adapter"]
+        pending_await = None
+        if conversation_id and (resume or _RESUME_TEXT.match(goal)):
+            pending_await = self._pending_await_user(conversation_id)
+        if resume and pending_await is None:
+            raise ValueError("当前没有等待你处理的任务")
+        run_goal = goal
+        context_note = ""
+        if pending_await is not None:
+            run_goal = str(pending_await["run"].get("goal") or goal)
+            kind = str(pending_await["await_user"].get("kind") or "input")
+            label = "登录" if kind == "login" else "人工处理"
+            context_note = (
+                f"用户已完成暂停事项（{label}），并回复：{goal}。"
+                "请从当前屏幕继续原任务，不要从头开始。"
+            )
         if not self._adapter_allowed(adapter_name):
             raise ValueError(f"unknown adapter: {adapter_name}")
         mode = (
@@ -858,11 +1006,13 @@ class UiServer:
         if not self._active.acquire(blocking=False):
             task = self.storage.enqueue_task(
                 conversation_id or "",
-                goal,
+                run_goal,
                 adapter_name,
                 mode,
                 model_provider_id,
                 model_id,
+                user_message=goal,
+                context_note=context_note,
             )
             self._publish(
                 "queue_added",
@@ -873,13 +1023,15 @@ class UiServer:
 
         try:
             run_id = self._launch_run(
-                goal,
+                run_goal,
                 adapter_name,
                 bool(auto_confirm),
                 conversation_id,
                 mode,
                 model_provider_id=model_provider_id,
                 model_id=model_id,
+                message=goal,
+                context_note=context_note,
             )
         except Exception:
             self._active.release()
@@ -896,6 +1048,8 @@ class UiServer:
         task_id: str | None = None,
         model_provider_id: str = "",
         model_id: str = "",
+        message: str | None = None,
+        context_note: str = "",
     ) -> str:
         run_id = uuid.uuid4().hex[:12]
         active = self.ai.active_summary()
@@ -940,7 +1094,7 @@ class UiServer:
                 self.storage.add_message(
                     conversation_id,
                     "user",
-                    goal,
+                    message if message is not None else goal,
                     "goal",
                     {
                         "run_id": run_id,
@@ -948,6 +1102,7 @@ class UiServer:
                         "audit_mode": audit_mode,
                         "model_provider_id": model_provider_id,
                         "model_id": model_id,
+                        "resume": bool(context_note),
                     },
                 )
             self.storage.create_run(
@@ -968,6 +1123,7 @@ class UiServer:
                     task_id,
                     model_provider_id,
                     model_id,
+                    context_note,
                 ),
                 daemon=True,
             ).start()
@@ -996,6 +1152,8 @@ class UiServer:
                 task_id=task["id"],
                 model_provider_id=task.get("model_provider_id") or "",
                 model_id=task.get("model_id") or "",
+                message=task.get("user_message") or None,
+                context_note=task.get("context_note") or "",
             )
             self._publish(
                 "queue",
@@ -1046,6 +1204,7 @@ class UiServer:
         task_id: str | None = None,
         model_provider_id: str = "",
         model_id: str = "",
+        context_note: str = "",
     ) -> None:
         thinking: list[str] = []
         assistant: list[str] = []
@@ -1080,7 +1239,9 @@ class UiServer:
             self._controls[run_id] = control
         adapter = None
         status, reason, steps, summary = "failed", "", 0, ""
+        await_user: dict[str, Any] | None = None
         screen = False
+        needs_screen = False
         try:
             provider = build_provider(
                 self.config,
@@ -1146,6 +1307,8 @@ class UiServer:
             else:
                 adapter = build_adapter(self.config, adapter_name)
                 needs_screen = self._uses_screen(adapter_name)
+            if needs_screen:
+                self._release_desktop(run_id)
             if self.indicator is not None and needs_screen:
                 screen = True
                 try:
@@ -1166,6 +1329,12 @@ class UiServer:
                     on_event("context", snapshot.to_dict())
                 except Exception:
                     task_context = ""
+            if context_note:
+                task_context = (
+                    f"{task_context}\n\n{context_note}".strip()
+                    if task_context
+                    else context_note
+                )
             gate = build_audit_gate(
                 self.config,
                 self.storage,
@@ -1193,6 +1362,10 @@ class UiServer:
                 max_consecutive_failures=(
                     self.config.runtime.max_consecutive_failures
                 ),
+                max_provider_retries=self.config.runtime.max_provider_retries,
+                provider_retry_delay=(
+                    self.config.runtime.provider_retry_delay
+                ),
                 confirm=confirm,
                 on_event=on_event,
                 gate=gate,
@@ -1202,6 +1375,7 @@ class UiServer:
             status = result.status
             reason = result.reason
             steps = len(result.steps)
+            await_user = result.await_user
             summary = result.summary or final_summary(
                 status, reason, result.steps
             )
@@ -1215,6 +1389,8 @@ class UiServer:
                     self.indicator.hide()
                 except Exception:
                     pass
+            if needs_screen:
+                self._reclaim_desktop(run_id)
             with self._control_lock:
                 self._controls.pop(run_id, None)
             if adapter is not None:
@@ -1248,6 +1424,7 @@ class UiServer:
                         "summary": summary,
                         "steps": steps,
                         "thinking": "".join(thinking)[:8000],
+                        **({"await_user": await_user} if await_user else {}),
                     },
                 )
                 self.storage.touch_conversation(conversation_id)
@@ -1484,6 +1661,7 @@ def _make_handler(app: UiServer):
                             body.get("model_provider_id") or ""
                         ),
                         model_id=str(body.get("model_id") or ""),
+                        resume=bool(body.get("resume")),
                     )
                     self._json(result, 202)
                     return
@@ -1491,7 +1669,9 @@ def _make_handler(app: UiServer):
                     provider_id = str(body.get("provider_id") or "")
                     model_id = str(body.get("model_id") or "")
                     if provider_id:
-                        app._validate_model_selection(provider_id, model_id)
+                        app._validate_audit_model_selection(
+                            provider_id, model_id
+                        )
                     app.storage.set_audit_model(
                         provider_id, model_id if provider_id else ""
                     )

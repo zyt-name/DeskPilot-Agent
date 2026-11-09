@@ -11,7 +11,8 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.10"]
-gui = ["pywebview>=6.0"]
+gui = ["pywebview>=6.0", "Pillow>=10"]
+vision = ["Pillow>=10"]
 
 [project.scripts]
 xm-agent = "xm_agent.cli:main"

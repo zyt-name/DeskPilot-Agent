@@ -1,6 +1,6 @@
 # DeskPilot Agent（XM Agent）
 
-基于能力契约（capability contract）的 Windows 电脑操控 Agent：把桌面观测、点击输入、视觉截图、终端与文件传输统一成 7 个能力，由本地运行时完成「观测 → 决策 → 策略检查 → 执行 → 验证」的闭环。仓库地址：<https://github.com/zyt-name/DeskPilot-Agent>。
+基于能力契约（capability contract）的 Windows 电脑操控 Agent：把桌面观测、点击输入、视觉截图、终端与文件传输统一成 8 个能力，由本地运行时完成「观测 → 决策 → 策略检查 → 执行 → 验证」的闭环。仓库地址：<https://github.com/zyt-name/DeskPilot-Agent>。
 
 当前版本提供：
 
@@ -8,8 +8,12 @@
 - Computer-Use MCP 视觉通道：基于截图的坐标级操作（可选）。
 - xshell-mcp 终端通道：Xshell 会话桥接（可选，需本机安装 Xshell）。
 - auto 模式：模型按任务自动选择通道——普通桌面任务优先 Windows-MCP，SSH / 远程 / Linux 任务走 xshell，Windows-MCP 观测失败时回退 Computer-Use（需可识图模型）。
-- 发送框内按厂商分组的模型选择（仅影响本次任务）；任务标题右侧「审计模型」可选择顶层审计 AI 使用的模型，默认跟随执行模型。
+- 发送框内按厂商分组的模型选择（仅影响本次任务）；任务标题右侧「审计模型」只列出可识图模型，默认跟随可识图的执行模型，未配置时回退到其他可识图模型。
+- 视觉提速：模型可一次规划 1–4 步批量动作、截屏缩到 1280 宽并优先 JPEG、屏幕未变化时复用摘要不上送图片；UIA 能表达状态时不依赖截图。
+- 回退风险审查：提交/保存/删除/覆盖、上传、`git push`、提权等难撤销操作，以及模型声明 `rollback_risk` 的 UI 动作，由顶层识图审计模型对照当前截图复核；审计模型或截图不可用时强制用户确认。
+- 登录阻塞：没有提供账号密码时遇到登录页，模型必须调用 `task.await_user` 暂停任务，禁止绕过登录；UIA 登录页还会被运行时强制拦截。用户登录后在同一会话发送「继续」，即以原目标从当前屏幕接着执行。
 - 本地桌面控制台（pywebview + WebView2）：任务运行、历史、AI 模型配置、Token 用量、MCP 资源检测。
+- 前台独占：需要屏幕的任务运行时控制台自动最小化，把桌面让给目标应用；任务结束、失败、取消后恢复窗口，暂停（F8）与确认弹窗会临时把窗口调回前台，继续后再次让出。
 - 任务收尾：结束时生成中文任务总结（成功说明当前状态，失败说明原因），工具步骤折叠为「执行工具 N 次」，并发送 Windows 系统通知。
 - 多厂商 AI 配置：OpenAI 兼容 / Anthropic Messages / Gemini / Ollama，API Key 使用 Windows DPAPI 加密入库。
 - 第三方 MCP 资源自动初始化：启动时检测、缺失时自动下载并构建，支持版本化目录与国内镜像回退。
@@ -142,6 +146,9 @@ start.cmd
 # 仅启动本地 API（浏览器访问打印出的 URL）
 PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent gui --server-only --port 8765
 
+# 清理过期审计日志与截图（--dry-run 只统计）
+PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent cleanup --dry-run
+
 # 离线 demo
 PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent demo
 
@@ -152,6 +159,9 @@ PYTHONPATH=src .venv\Scripts\python.exe -m xm_agent run --goal "打开记事本�
 ## 配置
 
 - 主配置：`config/agent.example.toml`（适配器、策略、审计、默认模型）。
+- 长任务稳定性：`[runtime]` 的 `max_steps`（默认 30）、`max_provider_retries`（默认 2，模型输出不可解析或调用失败时重试）、`provider_retry_delay`（默认 1.2 秒，仅 429/超时/连接/5xx 退避）。
+- 数据保留：`[audit].keep_days`（默认 7）同时约束审计 JSONL 与 `[runtime].screenshot_dir` 下的截图；`xm-agent cleanup` 立即清理，`--dry-run` 只统计不删除，启动 `run` / `gui` 时会自动执行一次。
+- 窗口让出：`[runtime].release_desktop`（默认 `true`）控制屏幕任务运行时是否最小化控制台；浏览器模式（`--server-only`）无窗口可让，该项不生效。
 - Xshell 桥接配置：`config/xshell-mcp.json`（路径相对 `vendor/xshell-mcp` 解析）。
 - 在 Xshell 标签页运行 `config/xshell-bridge-default.js` 前，先把其中的 `REPO_ROOT` 改为本仓库的绝对路径。
 - AI 厂商、密钥提示、模型与用量保存在 `.xm-agent/app.db`（SQLite，WAL）。
@@ -166,6 +176,7 @@ src/xm_agent/
   providers/      # OpenAI 兼容 / Anthropic / fake
   resources/      # 第三方 MCP 清单、下载、校验、构建、检测
   ui/             # 回环 HTTP API、静态前端、pywebview 窗口
+  maintenance.py  # 审计日志与截图的保留期清理
   runtime.py      # 能力契约运行时
   policy.py       # 能力白名单、命令前缀、路径限制、确认门
   storage.py      # SQLite 持久化
@@ -181,7 +192,7 @@ start.cmd         # 资源初始化 + 桌面控制台启动
 PYTHONPATH=src .venv\Scripts\python.exe -m pytest -q
 ```
 
-当前 173 项用例通过，覆盖能力契约、策略、锁、审计、MCP 协议、适配器、AI 配置与视觉能力判定、用量、面板 API，以及资源清单、版本检测、镜像回退、安全解压与版本化安装。
+当前 305 项用例通过，覆盖能力契约、策略、锁、审计、视觉审查与截屏缓存、批量计划、登录阻塞与继续、跨后端契约（mock / windows / computer_use / xshell）、控制台窗口接管（让出/恢复/暂停/确认联动）、数据保留清理、MCP 协议、适配器、AI 配置与视觉能力判定、用量来源、面板 API，以及资源清单、版本检测、镜像回退、安全解压与版本化安装。
 
 ## 安全与数据
 

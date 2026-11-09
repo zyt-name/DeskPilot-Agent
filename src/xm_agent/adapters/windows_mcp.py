@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
+from pathlib import Path
 from typing import Any
 
+from .. import vision
 from ..mcp_stdio import MCPError, StdioMCPClient
 from ..types import Element, Observation, Receipt, Verification
 from .mcp_tool import McpToolAdapter
@@ -130,15 +133,21 @@ class WindowsMcpAdapter(McpToolAdapter):
         client: StdioMCPClient,
         tools: dict[str, str] | None = None,
         tool_args: dict[str, dict[str, str]] | None = None,
+        screenshot_dir: str | Path = ".xm-agent/screenshots",
     ) -> None:
         super().__init__(client, {**WINDOWS_TOOLS, **(tools or {})}, tool_args)
+        self.screenshot_dir = Path(screenshot_dir)
         self._coords: dict[str, tuple[int, int]] = {}
         self._names: dict[str, str] = {}
 
     def observe(self, step: int, include_screenshot: bool = False) -> Observation:
         result = self.client.call_tool(
             self.tools["observe"],
-            {"use_vision": False, "use_ui_tree": True, "use_annotation": False},
+            {
+                "use_vision": bool(include_screenshot),
+                "use_ui_tree": True,
+                "use_annotation": False,
+            },
         )
         text = _text_of(result)
         elements, windows, active_window = parse_snapshot(text)
@@ -152,15 +161,45 @@ class WindowsMcpAdapter(McpToolAdapter):
             f"{len(elements)} elements, {len(windows)} windows, "
             f"active window: {active_window or 'unknown'}"
         )
+        raw: dict[str, Any] = {"mcp": "windows_mcp", "windows": windows[:20]}
+        screenshot_path: str | None = None
+        if include_screenshot:
+            saved = self._save(_image_of(result), prefix="snapshot")
+            screenshot_path = str(saved.get("path") or "") or None
+            if screenshot_path is None:
+                screenshot_path = self.capture_screenshot(prefix="snapshot")
+            if screenshot_path:
+                raw["screenshot_hash"] = vision.digest_path(screenshot_path)
         return Observation(
             step=step,
             source="uia",
             summary=summary,
             elements=elements,
             active_window=active_window,
-            screenshot_path=None,
-            raw={"mcp": "windows_mcp", "windows": windows[:20]},
+            screenshot_path=screenshot_path,
+            raw=raw,
         )
+
+    def capture_screenshot(self, prefix: str = "audit") -> str | None:
+        """Capture the desktop for the top-level vision auditor."""
+        try:
+            result = self.client.call_tool(self.tools["screenshot"], {})
+            saved = self._save(_image_of(result), prefix=prefix)
+            if saved.get("path"):
+                return str(saved["path"])
+        except Exception:
+            pass
+        saved = vision.capture_primary_screen(
+            self.screenshot_dir, prefix=prefix
+        )
+        if not saved:
+            return None
+        return str(saved.get("path") or "") or None
+
+    def _save(self, image: bytes | None, *, prefix: str) -> dict[str, Any]:
+        if not image:
+            return {}
+        return vision.save_image(image, self.screenshot_dir, prefix=prefix)
 
     def execute(self, capability: str, args: dict[str, Any]) -> Receipt:
         if capability == "desktop.verify":
@@ -330,6 +369,25 @@ def _user_control_wait(data: dict[str, Any]) -> float | None:
         return max(0.0, float(status.get("wait_seconds") or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _image_of(result: dict[str, Any]) -> bytes | None:
+    if not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "image":
+            continue
+        data = item.get("data")
+        if not data:
+            continue
+        try:
+            return base64.b64decode(data)
+        except Exception:
+            return None
+    return None
 
 
 def _text_of(result: dict[str, Any]) -> str:

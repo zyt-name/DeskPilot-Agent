@@ -145,6 +145,15 @@
                 <button class="btn btn-danger-ghost" id="task-banner-cancel" type="button">结束控制</button>
               </div>
             </div>
+            <div class="pause-banner await-banner hidden" id="task-await-banner">
+              <div>
+                <strong id="task-await-title">等待你登录</strong>
+                <span id="task-await-text">当前页面需要登录。登录完成后点击右侧按钮，或在输入框发送“继续”。</span>
+              </div>
+              <div class="row">
+                <button class="btn btn-primary" id="task-await-resume" type="button">我已登录，继续</button>
+              </div>
+            </div>
 
             <header class="chat-head">
               <div class="chat-head-title">
@@ -153,12 +162,12 @@
                   <button class="icon-btn title-edit" id="task-title-edit" type="button" title="重命名任务" aria-label="重命名任务" disabled>
                     <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 13.8V16h2.2l8-8-2.2-2.2-8 8Z" /><path d="M12.6 4.6l2.8 2.8" /></svg>
                   </button>
-                  <label class="field compact inline audit-model-field" title="顶层审计 AI 使用的模型">
+                  <label class="field compact inline audit-model-field" title="顶层审计 AI 使用的模型（必须支持图像输入）">
                     <span>审计模型</span>
                     <select id="task-audit-model"></select>
                   </label>
                 </div>
-                <p class="hint" id="task-conversation-sub">敏感操作由顶层审计 AI 判断，涉及用户数据时请你确认。</p>
+                <p class="hint" id="task-conversation-sub">敏感与回退风险操作由顶层识图审计 AI 判断，必要时对照屏幕截图复核；涉及用户数据时请你确认。</p>
                 <button class="context-meter" id="task-context-open" type="button" title="查看任务上下文与压缩摘要" disabled>
                   <span class="context-track"><span class="context-fill" id="task-context-fill"></span></span>
                   <span class="context-label" id="task-context-label">上下文 0%</span>
@@ -187,7 +196,7 @@
               <div class="chat-messages" id="task-messages">
                 <div class="chat-empty" id="task-chat-empty">
                   <h3>开始一个桌面任务</h3>
-                  <p>描述目标，AI 会逐步操作并验证。敏感操作先由顶层审计 AI 判断；涉及其他项目或用户数据时，系统会请你审计目的、流程与影响。</p>
+                  <p>描述目标，AI 会逐步操作并验证。敏感与回退风险操作先由顶层识图审计 AI 对照屏幕判断；涉及其他项目或用户数据时，系统会请你审计目的、流程与影响。</p>
                 </div>
               </div>
             </div>
@@ -392,6 +401,11 @@
             <div class="card-label">今日 Token</div>
             <div class="card-value" id="usage-today">0</div>
             <div class="card-note" id="usage-today-note">今日 0 次调用</div>
+          </div>
+          <div class="card">
+            <div class="card-label">审计 Token</div>
+            <div class="card-value" id="usage-audit">0</div>
+            <div class="card-note" id="usage-audit-note">占总量 0%</div>
           </div>
         </div>
 

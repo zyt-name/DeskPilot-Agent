@@ -254,6 +254,15 @@ class AutoAdapter:
     def verify(self, expect: str | dict[str, Any] | None) -> Verification:
         return self._ensure().verify(expect)
 
+    def capture_screenshot(self) -> str | None:
+        capture = getattr(self._ensure(), "capture_screenshot", None)
+        if not callable(capture):
+            return None
+        try:
+            return capture()
+        except Exception:
+            return None
+
     def close(self) -> None:
         if self._adapter is not None:
             try:

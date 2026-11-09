@@ -21,6 +21,8 @@ from .operation import (
     Sensitivity,
     detect_sensitivity,
     environment_profile,
+    needs_rollback_review,
+    needs_visual_review,
     normalize_operation,
 )
 
@@ -41,6 +43,7 @@ class GateDecision:
     audited: bool = False
     user_confirmed: bool = False
     reason: str = ""
+    rollback_review: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +51,7 @@ class GateDecision:
             "audited": self.audited,
             "user_confirmed": self.user_confirmed,
             "reason": self.reason,
+            "rollback_review": self.rollback_review,
             "operation": self.descriptor.to_dict(),
             "sensitivity": self.sensitivity.to_dict(),
             "verdict": self.verdict.to_dict(),
@@ -103,11 +107,21 @@ class AuditGate:
         action: Action,
         policy_decision: PolicyDecision,
         observation: Observation | None = None,
+        *,
+        screenshot_path: str | None = None,
+        screenshot_provider: Callable[[], str | None] | None = None,
     ) -> GateDecision:
         descriptor = self._normalize(action, observation)
         sensitivity = detect_sensitivity(
             descriptor, always_confirm=self.always_confirm
         )
+        rollback_review = needs_rollback_review(descriptor, sensitivity)
+        require_visual = needs_visual_review(descriptor, sensitivity)
+        if require_visual and not screenshot_path and screenshot_provider:
+            try:
+                screenshot_path = screenshot_provider()
+            except Exception:
+                screenshot_path = None
 
         if policy_decision.decision == "deny":
             verdict = AuditVerdict(
@@ -179,7 +193,9 @@ class AuditGate:
         if sensitivity.requires_user:
             needs_user = True
 
-        needs_ai = self.mode == "ai" and sensitivity.sensitive
+        needs_ai = (
+            self.mode == "ai" and sensitivity.sensitive
+        ) or rollback_review
         if not needs_ai and not needs_user:
             verdict = rule_verdict(descriptor, sensitivity)
             return self._finish(
@@ -189,6 +205,7 @@ class AuditGate:
                     sensitivity,
                     verdict,
                     audited=False,
+                    rollback_review=False,
                 ),
                 action,
                 policy_decision,
@@ -203,6 +220,8 @@ class AuditGate:
                 environment,
                 policy_decision,
                 sensitivity,
+                screenshot_path=screenshot_path,
+                require_visual=require_visual,
             )
         else:
             verdict = rule_verdict(descriptor, sensitivity)
@@ -250,6 +269,7 @@ class AuditGate:
                     verdict,
                     audited=True,
                     reason=verdict.impact or "被顶层审计阻止",
+                    rollback_review=rollback_review,
                 ),
                 action,
                 policy_decision,
@@ -269,13 +289,12 @@ class AuditGate:
         if needs_user:
             prompt = self._prompt(descriptor, verdict, sensitivity)
             approved = False
+            mandatory = bool(sensitivity.requires_user) or bool(
+                require_visual and verdict.source != "ai"
+            )
             if self.confirm is not None:
                 try:
-                    approved = bool(
-                        self.confirm(
-                            action, prompt, sensitivity.requires_user
-                        )
-                    )
+                    approved = bool(self.confirm(action, prompt, mandatory))
                 except Exception:
                     approved = False
             if not approved:
@@ -306,6 +325,7 @@ class AuditGate:
             audited=True,
             user_confirmed=user_confirmed,
             reason=reason,
+            rollback_review=rollback_review,
         )
         return self._finish(
             decision,
@@ -379,9 +399,25 @@ class AuditGate:
         environment: dict[str, Any],
         policy_decision: PolicyDecision,
         sensitivity: Sensitivity,
+        *,
+        screenshot_path: str | None = None,
+        require_visual: bool = False,
     ) -> AuditVerdict:
+        if require_visual:
+            if self.auditor is None:
+                return fallback_verdict(
+                    "该操作可能难以回退，但未配置可识图的顶层审计模型，已强制人工确认"
+                )
+            if not getattr(self.auditor, "vision", False):
+                return fallback_verdict(
+                    "该操作可能难以回退，但顶层审计模型不支持识图，已强制人工确认"
+                )
+            if not screenshot_path:
+                return fallback_verdict(
+                    "该操作可能难以回退，但无法获取屏幕截图，已强制人工确认"
+                )
         key = self._cache_key(descriptor, environment, policy_decision)
-        cached = self._cache.get(key)
+        cached = None if require_visual else self._cache.get(key)
         if cached is not None:
             timestamp, verdict = cached
             if (
@@ -396,9 +432,18 @@ class AuditGate:
             )
         else:
             verdict = self.auditor.audit(
-                descriptor, environment, policy_decision, sensitivity
+                descriptor,
+                environment,
+                policy_decision,
+                sensitivity,
+                screenshot_path=screenshot_path,
+                require_visual=require_visual,
             )
-        if verdict.source == "ai" and verdict.verdict in {"allow", "deny"}:
+        if (
+            not require_visual
+            and verdict.source == "ai"
+            and verdict.verdict in {"allow", "deny"}
+        ):
             self._cache[key] = (time.monotonic(), verdict)
             if len(self._cache) > 256:
                 oldest = sorted(
@@ -415,6 +460,10 @@ class AuditGate:
         sensitivity: Sensitivity,
     ) -> str:
         lines = [f"操作：{descriptor.summary()}"]
+        if verdict.visual:
+            lines.append("审查方式：顶部 AI 已对照屏幕截图审查（回退风险）")
+        elif verdict.source != "ai":
+            lines.append("审查方式：未能完成识图审查，请你确认")
         if verdict.purpose:
             lines.append(f"目的：{verdict.purpose}")
         if verdict.steps:

@@ -1,6 +1,14 @@
 [runtime]
-max_steps = 12
+# 长任务建议 30 步以上；每步失败上限与模型输出重试次数分开计算。
+max_steps = 30
 max_consecutive_failures = 2
+# 模型返回非法 JSON、超时或 429 时自动重试，避免一次异常就结束整个任务。
+max_provider_retries = 2
+provider_retry_delay = 1.2
+# 截图缓存目录；`xm_agent cleanup` 按 [audit].keep_days 清理其中的过期图片
+screenshot_dir = ".xm-agent/screenshots"
+# 需要接管桌面的任务运行期间最小化控制台，结束/暂停/等待确认时恢复窗口。
+release_desktop = true
 lock_path = ".xm-agent/agent.lock"
 lock_ttl_seconds = 60
 # auto = 由模型按任务自动挑后端：普通桌面任务优先 Windows-MCP；SSH、远程主机、
@@ -15,8 +23,8 @@ keep_days = 7
 # ai = 低风险自动执行，敏感操作交顶层审计模型；confirm_all = 所有写操作前询问。
 # 不提供关闭审计或完全访问的选项。
 mode = "ai"
-# 留空时使用当前活动的执行模型（独立性较弱，界面会标注）。
-# 界面里的「审计模型」选择保存在数据库中，会覆盖这里；选择「跟随执行模型」则继续按下面回退。
+# 留空时使用可识图的执行模型或活动模型；审计模型必须支持图像输入，界面会拒绝纯文本模型。
+# 界面里的「审计模型」选择保存在数据库中，会覆盖这里；选择「自动选择」则继续按下面回退。
 model_provider_id = ""
 model_id = ""
 timeout_seconds = 12
@@ -48,6 +56,7 @@ allowed_capabilities = [
   "file.transfer",
   "wait.for",
   "task.finish",
+  "task.await_user",
 ]
 allowed_command_prefixes = [
   "echo",

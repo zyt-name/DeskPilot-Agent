@@ -4,6 +4,7 @@ import time
 
 from ..config import AgentConfig
 from ..notify import SystemNotifier
+from .desktop import DesktopHandoff
 from .hotkey import GlobalHotkey
 from .overlay import ScreenIndicator
 from .server import STATIC_DIR, UiServer
@@ -19,12 +20,14 @@ def run_gui(
 ) -> int:
     indicator = ScreenIndicator()
     indicator.start()
+    desktop = DesktopHandoff()
     server = UiServer(
         config,
         db_path=db_path,
         port=port,
         indicator=indicator,
         notifier=SystemNotifier(),
+        desktop=desktop,
     )
     url = server.start()
     hotkey = GlobalHotkey(server.toggle_pause_active)
@@ -41,11 +44,19 @@ def run_gui(
                     time.sleep(0.5)
             except KeyboardInterrupt:
                 return 0
-        return open_window(url, debug=debug)
+        return open_window(
+            url, debug=debug, on_ready=lambda window: desktop.attach(window)
+        )
     finally:
         hotkey.stop()
         indicator.close()
         server.stop()
 
 
-__all__ = ["UiServer", "STATIC_DIR", "run_gui", "open_window"]
+__all__ = [
+    "UiServer",
+    "STATIC_DIR",
+    "DesktopHandoff",
+    "run_gui",
+    "open_window",
+]

@@ -7,7 +7,6 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from ..contracts import CAPABILITIES
 from ..types import Action, Observation, StepRecord
 from .common import (
     VERIFY_SYSTEM_PROMPT,
@@ -18,6 +17,7 @@ from .common import (
     normalize_usage,
     observation_text,
     parse_action_json,
+    parse_action_plan,
     parse_verdict_json,
     supports_temperature,
     system_prompt,
@@ -103,21 +103,14 @@ class OpenAICompatProvider:
                 ),
             },
         ]
-        content, _, _ = self._chat(messages, on_delta=on_delta)
-        parsed = self._parse_json(content)
-        capability = str(parsed.get("capability") or parsed.get("tool") or "")
-        if capability not in CAPABILITIES:
-            raise ProviderError(f"model chose unknown capability: {capability!r}")
-        args = parsed.get("args") or {}
-        if not isinstance(args, dict):
-            raise ProviderError("model args must be a JSON object")
-        expect = parsed.get("expect")
-        return Action(
-            capability=capability,
-            args=args,
-            rationale=str(parsed.get("rationale", "")),
-            expect=str(expect) if expect is not None else None,
+        content, _, _ = self._chat(
+            messages, max_tokens=8192, on_delta=on_delta
         )
+        parsed = self._parse_json(content)
+        try:
+            return parse_action_plan(parsed)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from exc
 
     def complete(
         self,
@@ -126,10 +119,22 @@ class OpenAICompatProvider:
         *,
         max_tokens: int = 800,
         on_delta: DeltaCallback | None = None,
+        image_path: str | None = None,
     ) -> str:
+        user_content: Any = user
+        image = image_data(image_path) if image_path else None
+        if image is not None:
+            mime, encoded = image
+            user_content = [
+                {"type": "text", "text": user},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                },
+            ]
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": user_content},
         ]
         text, _, _ = self._chat(
             messages, max_tokens=max_tokens, on_delta=on_delta
@@ -325,7 +330,8 @@ class OpenAICompatProvider:
         instructions: list[str] | None = None,
         task_context: str = "",
     ) -> str | list[dict[str, Any]]:
-        image = image_data(observation.screenshot_path) if self.vision else None
+        attach = self.vision and not observation.screenshot_cached
+        image = image_data(observation.screenshot_path) if attach else None
         text = observation_text(
             goal,
             observation,

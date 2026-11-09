@@ -15,6 +15,7 @@
     toolGroup: null,
     running: false,
     paused: false,
+    awaiting: null,
     nativeHotkey: false,
     defaultAuditMode: "ai",
     confirms: [],
@@ -24,6 +25,7 @@
     aiChoices: [],
     runModelChoice: "",
     auditChoice: "",
+    auditVisionAvailable: true,
   };
 
   const AUDIT_LABEL = {
@@ -237,7 +239,7 @@
       el(
         "p",
         "",
-        "描述目标，AI 会逐步操作并验证。敏感操作先由顶层审计 AI 判断；涉及其他项目或用户数据时，系统会请你审计目的、流程与影响。",
+        "描述目标，AI 会逐步操作并验证。敏感与回退风险操作先由顶层识图审计 AI 对照屏幕判断；涉及其他项目或用户数据时，系统会请你审计目的、流程与影响。",
       ),
     );
     box.appendChild(empty);
@@ -271,6 +273,15 @@
       el("span", `chip ${tone}`, label),
       el("span", "chip", RISK_LABEL[verdict.risk] || verdict.risk || "未评估"),
     );
+    if (payload.rollback_review) {
+      head.appendChild(
+        el(
+          "span",
+          verdict.visual ? "chip ok" : "chip warn",
+          verdict.visual ? "回退风险 · 已识图审查" : "回退风险 · 未识图",
+        ),
+      );
+    }
     if (verdict.source) {
       head.appendChild(
         el(
@@ -461,7 +472,22 @@
         STATUS_LABEL[status] || status,
       ),
     );
-    head.appendChild(el("span", "summary-title", "任务总结"));
+    head.appendChild(
+      el(
+        "span",
+        "summary-title",
+        payload.await_user ? "任务已暂停" : "任务总结",
+      ),
+    );
+    if (payload.await_user) {
+      head.appendChild(
+        el(
+          "span",
+          "chip warn",
+          payload.await_user.kind === "login" ? "等待你登录" : "等待你处理",
+        ),
+      );
+    }
     head.appendChild(
       el(
         "span",
@@ -575,6 +601,31 @@
       scrollChat();
       return;
     }
+    if (name === "observation_retry") {
+      const divider = el("div", "run-meta");
+      divider.textContent = `第 ${payload.step || "?"} 步观察失败，正在重新观察${
+        payload.error ? ` · ${String(payload.error).slice(0, 160)}` : ""
+      }`;
+      $("task-messages").appendChild(divider);
+      scrollChat();
+      return;
+    }
+    if (name === "provider_retry") {
+      const divider = el("div", "run-meta");
+      divider.textContent = `模型响应异常（第 ${payload.attempt || 1} 次）${
+        payload.retrying ? " · 正在重试" : " · 已停止重试"
+      }${payload.error ? ` · ${String(payload.error).slice(0, 160)}` : ""}`;
+      $("task-messages").appendChild(divider);
+      scrollChat();
+      return;
+    }
+    if (name === "provider_recovered") {
+      const divider = el("div", "run-meta");
+      divider.textContent = `模型已恢复（重试 ${payload.attempts || 0} 次后成功）`;
+      $("task-messages").appendChild(divider);
+      scrollChat();
+      return;
+    }
     if (name === "instructions") {
       const items = payload.items || [];
       if (!items.length) return;
@@ -582,6 +633,33 @@
       node.meta.appendChild(
         el("span", "chip warn", `已注入指令：${items.join("；")}`),
       );
+      return;
+    }
+    if (name === "plan") {
+      const actions = Array.isArray(payload.actions) ? payload.actions : [];
+      if (actions.length < 2) return;
+      const card = el("div", "plan-card");
+      card.appendChild(el("span", "plan-tag", "批量计划"));
+      card.appendChild(
+        el(
+          "span",
+          "plan-text",
+          actions
+            .map((item) => {
+              const action = item.args && item.args.action;
+              return action
+                ? `${item.capability}:${action}`
+                : item.capability;
+            })
+            .join(" → "),
+        ),
+      );
+      card.appendChild(
+        el("span", "plan-note", `${actions.length} 步 · 执行后统一验证`),
+      );
+      $("task-messages").appendChild(card);
+      showEmpty(false);
+      scrollChat(true);
       return;
     }
     if (name === "audit") {
@@ -654,6 +732,7 @@
       }
       appendResult(payload);
       setRunning(false);
+      setAwaiting(payload.await_user || null);
       refreshConversations();
       refreshQueue();
       return;
@@ -744,13 +823,17 @@
     const names = [
       "start",
       "observation",
+      "observation_retry",
       "thinking",
       "assistant",
       "model",
       "instructions",
       "context",
       "audit",
+      "plan",
       "step",
+      "provider_retry",
+      "provider_recovered",
       "result",
       "error",
       "lock_busy",
@@ -781,14 +864,60 @@
 
   function setRunning(running) {
     taskState.running = running;
+    if (running) setAwaiting(null);
     $("task-run-controls").classList.toggle("hidden", !running);
     $("task-pause").classList.toggle("hidden", taskState.paused);
     $("task-resume").classList.toggle("hidden", !taskState.paused);
     $("task-run-pill").textContent = taskState.paused ? "已暂停" : "运行中";
     $("task-composer-hint").textContent = running
       ? "运行中可按 F8 暂停；暂停后输入内容会作为新指令注入。"
-      : "敏感操作会先经过顶层审计。";
+      : idleHint();
     if (!running) setPaused(false);
+  }
+
+  function idleHint() {
+    return taskState.awaiting
+      ? "任务已暂停等待你处理；完成登录后输入“继续”，我会从当前屏幕接着做。"
+      : "敏感与回退风险操作会先经过顶层识图审计。";
+  }
+
+  function pendingAwait(messages) {
+    const list = messages || [];
+    const last = list[list.length - 1];
+    if (
+      last &&
+      last.role === "assistant" &&
+      last.payload &&
+      last.payload.await_user
+    ) {
+      return last.payload.await_user;
+    }
+    return null;
+  }
+
+  async function resumeAwaiting() {
+    if (!taskState.awaiting || taskState.running) return;
+    $("task-goal").value = "继续";
+    await submitGoal();
+  }
+
+  function setAwaiting(info) {
+    taskState.awaiting = info || null;
+    $("task-await-banner").classList.toggle("hidden", !info);
+    if (info) {
+      $("task-await-title").textContent =
+        info.kind === "login" ? "等待你登录" : "等待你处理";
+      $("task-await-text").textContent =
+        info.prompt || "当前任务需要你先处理，完成后输入“继续”。";
+      $("task-goal").placeholder =
+        "登录完成后输入“继续”，或点击上方“我已登录，继续”";
+    } else {
+      $("task-goal").placeholder =
+        "描述任务，例如：在记事本中输入 hello 并保存";
+    }
+    if (!taskState.running) {
+      $("task-composer-hint").textContent = idleHint();
+    }
   }
 
   function setPaused(paused) {
@@ -1335,16 +1464,31 @@
   function fillModelSelect(select, options) {
     select.replaceChildren();
     if (options.follow) {
-      const follow = el("option", "", "跟随执行模型");
+      const follow = el(
+        "option",
+        "",
+        options.visionOnly ? "自动选择（需可识图）" : "跟随执行模型",
+      );
       follow.value = "";
       select.appendChild(follow);
     }
-    const providers = (taskState.aiChoices || []).filter(
-      (provider) => (provider.models || []).length > 0,
-    );
+    const providers = (taskState.aiChoices || [])
+      .map((provider) => ({
+        ...provider,
+        models: (provider.models || []).filter(
+          (model) => !options.visionOnly || model.vision,
+        ),
+      }))
+      .filter((provider) => provider.models.length > 0);
     if (providers.length === 0) {
       if (!options.follow) {
-        const option = el("option", "", "未配置模型 · 使用内置策略");
+        const option = el(
+          "option",
+          "",
+          options.visionOnly
+            ? "未配置可识图模型 · 无法完成识图审查"
+            : "未配置模型 · 使用内置策略",
+        );
         option.value = "";
         select.appendChild(option);
       }
@@ -1388,6 +1532,7 @@
   function applyAuditModelSelect() {
     const chosen = fillModelSelect($("task-audit-model"), {
       follow: true,
+      visionOnly: true,
       selected: taskState.auditChoice,
     });
     taskState.auditChoice = chosen;
@@ -1401,6 +1546,7 @@
     taskState.runModelChoice = runChosen;
     const auditChosen = fillModelSelect($("task-audit-model"), {
       follow: true,
+      visionOnly: true,
       selected: taskState.auditChoice,
     });
     taskState.auditChoice = auditChosen;
@@ -1487,10 +1633,20 @@
       refreshContext();
       setRunning(Boolean(runningRun));
       setPaused(Boolean(runningRun && runningRun.paused));
+      setAwaiting(
+        runningRun ? null : pendingAwait(detail.messages || []),
+      );
       renderConversationList();
     } catch (err) {
       toast(`读取任务失败：${err.message}`, true);
     }
+  }
+
+  function conversationHint() {
+    if (!taskState.auditVisionAvailable) {
+      return "未配置可识图审计模型：回退风险操作将强制由你确认。";
+    }
+    return "敏感与回退风险操作由顶层识图审计 AI 判断，必要时对照屏幕截图复核；涉及用户数据时请你确认。";
   }
 
   function newConversation() {
@@ -1503,13 +1659,13 @@
     taskState.replayAfter = 0;
     taskState.paused = false;
     setRunning(false);
+    setAwaiting(null);
     $("task-conversation-title").textContent = "新任务";
     $("task-title-edit").disabled = true;
     $("task-context-open").disabled = true;
     taskState.context = null;
     renderContext(null);
-    $("task-conversation-sub").textContent =
-      "敏感操作由顶层审计 AI 判断，涉及用户数据时请你确认。";
+    $("task-conversation-sub").textContent = conversationHint();
     $("task-audit-mode").value = taskState.defaultAuditMode;
     fillAdapterSelect(
       $("task-adapter"),
@@ -1522,8 +1678,17 @@
     $("task-goal").focus();
   }
 
+  function isResumeText(text) {
+    const compact = String(text || "").replace(/\s+/g, "");
+    return (
+      compact.length > 0 &&
+      compact.length <= 24 &&
+      /(继续|已登录|已经登录|登录好了|登录完成|可以继续)/.test(compact)
+    );
+  }
+
   async function submitGoal(event) {
-    event.preventDefault();
+    if (event) event.preventDefault();
     const goal = $("task-goal").value.trim();
     if (!goal) {
       toast("请输入任务目标", true);
@@ -1532,6 +1697,7 @@
     const adapter = $("task-adapter").value;
     const auditMode = $("task-audit-mode").value;
     const model = parseModelToken($("task-model").value);
+    const resume = Boolean(taskState.awaiting && isResumeText(goal));
     if (taskState.paused && taskState.activeRunId) {
       try {
         await api(`/api/runs/${taskState.activeRunId}/instruct`, {
@@ -1577,9 +1743,11 @@
           audit_mode: auditMode,
           model_provider_id: model.providerId,
           model_id: model.modelId,
+          resume,
         }),
       });
       if (data.queued) {
+        setAwaiting(null);
         toast("当前任务正在运行，已加入队列");
         await refreshQueue();
         await refreshConversations();
@@ -1684,6 +1852,9 @@
       running: queue.running || [],
     };
     taskState.defaultAuditMode = (data.audit && data.audit.mode) || "ai";
+    taskState.auditVisionAvailable = !(
+      data.audit && data.audit.vision_available === false
+    );
     taskState.nativeHotkey = Boolean(data.hotkey && data.hotkey.enabled);
     taskState.aiChoices = data.ai_choices || [];
     taskState.auditChoice = data.audit && !data.audit.follow_executor
@@ -1697,6 +1868,9 @@
     $("task-audit-mode").value = taskState.defaultAuditMode;
     applyRunModelDefault();
     applyAuditModelSelect();
+    if (!taskState.conversationId) {
+      $("task-conversation-sub").textContent = conversationHint();
+    }
     $("task-auto-confirm").checked = Boolean(data.profile.auto_confirm);
     renderConversationList();
     renderQueue();
@@ -1715,6 +1889,7 @@
     restoreQueueWidth();
     bindQueueResize();
     $("task-form").addEventListener("submit", submitGoal);
+    $("task-await-resume").addEventListener("click", resumeAwaiting);
     $("task-new-conversation").addEventListener("click", newConversation);
     $("task-title-edit").addEventListener("click", startTitleEdit);
     $("task-context-open").addEventListener("click", () => {

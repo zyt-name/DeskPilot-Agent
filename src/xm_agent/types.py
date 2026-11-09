@@ -35,6 +35,8 @@ class Observation:
     elements: list[Element] = field(default_factory=list)
     active_window: str | None = None
     screenshot_path: str | None = None
+    screen_card: str = ""
+    screenshot_cached: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, max_elements: int = 40) -> dict[str, Any]:
@@ -44,6 +46,8 @@ class Observation:
             "summary": self.summary,
             "active_window": self.active_window,
             "screenshot_path": self.screenshot_path,
+            "screen_card": self.screen_card,
+            "screenshot_cached": self.screenshot_cached,
             "elements": [element.to_dict() for element in self.elements[:max_elements]],
         }
 
@@ -54,6 +58,8 @@ class Action:
     args: dict[str, Any] = field(default_factory=dict)
     rationale: str = ""
     expect: str | None = None
+    steps: tuple["Action", ...] = ()
+    screen_card: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +67,8 @@ class Action:
             "args": self.args,
             "rationale": self.rationale,
             "expect": self.expect,
+            "steps": [step.to_dict() for step in self.steps],
+            "screen_card": self.screen_card,
         }
 
 
@@ -136,12 +144,16 @@ class TaskResult:
     steps: list[StepRecord] = field(default_factory=list)
     reason: str = ""
     summary: str = ""
+    await_user: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "trace_id": self.trace_id,
             "status": self.status,
             "reason": self.reason,
             "summary": self.summary,
             "steps": [step.to_dict() for step in self.steps],
         }
+        if self.await_user:
+            data["await_user"] = self.await_user
+        return data

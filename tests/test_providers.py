@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 
 from xm_agent.adapters.mock import MockAdapter
-from xm_agent.providers.common import parse_verdict_json
+from xm_agent.providers.common import parse_action_plan, parse_verdict_json
 from xm_agent.providers.fake import HeuristicMockProvider
-from xm_agent.providers.openai_compat import OpenAICompatProvider
+from xm_agent.providers.openai_compat import OpenAICompatProvider, ProviderError
 from xm_agent.types import Observation
 
 
@@ -16,6 +16,29 @@ class ProviderTests(unittest.TestCase):
             '```json\n{"capability": "task.finish", "args": {}}\n```'
         )
         self.assertEqual(parsed["capability"], "task.finish")
+
+    def test_parse_json_embedded_in_prose(self):
+        parsed = OpenAICompatProvider._parse_json(
+            "当前屏幕显示登录页，先清空密码框。\n"
+            '{"capability": "desktop.act", "args": '
+            '{"action": "key", "keys": ["ctrl+a"]}}\n'
+            "执行完后再观察。"
+        )
+        self.assertEqual(parsed["capability"], "desktop.act")
+        self.assertEqual(parsed["args"]["keys"], ["ctrl+a"])
+
+    def test_parse_json_ignores_braces_in_strings(self):
+        parsed = OpenAICompatProvider._parse_json(
+            '说明：使用 {占位符} 表示。\n'
+            '{"capability":"desktop.act","args":{"text":"a}b{c"}}'
+        )
+        self.assertEqual(parsed["args"]["text"], "a}b{c")
+
+    def test_parse_json_rejects_unbalanced_output(self):
+        with self.assertRaises(ProviderError):
+            OpenAICompatProvider._parse_json(
+                '{"capability": "desktop.act", "args": {'
+            )
 
     def test_heuristic_provider_types_requested_text(self):
         provider = HeuristicMockProvider()
@@ -120,6 +143,35 @@ class ProviderTests(unittest.TestCase):
         assert action.capability == "task.finish"
         payload = json.loads(captured["messages"][1]["content"])
         assert "下载目录" in payload["task_context"]
+
+    def test_parse_action_plan_batches_known_steps(self):
+        action = parse_action_plan(
+            {
+                "capability": "desktop.act",
+                "args": {"action": "type", "text": "hello"},
+                "expect": "hello",
+                "screen_card": "记事本已打开",
+                "steps": [
+                    {
+                        "capability": "desktop.act",
+                        "args": {"action": "click", "element_id": "e2"},
+                    },
+                    {"capability": "task.finish", "args": {"summary": "ok"}},
+                    {"capability": "made.up", "args": {}},
+                ],
+            }
+        )
+
+        self.assertEqual(action.capability, "desktop.act")
+        self.assertEqual(action.screen_card, "记事本已打开")
+        self.assertEqual(
+            [step.capability for step in action.steps],
+            ["desktop.act", "task.finish"],
+        )
+
+    def test_parse_action_plan_rejects_unknown_first_action(self):
+        with self.assertRaises(ValueError):
+            parse_action_plan({"capability": "made.up", "args": {}})
 
     def test_parse_verdict_json_is_conservative(self):
         self.assertEqual(

@@ -66,6 +66,14 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
                     "type": "boolean",
                     "description": "Press Enter after typing (UIA backends).",
                 },
+                "label": {
+                    "type": "string",
+                    "description": "Visible name of the control, used when the backend has no element ids.",
+                },
+                "rollback_risk": {
+                    "type": "boolean",
+                    "description": "Set true when a mistake would be hard to undo; the top-level vision auditor reviews it.",
+                },
             },
             "required": ["action"],
         },
@@ -177,6 +185,28 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
                 "success": {"type": "boolean"},
             },
             "required": ["summary"],
+        },
+        output_schema={"type": "object", "properties": {}},
+    ),
+    "task.await_user": CapabilitySpec(
+        name="task.await_user",
+        version="1.0",
+        description=(
+            "Stop and hand control to the user when the task needs a human "
+            "step that the agent cannot perform, such as logging in without "
+            "provided credentials. Do not call it when you can continue."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["login", "input"],
+                },
+                "prompt": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["prompt"],
         },
         output_schema={"type": "object", "properties": {}},
     ),

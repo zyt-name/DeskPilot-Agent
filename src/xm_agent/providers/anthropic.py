@@ -6,7 +6,6 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from ..contracts import CAPABILITIES
 from ..types import Action, Observation, StepRecord
 from .common import (
     VERIFY_SYSTEM_PROMPT,
@@ -16,6 +15,7 @@ from .common import (
     normalize_usage,
     observation_text,
     parse_action_json,
+    parse_action_plan,
     parse_verdict_json,
     system_prompt,
     usage_with_latency,
@@ -63,7 +63,8 @@ class AnthropicProvider:
         context: str = "",
     ) -> Action:
         content: list[dict[str, Any]] = []
-        image = image_data(observation.screenshot_path) if self.vision else None
+        attach = self.vision and not observation.screenshot_cached
+        image = image_data(observation.screenshot_path) if attach else None
         if image is not None:
             mime, encoded = image
             content.append(
@@ -97,20 +98,10 @@ class AnthropicProvider:
             parsed = parse_action_json(text)
         except ValueError as exc:
             raise AnthropicError(str(exc)) from exc
-
-        capability = str(parsed.get("capability") or parsed.get("tool") or "")
-        if capability not in CAPABILITIES:
-            raise AnthropicError(f"model chose unknown capability: {capability!r}")
-        args = parsed.get("args") or {}
-        if not isinstance(args, dict):
-            raise AnthropicError("model args must be a JSON object")
-        expect = parsed.get("expect")
-        return Action(
-            capability=capability,
-            args=args,
-            rationale=str(parsed.get("rationale", "")),
-            expect=str(expect) if expect is not None else None,
-        )
+        try:
+            return parse_action_plan(parsed)
+        except ValueError as exc:
+            raise AnthropicError(str(exc)) from exc
 
     def complete(
         self,
@@ -119,9 +110,25 @@ class AnthropicProvider:
         *,
         max_tokens: int = 800,
         on_delta: DeltaCallback | None = None,
+        image_path: str | None = None,
     ) -> str:
+        content: list[dict[str, Any]] = []
+        image = image_data(image_path) if image_path else None
+        if image is not None:
+            mime, encoded = image
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": encoded,
+                    },
+                }
+            )
+        content.append({"type": "text", "text": user})
         text, _, _ = self._chat(
-            [{"type": "text", "text": user}],
+            content,
             max_tokens=max_tokens,
             system=system,
             on_delta=on_delta,

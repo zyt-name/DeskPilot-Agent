@@ -11,7 +11,8 @@ class ConfigTests(unittest.TestCase):
     def test_defaults(self):
         config = load_config()
         self.assertEqual(config.default_adapter, "mock")
-        self.assertEqual(config.runtime.max_steps, 12)
+        self.assertEqual(config.runtime.max_steps, 30)
+        self.assertEqual(config.runtime.max_provider_retries, 2)
         self.assertIn("mock", config.adapters)
 
     def test_example_config(self):

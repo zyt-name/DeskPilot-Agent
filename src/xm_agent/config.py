@@ -10,10 +10,14 @@ from .contracts import CAPABILITIES
 
 @dataclass
 class RuntimeConfig:
-    max_steps: int = 12
+    max_steps: int = 30
     max_consecutive_failures: int = 2
+    max_provider_retries: int = 2
+    provider_retry_delay: float = 1.2
     lock_path: str = ".xm-agent/agent.lock"
     lock_ttl_seconds: int = 60
+    screenshot_dir: str = ".xm-agent/screenshots"
+    release_desktop: bool = True
 
 
 @dataclass
@@ -126,9 +130,31 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
                 defaults.runtime.max_consecutive_failures,
             )
         ),
+        max_provider_retries=int(
+            runtime_raw.get(
+                "max_provider_retries",
+                defaults.runtime.max_provider_retries,
+            )
+        ),
+        provider_retry_delay=float(
+            runtime_raw.get(
+                "provider_retry_delay",
+                defaults.runtime.provider_retry_delay,
+            )
+        ),
         lock_path=str(runtime_raw.get("lock_path", defaults.runtime.lock_path)),
         lock_ttl_seconds=int(
             runtime_raw.get("lock_ttl_seconds", defaults.runtime.lock_ttl_seconds)
+        ),
+        screenshot_dir=str(
+            runtime_raw.get(
+                "screenshot_dir", defaults.runtime.screenshot_dir
+            )
+        ),
+        release_desktop=bool(
+            runtime_raw.get(
+                "release_desktop", defaults.runtime.release_desktop
+            )
         ),
     )
     audit = AuditConfig(

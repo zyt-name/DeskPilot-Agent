@@ -568,13 +568,19 @@ def test_failed_business_response_does_not_record_usage(tmp_path):
 def test_usage_summary_ignores_zero_token_rows(tmp_path):
     storage = Storage(tmp_path / "app.db")
     storage.record_ai_usage("p1", "Provider", "model-a", 0, 0, 0)
-    storage.record_ai_usage("p1", "Provider", "model-a", 10, 5, 15)
+    storage.record_ai_usage("p1", "Provider", "model-a", 10, 5, 15, source="run")
+    storage.record_ai_usage("p1", "Provider", "model-a", 4, 2, 6, source="audit")
     summary = storage.ai_usage_summary()
-    assert summary["totals"]["calls"] == 1
-    assert summary["totals"]["total_tokens"] == 15
+    assert summary["totals"]["calls"] == 2
+    assert summary["totals"]["total_tokens"] == 21
     assert len(summary["by_model"]) == 1
     assert len(summary["by_provider"]) == 1
-    assert len(summary["recent"]) == 1
+    assert len(summary["recent"]) == 2
+    by_source = {row["source"]: row for row in summary["by_source"]}
+    assert by_source["run"]["total_tokens"] == 15
+    assert by_source["audit"]["total_tokens"] == 6
+    assert by_source["audit"]["calls"] == 1
+    assert by_source["audit"]["prompt_tokens"] == 4
 
 
 def test_empty_refresh_keeps_existing_models(tmp_path):

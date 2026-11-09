@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS task_queue (
     audit_mode TEXT NOT NULL DEFAULT 'ai',
     model_provider_id TEXT NOT NULL DEFAULT '',
     model_id TEXT NOT NULL DEFAULT '',
+    user_message TEXT NOT NULL DEFAULT '',
+    context_note TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'queued',
     position INTEGER NOT NULL DEFAULT 0,
     run_id TEXT,
@@ -251,6 +253,16 @@ class Storage:
         if queue_columns and "model_id" not in queue_columns:
             conn.execute(
                 "ALTER TABLE task_queue ADD COLUMN model_id "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if queue_columns and "user_message" not in queue_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN user_message "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if queue_columns and "context_note" not in queue_columns:
+            conn.execute(
+                "ALTER TABLE task_queue ADD COLUMN context_note "
                 "TEXT NOT NULL DEFAULT ''"
             )
         audit_columns = {
@@ -744,6 +756,8 @@ class Storage:
         audit_mode: str = "ai",
         model_provider_id: str = "",
         model_id: str = "",
+        user_message: str = "",
+        context_note: str = "",
     ) -> dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
         with self._connect() as conn:
@@ -755,9 +769,9 @@ class Storage:
                 """
                 INSERT INTO task_queue
                     (id, conversation_id, goal, adapter, audit_mode,
-                     model_provider_id, model_id, status, position,
-                     created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                     model_provider_id, model_id, user_message,
+                     context_note, status, position, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (
                     task_id,
@@ -767,6 +781,8 @@ class Storage:
                     "confirm_all" if audit_mode == "confirm_all" else "ai",
                     model_provider_id[:64],
                     model_id[:128],
+                    user_message[:500],
+                    context_note[:2000],
                     int(position),
                     _now(),
                 ),
@@ -1452,6 +1468,19 @@ class Storage:
                  ORDER BY total_tokens DESC
                 """
             ).fetchall()
+            by_source = conn.execute(
+                """
+                SELECT source,
+                       COUNT(*) AS calls,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                  FROM ai_usage
+                 WHERE total_tokens > 0
+                 GROUP BY source
+                 ORDER BY total_tokens DESC
+                """
+            ).fetchall()
             recent = conn.execute(
                 """
                 SELECT ts, provider_name, model, prompt_tokens, completion_tokens,
@@ -1467,6 +1496,7 @@ class Storage:
             "today": dict(today_totals),
             "by_model": [dict(row) for row in by_model],
             "by_provider": [dict(row) for row in by_provider],
+            "by_source": [dict(row) for row in by_source],
             "recent": [dict(row) for row in recent],
         }
 

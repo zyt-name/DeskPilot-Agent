@@ -259,6 +259,7 @@ function applyBootstrap(data) {
   state.token = data.token;
   state.config = data.config;
   state.profile = data.profile;
+  if (data.ai) state.ai = data.ai;
 
   const active = data.ai && data.ai.active;
   const modelLabel = active
@@ -327,6 +328,17 @@ function eventView(event) {
     meta = `${payload.adapter || ""} · ${payload.reason || ""}${
       chain ? ` · 链路 ${chain}` : ""
     }`;
+  } else if (event.event === "observation_retry") {
+    title = `第 ${payload.step || "?"} 步观察失败 · 重新观察`;
+    meta = payload.error ? String(payload.error).slice(0, 200) : "";
+  } else if (event.event === "provider_retry") {
+    title = `模型响应异常 · 第 ${payload.attempt || 1} 次`;
+    meta = `${payload.retrying ? "正在重试" : "已停止重试"}${
+      payload.error ? ` · ${String(payload.error).slice(0, 200)}` : ""
+    }`;
+  } else if (event.event === "provider_recovered") {
+    title = "模型已恢复";
+    meta = `重试 ${payload.attempts || 0} 次后成功`;
   } else if (event.event === "step") {
     const receipt = payload.receipt_ok ? "回执通过" : "回执失败";
     const verify = payload.verify_ok
@@ -1191,6 +1203,13 @@ function renderUsage(usage) {
   $("usage-completion").textContent = formatNumber(totals.completion_tokens);
   $("usage-today").textContent = formatNumber(today.total_tokens);
   $("usage-today-note").textContent = `今日 ${formatNumber(today.calls)} 次调用`;
+  const auditRow =
+    (usage.by_source || []).find((item) => item.source === "audit") || {};
+  const auditTotal = Number(auditRow.total_tokens || 0);
+  $("usage-audit").textContent = formatNumber(auditTotal);
+  $("usage-audit-note").textContent = auditTotal
+    ? `占总量 ${Math.round((auditTotal / Math.max(1, total)) * 100)}% · ${formatNumber(auditRow.calls)} 次审计调用`
+    : "暂无审计调用";
   const byModel = (usage.by_model || []).filter(
     (item) => Number(item.total_tokens) > 0,
   );

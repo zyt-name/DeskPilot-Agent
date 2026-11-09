@@ -465,3 +465,169 @@ def test_rule_verdict_reports_scope(tmp_path):
     verdict = rule_verdict(descriptor, detect_sensitivity(descriptor))
     assert verdict.verdict == "ask_user"
     assert verdict.scope["paths"]
+
+
+class VisionAuditProvider(StubAuditProvider):
+    vision = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.images: list[str | None] = []
+
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 800,
+        image_path: str | None = None,
+    ) -> str:
+        self.images.append(image_path)
+        return super().complete(system, user, max_tokens=max_tokens)
+
+
+def _vision_gate(tmp_path, *, verdict: str = "ask_user", confirm: bool = True):
+    provider = VisionAuditProvider(verdict=verdict)
+    calls: list[tuple[str, bool]] = []
+
+    def confirm_callback(
+        action: Action, prompt: str, mandatory: bool = False
+    ) -> bool:
+        calls.append((prompt, mandatory))
+        return confirm
+
+    gate = AuditGate(
+        auditor=TopLevelAuditor(provider, model="vision-audit"),
+        confirm=confirm_callback,
+        workspace_roots=[str(tmp_path)],
+        project_root=str(tmp_path),
+    )
+    return gate, provider, calls
+
+
+def test_commit_click_is_reviewed_with_vision_and_screenshot(tmp_path):
+    shot = tmp_path / "shot.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    gate, provider, calls = _vision_gate(tmp_path)
+    observation = Observation(
+        step=1,
+        elements=[Element("e1", "Button", "Publish")],
+        screenshot_path=str(shot),
+    )
+
+    decision = gate.review(
+        Action("desktop.act", {"action": "click", "element_id": "e1"}),
+        PolicyDecision("allow", "allowed"),
+        observation,
+        screenshot_path=str(shot),
+    )
+
+    assert decision.allowed is True
+    assert decision.rollback_review is True
+    assert decision.verdict.visual is True
+    assert provider.images == [str(shot)]
+    assert calls and calls[0][1] is False
+    assert "顶部 AI 已对照屏幕截图审查" in calls[0][0]
+
+
+def test_commit_click_without_vision_model_forces_mandatory_user(tmp_path):
+    prompts: list[tuple[str, bool]] = []
+
+    def confirm_callback(
+        action: Action, prompt: str, mandatory: bool = False
+    ) -> bool:
+        prompts.append((prompt, mandatory))
+        return True
+
+    gate = AuditGate(
+        auditor=TopLevelAuditor(StubAuditProvider(verdict="allow")),
+        confirm=confirm_callback,
+        workspace_roots=[str(tmp_path)],
+        project_root=str(tmp_path),
+    )
+    observation = Observation(
+        step=1, elements=[Element("e1", "Button", "Delete")]
+    )
+
+    decision = gate.review(
+        Action("desktop.act", {"action": "click", "element_id": "e1"}),
+        PolicyDecision("allow", "allowed"),
+        observation,
+    )
+
+    assert decision.allowed is True
+    assert decision.user_confirmed is True
+    assert decision.rollback_review is True
+    assert prompt_mandatory(prompts)
+    assert "未能完成识图审查" in prompts[0][0]
+
+
+def prompt_mandatory(prompts: list[tuple[str, bool]]) -> bool:
+    return bool(prompts) and prompts[0][1] is True
+
+
+def test_vision_auditor_without_screenshot_does_not_guess(tmp_path):
+    gate, provider, calls = _vision_gate(tmp_path)
+    observation = Observation(
+        step=1, elements=[Element("e1", "Button", "Submit")]
+    )
+
+    decision = gate.review(
+        Action("desktop.act", {"action": "click", "element_id": "e1"}),
+        PolicyDecision("allow", "allowed"),
+        observation,
+        screenshot_path=None,
+    )
+
+    assert decision.allowed is True
+    assert decision.user_confirmed is True
+    assert provider.images == []
+    assert prompt_mandatory(calls)
+    assert "无法获取屏幕截图" in calls[0][0]
+
+
+def test_desktop_commit_and_destructive_actions_need_visual_review(tmp_path):
+    from xm_agent.guard.operation import (
+        needs_rollback_review,
+        needs_visual_review,
+    )
+
+    for label in ("Publish", "发送", "Delete project"):
+        descriptor = normalize_operation(
+            Action("desktop.act", {"action": "click", "label": label}),
+            workspace_roots=[str(tmp_path)],
+            project_root=str(tmp_path),
+        )
+        sensitivity = detect_sensitivity(descriptor)
+        assert needs_rollback_review(descriptor, sensitivity)
+        assert needs_visual_review(descriptor, sensitivity)
+
+
+def test_terminal_delete_needs_review_but_no_screenshot(tmp_path):
+    from xm_agent.guard.operation import (
+        needs_rollback_review,
+        needs_visual_review,
+    )
+
+    descriptor = normalize_operation(
+        Action("terminal.exec", {"command": "rm -r build"}),
+        workspace_roots=[str(tmp_path)],
+        project_root=str(tmp_path),
+    )
+    assert needs_rollback_review(descriptor)
+    assert not needs_visual_review(descriptor)
+
+
+def test_explicit_rollback_risk_flag_is_honored(tmp_path):
+    from xm_agent.guard.operation import needs_rollback_review
+
+    descriptor = normalize_operation(
+        Action(
+            "desktop.act",
+            {"action": "click", "label": "OK", "rollback_risk": True},
+        ),
+        workspace_roots=[str(tmp_path)],
+        project_root=str(tmp_path),
+    )
+    assert "ui_commit" in descriptor.effects
+    assert needs_rollback_review(descriptor)

@@ -40,6 +40,8 @@ class Policy:
 
     def check(self, action: Action) -> PolicyDecision:
         capability = action.capability
+        if capability == "task.await_user":
+            return PolicyDecision("allow", "control handoff")
         if capability not in self.allowed_capabilities:
             return PolicyDecision("deny", f"capability not allowed: {capability}")
 

@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,6 +17,7 @@ from xm_agent.providers.fake import ScriptedProvider
 from xm_agent.runtime import AgentRuntime
 from xm_agent.types import (
     Action,
+    Element,
     Observation,
     PolicyDecision,
     Receipt,
@@ -28,7 +30,14 @@ class FixedAuditor:
     def __init__(self, verdict: str) -> None:
         self.verdict = verdict
 
-    def audit(self, descriptor, environment, policy, sensitivity):
+    def audit(
+        self,
+        descriptor,
+        environment,
+        policy,
+        sensitivity,
+        **kwargs,
+    ):
         return AuditVerdict(
             verdict=self.verdict,
             risk="high" if self.verdict != "allow" else "low",
@@ -86,6 +95,53 @@ class ContextProvider(RecordingProvider):
             instructions=instructions,
             on_delta=on_delta,
         )
+
+
+class FlakyProvider:
+    name = "flaky"
+
+    def __init__(
+        self,
+        failures: int,
+        action: Action,
+        message: str = "model did not return valid JSON: 当前屏幕显示登录页",
+    ) -> None:
+        self.failures = failures
+        self.action = action
+        self.message = message
+        self.calls = 0
+        self.last_instructions: list[str] | None = None
+
+    def decide(
+        self,
+        goal,
+        observation: Observation,
+        history: list[StepRecord],
+        remaining_steps: int,
+        *,
+        instructions=None,
+        on_delta=None,
+    ) -> Action:
+        self.calls += 1
+        self.last_instructions = (
+            list(instructions) if instructions is not None else None
+        )
+        if self.calls <= self.failures:
+            raise ValueError(self.message)
+        return self.action
+
+
+class FlakyAdapter(MockAdapter):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.observe_calls = 0
+
+    def observe(self, step, include_screenshot=False):
+        self.observe_calls += 1
+        if self.observe_calls <= self.failures:
+            raise RuntimeError("windows-mcp snapshot timed out")
+        return super().observe(step, include_screenshot)
 
 
 class AgentRuntimeTests(unittest.TestCase):
@@ -451,6 +507,103 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(assistant)
         self.assertIn("desktop.act", assistant[0]["text"])
 
+    def _retry_runtime(self, provider, retries=2, on_event=None):
+        return AgentRuntime(
+            adapter=self.adapter,
+            provider=provider,
+            policy=self.policy,
+            audit=self.audit,
+            lock=self.lock,
+            max_steps=6,
+            max_consecutive_failures=2,
+            max_provider_retries=retries,
+            provider_retry_delay=0,
+            confirm=lambda action, reason, mandatory=False: True,
+            on_event=on_event,
+        )
+
+    def test_provider_error_is_retried_with_json_instruction(self):
+        events = []
+        provider = FlakyProvider(
+            1, Action("task.finish", {"summary": "done"})
+        )
+        result = self._retry_runtime(
+            provider,
+            on_event=lambda event, payload: events.append((event, payload)),
+        ).run("task")
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(provider.calls, 2)
+        retries = [payload for name, payload in events if name == "provider_retry"]
+        self.assertEqual(retries[0]["attempt"], 1)
+        self.assertTrue(retries[0]["retrying"])
+        self.assertTrue(
+            any(name == "provider_recovered" for name, _ in events)
+        )
+        self.assertTrue(
+            any(
+                "只输出一个合法 JSON 对象" in note
+                for note in (provider.last_instructions or [])
+            )
+        )
+
+    def test_provider_error_stops_after_retry_budget(self):
+        provider = FlakyProvider(
+            10, Action("task.finish", {"summary": "done"})
+        )
+        result = self._retry_runtime(provider, retries=1).run("task")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(provider.calls, 2)
+        self.assertIn("模型连续 2 次未能给出可执行结果", result.reason)
+
+    def test_fatal_provider_error_is_not_retried(self):
+        provider = FlakyProvider(
+            10,
+            Action("task.finish", {"summary": "done"}),
+            message="401 invalid api key",
+        )
+        result = self._retry_runtime(provider).run("task")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(provider.calls, 1)
+        self.assertIn("401", result.reason)
+
+    def _observation_runtime(self, adapter, on_event=None):
+        return AgentRuntime(
+            adapter=adapter,
+            provider=ScriptedProvider(
+                [Action("task.finish", {"summary": "done"})]
+            ),
+            policy=self.policy,
+            audit=self.audit,
+            lock=self.lock,
+            max_steps=6,
+            on_event=on_event,
+        )
+
+    def test_observation_failure_is_retried(self):
+        events = []
+        adapter = FlakyAdapter(failures=1)
+        result = self._observation_runtime(
+            adapter,
+            on_event=lambda event, payload: events.append((event, payload)),
+        ).run("task")
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(adapter.observe_calls, 2)
+        self.assertTrue(
+            any(name == "observation_retry" for name, _ in events)
+        )
+
+    def test_observation_failure_twice_ends_task(self):
+        adapter = FlakyAdapter(failures=10)
+        result = self._observation_runtime(adapter).run("task")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(adapter.observe_calls, 2)
+        self.assertIn("observation failed", result.reason)
+
 
 class VisionAdapter:
     name = "vision"
@@ -604,6 +757,288 @@ class VisionCompletionTests(unittest.TestCase):
         ]
         self.assertTrue(blocked)
         self.assertFalse(blocked[0]["verify_ok"])
+
+
+class CountingProvider:
+    name = "counting"
+
+    def __init__(self, actions: list[Action]) -> None:
+        self.actions = list(actions)
+        self.calls = 0
+        self.observed: list[Observation] = []
+
+    def decide(
+        self,
+        goal,
+        observation: Observation,
+        history: list[StepRecord],
+        remaining_steps: int,
+        *,
+        instructions=None,
+        on_delta=None,
+        context="",
+    ) -> Action:
+        self.calls += 1
+        self.observed.append(observation)
+        if not self.actions:
+            return Action("task.finish", {"summary": "done"})
+        return self.actions.pop(0)
+
+
+class CountingAdapter(MockAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observe_calls = 0
+
+    def observe(self, step, include_screenshot=False):
+        self.observe_calls += 1
+        return super().observe(step, include_screenshot)
+
+
+class CachedScreenAdapter(CountingAdapter):
+    def observe(self, step, include_screenshot=False):
+        observation = super().observe(step, include_screenshot)
+        observation.screenshot_path = "mock://screenshot.png"
+        observation.raw["screenshot_hash"] = "stable-hash"
+        return observation
+
+
+class LoginWallAdapter(CountingAdapter):
+    def observe(self, step, include_screenshot=False):
+        observation = super().observe(step, include_screenshot)
+        observation.active_window = "登录 - 测试系统"
+        observation.elements = [
+            Element("e1", "Edit", "账号", True, (10, 10, 120, 24)),
+            Element("e2", "Edit", "密码", True, (10, 40, 120, 24)),
+            Element("e3", "Button", "登录", True, (10, 70, 80, 24)),
+        ]
+        return observation
+
+
+class BatchedPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.audit = AuditLog(self.root / "audit")
+        self.lock = LeaseLock(self.root / "agent.lock", ttl_seconds=10)
+        self.policy = Policy(
+            allowed_capabilities=list(CAPABILITIES),
+            allowed_paths=[str(self.root)],
+        )
+
+    def _run(
+        self,
+        adapter,
+        provider,
+        on_event=None,
+        max_steps=6,
+        goal="type hello and save",
+        context="",
+    ):
+        runtime = AgentRuntime(
+            adapter=adapter,
+            provider=provider,
+            policy=self.policy,
+            audit=self.audit,
+            lock=self.lock,
+            max_steps=max_steps,
+            max_consecutive_failures=2,
+            confirm=lambda action, reason, mandatory=False: True,
+            on_event=on_event,
+        )
+        return runtime.run(goal, context=context)
+
+    def test_plan_observes_and_decides_once_then_batches(self):
+        adapter = CountingAdapter()
+        provider = CountingProvider(
+            [
+                Action(
+                    "desktop.act",
+                    {"action": "type", "text": "hello"},
+                    steps=(
+                        Action(
+                            "desktop.act",
+                            {"action": "click", "element_id": "e2"},
+                        ),
+                        Action("task.finish", {"summary": "done"}),
+                    ),
+                )
+            ]
+        )
+        events = []
+        result = self._run(
+            adapter,
+            provider,
+            on_event=lambda event, payload: events.append((event, payload)),
+        )
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(adapter.observe_calls, 2)
+        self.assertEqual(adapter.text, "hello")
+        self.assertTrue(adapter.saved)
+        self.assertEqual(len(result.steps), 3)
+        self.assertTrue(result.steps[0].verification.deferred)
+        self.assertTrue(result.steps[1].verification.deferred)
+        self.assertEqual(
+            result.steps[2].action.capability, "task.finish"
+        )
+        plans = [payload for event, payload in events if event == "plan"]
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(len(plans[0]["actions"]), 3)
+
+    def test_failed_batch_step_drops_remaining_actions(self):
+        adapter = CountingAdapter()
+        provider = CountingProvider(
+            [
+                Action(
+                    "desktop.act",
+                    {"action": "frobnicate"},
+                    steps=(
+                        Action(
+                            "desktop.act",
+                            {"action": "click", "element_id": "e2"},
+                        ),
+                    ),
+                )
+            ]
+        )
+        result = self._run(adapter, provider)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(adapter.clicks, [])
+        self.assertFalse(adapter.saved)
+        self.assertFalse(result.steps[0].verification.ok)
+        self.assertEqual(
+            result.steps[1].action.capability, "task.finish"
+        )
+
+    def test_plan_stops_at_terminal_action(self):
+        adapter = CountingAdapter()
+        provider = CountingProvider(
+            [
+                Action(
+                    "desktop.act",
+                    {"action": "type", "text": "hello"},
+                    steps=(
+                        Action("task.finish", {"summary": "done"}),
+                        Action(
+                            "desktop.act",
+                            {"action": "click", "element_id": "e2"},
+                        ),
+                    ),
+                )
+            ]
+        )
+        result = self._run(adapter, provider)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(adapter.clicks, [])
+        self.assertEqual(len(result.steps), 2)
+
+    def test_unchanged_screen_reuses_screen_card(self):
+        adapter = CachedScreenAdapter()
+        provider = CountingProvider(
+            [
+                Action(
+                    "desktop.act",
+                    {"action": "type", "text": "hello"},
+                    expect="hello",
+                    screen_card="卡片：记事本已打开",
+                )
+            ]
+        )
+        events = []
+        result = self._run(
+            adapter,
+            provider,
+            on_event=lambda event, payload: events.append((event, payload)),
+        )
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(provider.calls, 2)
+        first, second = provider.observed
+        self.assertEqual(first.screenshot_path, "mock://screenshot.png")
+        self.assertFalse(first.screenshot_cached)
+        self.assertIsNone(second.screenshot_path)
+        self.assertTrue(second.screenshot_cached)
+        self.assertEqual(second.screen_card, "卡片：记事本已打开")
+        cache_events = [
+            payload for event, payload in events if event == "screen_cache"
+        ]
+        self.assertEqual(len(cache_events), 1)
+        self.assertTrue(cache_events[0]["reused"])
+
+    def test_await_user_stops_without_executing_actions(self):
+        adapter = CountingAdapter()
+        provider = CountingProvider(
+            [
+                Action(
+                    "task.await_user",
+                    {
+                        "kind": "login",
+                        "prompt": "请先登录测试系统",
+                        "summary": "任务已暂停，等待你登录。请登录后输入“继续”。",
+                    },
+                )
+            ]
+        )
+        result = self._run(adapter, provider, goal="查看测试系统通知")
+
+        self.assertEqual(result.status, "needs_human")
+        self.assertEqual(result.await_user["kind"], "login")
+        self.assertEqual(result.await_user["prompt"], "请先登录测试系统")
+        self.assertIn("等待你登录", result.summary)
+        self.assertEqual(result.steps[0].action.capability, "task.await_user")
+        self.assertEqual(result.steps[0].receipt.ok, True)
+        self.assertEqual(adapter.clicks, [])
+        self.assertEqual(adapter.text, "")
+
+    def test_login_wall_forces_await_user_without_credentials(self):
+        adapter = LoginWallAdapter()
+        provider = CountingProvider(
+            [Action("desktop.act", {"action": "click", "element_id": "e3"})]
+        )
+        result = self._run(adapter, provider, goal="查看测试系统通知")
+
+        self.assertEqual(result.status, "needs_human")
+        self.assertEqual(result.await_user["kind"], "login")
+        self.assertIn("登录", result.summary)
+        self.assertEqual(result.steps[0].action.capability, "task.await_user")
+        self.assertEqual(adapter.clicks, [])
+
+    def test_login_wall_ignored_when_goal_mentions_login(self):
+        adapter = LoginWallAdapter()
+        provider = CountingProvider(
+            [
+                Action("desktop.act", {"action": "click", "element_id": "e3"}),
+                Action("task.finish", {"summary": "已登录"}),
+            ]
+        )
+        result = self._run(adapter, provider, goal="打开登录页面并登录")
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(adapter.clicks, ["e3"])
+
+    def test_login_wall_ignored_when_credentials_in_goal(self):
+        adapter = LoginWallAdapter()
+        provider = CountingProvider(
+            [
+                Action("desktop.act", {"action": "click", "element_id": "e3"}),
+                Action("task.finish", {"summary": "已登录"}),
+            ]
+        )
+        result = self._run(
+            adapter,
+            provider,
+            goal="用账号 demo 密码 demo123 登录后查看通知",
+        )
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(adapter.clicks, ["e3"])
 
 
 if __name__ == "__main__":

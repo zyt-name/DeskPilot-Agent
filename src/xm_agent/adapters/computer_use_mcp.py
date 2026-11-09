@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import vision
 from ..mcp_stdio import MCPError, StdioMCPClient
 from ..types import Observation, Receipt, Verification
 
@@ -42,30 +43,57 @@ class ComputerUseMcpAdapter:
         self.tool_name = (tools or {}).get("computer", "computer")
         self.screenshot_dir = Path(screenshot_dir)
         self._last_size = (0, 0)
+        self._sent_size = (0, 0)
         self._shots = 0
 
     def observe(self, step: int, include_screenshot: bool = False) -> Observation:
         data, image = self._invoke({"action": "get_screenshot"})
-        width = int(data.get("image_width") or 0)
-        height = int(data.get("image_height") or 0)
-        self._last_size = (width, height)
-        path = self._save_png(image)
+        native_width = int(data.get("image_width") or 0)
+        native_height = int(data.get("image_height") or 0)
+        self._last_size = (native_width, native_height)
+        saved = self._save(image, prefix="shot")
+        width = int(saved.get("width") or native_width)
+        height = int(saved.get("height") or native_height)
+        self._sent_size = (width, height)
+        path = str(saved.get("path") or "") or None
         summary = (
             f"screenshot {width}x{height}; give x/y in this image space "
             f"(no UI element ids on this backend)"
         )
+        if width != native_width:
+            summary += f"; scaled from {native_width}x{native_height}"
+        raw: dict[str, Any] = {
+            "mcp": "computer_use_mcp",
+            "image_width": width,
+            "image_height": height,
+            "native_image_width": native_width,
+            "native_image_height": native_height,
+            "image_scale": float(saved.get("scale") or 1.0),
+            "screenshot_hash": saved.get("hash", ""),
+            "screenshot_bytes": saved.get("bytes", 0),
+            "source_bytes": saved.get("source_bytes", 0),
+        }
         return Observation(
             step=step,
             source="vision",
             summary=summary,
             elements=[],
             screenshot_path=path,
-            raw={
-                "mcp": "computer_use_mcp",
-                "image_width": width,
-                "image_height": height,
-            },
+            raw=raw,
         )
+
+    def capture_screenshot(self) -> str | None:
+        """Take one fresh screenshot for the top-level vision auditor."""
+        try:
+            data, image = self._invoke({"action": "get_screenshot"})
+        except MCPError:
+            return None
+        native_width = int(data.get("image_width") or 0)
+        native_height = int(data.get("image_height") or 0)
+        if native_width and native_height:
+            self._last_size = (native_width, native_height)
+        saved = self._save(image, prefix="audit")
+        return str(saved.get("path") or "") or None
 
     def execute(self, capability: str, args: dict[str, Any]) -> Receipt:
         try:
@@ -86,16 +114,17 @@ class ComputerUseMcpAdapter:
             data, image = self._invoke({"action": "get_screenshot"})
         except MCPError as exc:
             return Verification(False, f"verify failed: {exc}")
-        path = self._save_png(image)
+        saved = self._save(image, prefix="verify")
         return Verification(
             True,
             "screenshot captured; semantic check deferred to the vision model",
             {
-                "screenshot_path": path,
+                "screenshot_path": saved.get("path"),
                 "expect": expect,
                 "deferred": True,
-                "image_width": data.get("image_width"),
-                "image_height": data.get("image_height"),
+                "image_width": saved.get("width") or data.get("image_width"),
+                "image_height": saved.get("height") or data.get("image_height"),
+                "screenshot_hash": saved.get("hash", ""),
             },
             deferred=True,
         )
@@ -165,15 +194,16 @@ class ComputerUseMcpAdapter:
         if capability == "wait.for" and args.get("timeout_s"):
             time.sleep(min(float(args["timeout_s"]), 10.0))
         data, image = self._invoke({"action": "get_screenshot"})
-        path = self._save_png(image)
+        saved = self._save(image, prefix="capture")
         return Receipt(
             True,
             {
-                "screenshot_path": path,
+                "screenshot_path": saved.get("path"),
                 "deferred": True,
                 "detail": "visual backend cannot check text or windows without vision",
-                "image_width": data.get("image_width"),
-                "image_height": data.get("image_height"),
+                "image_width": saved.get("width") or data.get("image_width"),
+                "image_height": saved.get("height") or data.get("image_height"),
+                "screenshot_hash": saved.get("hash", ""),
             },
         )
 
@@ -181,6 +211,24 @@ class ComputerUseMcpAdapter:
         self, args: dict[str, Any], fallback_cursor: bool = False
     ) -> list[int]:
         if args.get("x") is not None and args.get("y") is not None:
+            sent_width, sent_height = self._sent_size
+            native_width, native_height = self._last_size
+            if (
+                sent_width > 0
+                and sent_height > 0
+                and native_width > 0
+                and native_height > 0
+            ):
+                return list(
+                    vision.scale_point(
+                        int(args["x"]),
+                        int(args["y"]),
+                        image_width=sent_width,
+                        image_height=sent_height,
+                        source_width=native_width,
+                        source_height=native_height,
+                    )
+                )
             return [int(args["x"]), int(args["y"])]
         if args.get("element_id"):
             raise MCPError(
@@ -228,14 +276,13 @@ class ComputerUseMcpAdapter:
             data = parsed
         return data, image
 
-    def _save_png(self, image: bytes | None) -> str | None:
+    def _save(self, image: bytes | None, *, prefix: str) -> dict[str, Any]:
         if image is None:
-            return None
+            return {}
         self._shots += 1
-        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        path = self.screenshot_dir / f"shot-{time.time_ns()}-{self._shots}.png"
-        path.write_bytes(image)
-        return str(path.resolve())
+        return vision.save_image(
+            image, self.screenshot_dir, prefix=f"{prefix}-{self._shots}"
+        )
 
     @staticmethod
     def _receipt(data: dict[str, Any]) -> Receipt:

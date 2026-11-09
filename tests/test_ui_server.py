@@ -697,6 +697,7 @@ def test_ai_model_active_and_usage_endpoints(server):
     assert status == 200
     assert usage["totals"]["calls"] == 0
     assert usage["by_model"] == []
+    assert usage["by_source"] == []
 
     status, bootstrap = _request(url + "api/bootstrap")
     assert status == 200
@@ -706,7 +707,9 @@ def test_ai_model_active_and_usage_endpoints(server):
 
 def test_audit_model_selection_roundtrip(server):
     app, url = server
-    provider_id, model_id = _create_provider_model(app, url)
+    provider_id, model_id = _create_provider_model(
+        app, url, model_id="llava"
+    )
 
     status, data = _request(
         url + "api/audit/model",
@@ -745,9 +748,27 @@ def test_audit_model_selection_roundtrip(server):
     assert app.storage.get_audit_model() == ("", "")
 
 
-def test_deleting_model_clears_audit_selection(server):
+def test_audit_model_must_see_images(server):
     app, url = server
     provider_id, model_id = _create_provider_model(app, url)
+
+    status, data = _request(
+        url + "api/audit/model",
+        method="POST",
+        body={"provider_id": provider_id, "model_id": model_id},
+        token=app.token,
+    )
+
+    assert status == 400
+    assert "识图" in data["error"]
+    assert app.storage.get_audit_model() == ("", "")
+
+
+def test_deleting_model_clears_audit_selection(server):
+    app, url = server
+    provider_id, model_id = _create_provider_model(
+        app, url, model_id="llava"
+    )
     _request(
         url + "api/audit/model",
         method="POST",
@@ -1447,6 +1468,126 @@ def test_resource_sync_reports_runtime_failure(server, monkeypatch):
     assert "可强制重装失败项" in job["message"]
     assert job["resources"][0]["runtime_ok"] is False
     assert "closed stdout" in job["resources"][0]["runtime_detail"]
+
+
+def test_await_user_handoff_and_resume(tmp_path, monkeypatch):
+    class AwaitProvider(HeuristicMockProvider):
+        def __init__(self) -> None:
+            self.await_sent = False
+            self.contexts: list[str] = []
+
+        def decide(
+            self,
+            goal,
+            observation,
+            history,
+            remaining_steps,
+            *,
+            instructions=None,
+            on_delta=None,
+            context="",
+        ):
+            self.contexts.append(context)
+            if not self.await_sent:
+                self.await_sent = True
+                return Action(
+                    "task.await_user",
+                    {
+                        "kind": "login",
+                        "prompt": "请先登录测试系统",
+                        "summary": "任务已暂停，等待你登录。请登录后输入“继续”。",
+                    },
+                )
+            return Action("task.finish", {"summary": "已完成：通知已打开。"})
+
+        def complete(self, system, user, *, max_tokens=800, on_delta=None):
+            return "登录后查看通知"
+
+    provider = AwaitProvider()
+    app = UiServer(
+        _config(tmp_path),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    monkeypatch.setattr(
+        server_module, "build_provider", lambda *a, **k: provider
+    )
+    url = app.start()
+    try:
+        _, data = _request(
+            url + "api/conversations",
+            method="POST",
+            body={"adapter": "mock"},
+            token=app.token,
+        )
+        conversation_id = data["conversation"]["id"]
+        original_goal = "查看测试系统的通知"
+        _, started = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": original_goal,
+                "adapter": "mock",
+                "auto_confirm": True,
+                "conversation_id": conversation_id,
+            },
+            token=app.token,
+        )
+        stored = _wait_run(app, started["id"])
+        assert stored["status"] == "needs_human"
+        conversation = app.storage.get_conversation(conversation_id)
+        last = conversation["messages"][-1]
+        assert last["role"] == "assistant"
+        assert last["payload"]["await_user"]["kind"] == "login"
+        assert "请先登录测试系统" in last["payload"]["await_user"]["prompt"]
+
+        status, resumed = _request(
+            url + "api/runs",
+            method="POST",
+            body={
+                "goal": "继续",
+                "adapter": "mock",
+                "auto_confirm": True,
+                "conversation_id": conversation_id,
+                "resume": True,
+            },
+            token=app.token,
+        )
+        assert status == 202
+        resumed_run = _wait_run(app, resumed["id"])
+        assert resumed_run["status"] == "done"
+        assert resumed_run["goal"] == original_goal
+        messages = app.storage.list_messages(conversation_id)
+        assert any(
+            message["role"] == "user" and message["content"] == "继续"
+            for message in messages
+        )
+        assert "用户已完成暂停事项（登录）" in provider.contexts[-1]
+    finally:
+        app.stop()
+
+
+def test_resume_without_pending_handoff_is_rejected(server):
+    app, url = server
+    _, data = _request(
+        url + "api/conversations",
+        method="POST",
+        body={"adapter": "mock"},
+        token=app.token,
+    )
+    status, body = _request(
+        url + "api/runs",
+        method="POST",
+        body={
+            "goal": "继续",
+            "adapter": "mock",
+            "conversation_id": data["conversation"]["id"],
+            "resume": True,
+        },
+        token=app.token,
+    )
+    assert status == 400
+    assert "没有等待你处理的任务" in body["error"]
 
 
 def test_resources_snapshot_ignores_probe_for_missing_resource(server, monkeypatch):

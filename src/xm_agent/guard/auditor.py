@@ -7,6 +7,7 @@ degrades to ``ask_user`` (fail closed), never to ``allow``.
 
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from dataclasses import dataclass, field
@@ -67,6 +68,22 @@ Rules:
 - If the operation is ambiguous, choose "ask_user".
 """
 
+VISUAL_AUDITOR_PROMPT = """
+
+A screenshot taken just before this operation is attached. The operation may be
+hard to undo (submit, send, publish, delete, pay, install or overwrite).
+Use the screenshot as evidence:
+- Confirm that the operation targets what the screenshot actually shows. If the
+  target, window, selection or typed value is not visible or does not match the
+  arguments, choose "ask_user".
+- Decide whether a wrong result could be rolled back. Set reversible=false when
+  undoing would need deleted data, external messages, payments or system state
+  to be restored.
+- If the screenshot is blank, shows a different application than the operation
+  claims, or is ambiguous, choose "ask_user" and say what is missing.
+- Your verdict is the top-level safety gate; when in doubt, choose "ask_user".
+"""
+
 
 @dataclass
 class AuditVerdict:
@@ -83,6 +100,8 @@ class AuditVerdict:
     reason: str = ""
     model: str = ""
     latency_ms: int = 0
+    visual: bool = False
+    screenshot_attached: bool = False
     raw: str = ""
 
     def to_dict(self, include_raw: bool = False) -> dict[str, Any]:
@@ -100,6 +119,8 @@ class AuditVerdict:
             "reason": self.reason,
             "model": self.model,
             "latency_ms": self.latency_ms,
+            "visual": self.visual,
+            "screenshot_attached": self.screenshot_attached,
         }
         if include_raw:
             data["raw"] = self.raw
@@ -217,6 +238,19 @@ def _as_list(value: Any) -> list[str]:
     return [str(item)[:300] for item in value if item is not None][:20]
 
 
+def _accepts_image(complete: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(complete).parameters
+    except (TypeError, ValueError):
+        return False
+    if "image_path" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 class TopLevelAuditor:
     """Calls a no-tool model and validates its fixed JSON verdict."""
 
@@ -227,12 +261,18 @@ class TopLevelAuditor:
         model: str = "",
         provider_name: str = "",
         same_as_executor: bool = False,
+        vision: bool = False,
         on_verdict: Callable[[AuditVerdict], None] | None = None,
     ) -> None:
         self.provider = provider
         self.model = model
         self.provider_name = provider_name
         self.same_as_executor = same_as_executor
+        self.vision = bool(
+            vision
+            or getattr(provider, "provider_vision", False)
+            or getattr(provider, "vision", False)
+        )
         self.on_verdict = on_verdict
 
     def audit(
@@ -241,8 +281,35 @@ class TopLevelAuditor:
         environment: dict[str, Any],
         policy: PolicyDecision,
         sensitivity: Sensitivity,
+        *,
+        screenshot_path: str | None = None,
+        require_visual: bool = False,
     ) -> AuditVerdict:
         started = time.monotonic()
+        if require_visual and not self.vision:
+            verdict = fallback_verdict(
+                "未配置可识图的顶层审计模型，无法审查该回退风险操作"
+            )
+            verdict.model = self.model
+            verdict.latency_ms = int((time.monotonic() - started) * 1000)
+            if self.on_verdict is not None:
+                try:
+                    self.on_verdict(verdict)
+                except Exception:
+                    pass
+            return verdict
+        if require_visual and not screenshot_path:
+            verdict = fallback_verdict(
+                "无法获取当前屏幕截图，无法审查该回退风险操作"
+            )
+            verdict.model = self.model
+            verdict.latency_ms = int((time.monotonic() - started) * 1000)
+            if self.on_verdict is not None:
+                try:
+                    self.on_verdict(verdict)
+                except Exception:
+                    pass
+            return verdict
         request = {
             "operation": descriptor.to_dict(),
             "environment": environment,
@@ -254,20 +321,40 @@ class TopLevelAuditor:
                 "requires_user": sensitivity.requires_user,
                 "policy_decision": policy.decision,
                 "policy_reason": policy.reason,
+                "rollback_review": bool(require_visual),
             },
         }
+        image_attached = bool(require_visual and screenshot_path)
+        if image_attached:
+            request["visual_review"] = {
+                "screenshot_attached": True,
+                "instruction": "Compare the operation with the attached screenshot.",
+            }
+        system = AUDITOR_SYSTEM_PROMPT + (
+            VISUAL_AUDITOR_PROMPT if image_attached else ""
+        )
         try:
             complete = getattr(self.provider, "complete", None)
             if complete is None:
                 raise RuntimeError("audit provider does not support complete()")
-            raw = complete(
-                AUDITOR_SYSTEM_PROMPT,
-                json.dumps(request, ensure_ascii=False),
-                max_tokens=800,
-            )
+            if image_attached and _accepts_image(complete):
+                raw = complete(
+                    system,
+                    json.dumps(request, ensure_ascii=False),
+                    max_tokens=800,
+                    image_path=screenshot_path,
+                )
+            else:
+                raw = complete(
+                    system,
+                    json.dumps(request, ensure_ascii=False),
+                    max_tokens=800,
+                )
             verdict = self._parse(raw)
         except Exception as exc:
             verdict = fallback_verdict(f"顶层审计不可用：{exc}")
+        verdict.visual = image_attached
+        verdict.screenshot_attached = bool(screenshot_path)
         verdict.latency_ms = int((time.monotonic() - started) * 1000)
         verdict.model = self.model
         if self.same_as_executor:

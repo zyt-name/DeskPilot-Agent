@@ -57,13 +57,14 @@ class AuditLog:
     def path_for(self, trace_id: str) -> Path:
         return self.root / f"{trace_id}.jsonl"
 
-    def prune(self) -> int:
+    def prune(self, dry_run: bool = False) -> int:
         cutoff = time.time() - self.keep_days * 86400
         removed = 0
         for path in self.root.glob("*.jsonl"):
             try:
                 if path.stat().st_mtime < cutoff:
-                    path.unlink(missing_ok=True)
+                    if not dry_run:
+                        path.unlink(missing_ok=True)
                     removed += 1
             except OSError:
                 continue

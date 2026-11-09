@@ -192,91 +192,165 @@ def policy_from_config(config: AgentConfig) -> Policy:
     )
 
 
+def _provider_vision(provider: Any) -> bool:
+    return bool(
+        getattr(provider, "provider_vision", False)
+        or getattr(provider, "vision", False)
+    )
+
+
+def _vision_model(
+    models: dict[str, dict[str, Any]], preferred: str = ""
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    if preferred and bool(models.get(preferred, {}).get("vision")):
+        return preferred, models[preferred]
+    for model_id, model in models.items():
+        if bool(model.get("vision")):
+            return model_id, model
+    return None, None
+
+
+def _audit_provider_from_row(
+    config: AgentConfig,
+    storage: Storage,
+    row: dict[str, Any],
+    model_id: str,
+    model: dict[str, Any],
+    run_id: str | None,
+    executor: tuple[Any, str, str] | None,
+    active: dict[str, Any] | None,
+) -> tuple[Any, str, str, bool, bool] | None:
+    if not bool(model.get("vision")):
+        return None
+    endpoint = preset_endpoint(
+        str(row.get("preset_id") or ""),
+        str(row.get("plan_id") or ""),
+    )
+    if endpoint is not None:
+        row = {**row, **endpoint}
+    try:
+        api_key = decrypt_secret(str(row.get("api_key_enc") or ""))
+        recorder = usage_recorder(
+            storage,
+            str(row.get("id") or ""),
+            str(row.get("name") or ""),
+            model_id,
+            "audit",
+            run_id,
+        )
+        provider = build_ai_provider(
+            row,
+            model_id,
+            api_key=api_key,
+            vision=True,
+            timeout_seconds=config.audit_ai.timeout_seconds,
+            temperature=0.0,
+            on_usage=recorder,
+        )
+    except Exception:
+        return None
+    same = bool(
+        executor is not None
+        and executor[2] == model_id
+        and str(row.get("id") or "")
+        == str(getattr(executor[0], "provider_id", "") or "")
+    )
+    if executor is not None and not same:
+        same = bool(
+            active
+            and active["provider"]["id"] == row.get("id")
+            and active["model"]["model_id"] == model_id
+        )
+    return provider, model_id, str(row.get("name") or ""), same, True
+
+
 def _audit_provider(
     config: AgentConfig,
     storage: Storage | None,
     run_id: str | None,
     executor: tuple[Any, str, str] | None = None,
-) -> tuple[Any, str, str, bool]:
+) -> tuple[Any, str, str, bool, bool]:
+    """Select a vision-capable top-level auditor.
+
+    The audit model must be able to see screenshots because rollback-risk UI
+    actions are reviewed against the screen. Selection order: explicit audit
+    model, explicit config, executor, active model, any configured vision
+    model, then the config model.
+    """
     audit_config = config.audit_ai
     active = storage.get_active_ai() if storage is not None else None
-    selected_provider_id, selected_model_id = "", ""
+
+    selections: list[tuple[str, str]] = []
     if storage is not None:
-        selected_provider_id, selected_model_id = storage.get_audit_model()
-    if not selected_provider_id:
-        selected_provider_id = audit_config.model_provider_id
-        selected_model_id = audit_config.model_id
-    if storage is not None and selected_provider_id:
-        row = storage.get_ai_provider(selected_provider_id, include_secret=True)
-        if row is not None:
-            endpoint = preset_endpoint(
-                str(row.get("preset_id") or ""),
-                str(row.get("plan_id") or ""),
-            )
-            if endpoint is not None:
-                row = {**row, **endpoint}
+        stored = storage.get_audit_model()
+        if stored[0]:
+            selections.append(stored)
+    if audit_config.model_provider_id:
+        selections.append(
+            (audit_config.model_provider_id, audit_config.model_id)
+        )
+    if storage is not None:
+        for provider_id, preferred in selections:
+            row = storage.get_ai_provider(provider_id, include_secret=True)
+            if row is None:
+                continue
             models = {
                 item["model_id"]: item
                 for item in storage.list_ai_models(row["id"])
             }
-            model_id = selected_model_id
-            model = models.get(model_id)
-            if model is None and models:
-                model_id, model = next(iter(models.items()))
-            if model is not None:
-                api_key = decrypt_secret(str(row.get("api_key_enc") or ""))
-                recorder = usage_recorder(
-                    storage,
-                    str(row.get("id") or ""),
-                    str(row.get("name") or ""),
-                    model_id,
-                    "audit",
-                    run_id,
-                )
-                provider = build_ai_provider(
-                    row,
-                    model_id,
-                    api_key=api_key,
-                    vision=False,
-                    timeout_seconds=audit_config.timeout_seconds,
-                    temperature=0.0,
-                    on_usage=recorder,
-                )
-                same = bool(
-                    executor is not None
-                    and executor[2] == model_id
-                    and str(row.get("id") or "")
-                    == str(getattr(executor[0], "provider_id", "") or "")
-                )
-                if executor is not None and not same:
-                    same = bool(
-                        active
-                        and active["provider"]["id"] == row.get("id")
-                        and active["model"]["model_id"] == model_id
-                    )
-                return provider, model_id, str(row.get("name") or ""), same
+            model_id, model = _vision_model(models, preferred)
+            if model_id is None or model is None:
+                continue
+            chosen = _audit_provider_from_row(
+                config, storage, row, model_id, model, run_id, executor, active
+            )
+            if chosen is not None:
+                return chosen
 
-    if executor is not None:
+    if executor is not None and _provider_vision(executor[0]):
         provider, model_id, provider_name = executor
-        return provider, model_id, provider_name, True
+        return provider, model_id, provider_name, True, True
 
     if storage is not None:
-        provider = build_active_provider(
+        active_provider = build_active_provider(
             storage,
             timeout_seconds=audit_config.timeout_seconds,
             temperature=0.0,
             source="audit",
             run_id=run_id,
         )
-        if provider is not None:
+        if active_provider is not None and _provider_vision(active_provider):
             return (
-                provider,
-                str(getattr(provider, "provider_model", "")),
-                str(getattr(provider, "provider_name", "")),
+                active_provider,
+                str(getattr(active_provider, "provider_model", "")),
+                str(getattr(active_provider, "provider_name", "")),
+                True,
                 True,
             )
 
-    if config.model.provider in {"openai_compat", "openai"}:
+    if storage is not None:
+        for summary in storage.list_ai_providers():
+            row = storage.get_ai_provider(
+                str(summary.get("id") or ""), include_secret=True
+            )
+            if row is None:
+                continue
+            models = {
+                item["model_id"]: item
+                for item in storage.list_ai_models(row["id"])
+            }
+            model_id, model = _vision_model(models)
+            if model_id is None or model is None:
+                continue
+            chosen = _audit_provider_from_row(
+                config, storage, row, model_id, model, run_id, executor, active
+            )
+            if chosen is not None:
+                return chosen
+
+    if config.model.provider in {"openai_compat", "openai"} and is_vision_model(
+        config.model.model
+    ):
         recorder = None
         if storage is not None:
             recorder = usage_recorder(
@@ -293,12 +367,12 @@ def _audit_provider(
             api_key_env=config.model.api_key_env,
             timeout_seconds=audit_config.timeout_seconds,
             temperature=0.0,
-            vision=False,
+            vision=True,
             on_usage=recorder,
         )
-        return provider, config.model.model, "config", True
+        return provider, config.model.model, "config", True, True
 
-    return None, "", "", False
+    return None, "", "", False, False
 
 
 def build_audit_gate(
@@ -314,7 +388,7 @@ def build_audit_gate(
     workspace_roots: list[str] | None = None,
     executor: tuple[Any, str, str] | None = None,
 ) -> AuditGate:
-    provider, model_id, provider_name, same = _audit_provider(
+    provider, model_id, provider_name, same, vision = _audit_provider(
         config, storage, run_id, executor
     )
     auditor = (
@@ -323,6 +397,7 @@ def build_audit_gate(
             model=model_id,
             provider_name=provider_name,
             same_as_executor=same,
+            vision=vision,
         )
         if provider is not None
         else None

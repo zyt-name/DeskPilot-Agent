@@ -24,6 +24,7 @@ READ_ONLY_CAPABILITIES = {
     "desktop.verify",
     "wait.for",
     "task.finish",
+    "task.await_user",
 }
 
 READ_ONLY_DESKTOP_ACTIONS = {"scroll", "move"}
@@ -176,6 +177,32 @@ _DESTRUCTIVE_KEYS_RE = re.compile(
     r"(?:shift\+)?delete|shift\+del|alt\+f4|win\+l|ctrl\+shift\+esc",
     re.I,
 )
+_COMMIT_UI_RE = re.compile(
+    r"发送|提交|发布|确认|购买|支付|付款|下单|删除|移除|卸载|格式化|清空|"
+    r"重置|撤销|退订|注销|send|submit|publish|post|confirm|buy|pay|"
+    r"purchase|order|delete|remove|uninstall|format|reset|unsubscribe",
+    re.I,
+)
+
+_ROLLBACK_EFFECTS = {
+    "delete",
+    "recursive",
+    "overwrite",
+    "external_write",
+    "upload",
+    "git_push",
+    "git_force_push",
+    "privilege",
+    "service_change",
+    "registry_change",
+    "startup_change",
+    "permission_change",
+    "security_change",
+    "system_change",
+    "credential_access",
+    "ui_destructive",
+    "ui_commit",
+}
 
 _PATH_TOKEN_RE = re.compile(
     r"""(?x)
@@ -495,17 +522,30 @@ def _ui_effects(action: str, args: dict[str, Any], element_name: str) -> list[st
     effects = [f"ui_{action}"]
     text = str(args.get("text") or "")
     keys = str(args.get("keys") or "")
+    label = element_name or str(
+        args.get("label") or args.get("target") or args.get("element_name") or ""
+    )
     if action == "type" and text:
         if _DELETE_RE.search(text) or _PRIVILEGE_RE.search(text):
             command_effects, _ = _command_effects(text)
             effects.extend(command_effects)
             effects.append("ui_submit")
-        elif "\n" in text or "\r" in text:
+        elif (
+            "\n" in text
+            or "\r" in text
+            or bool(args.get("press_enter"))
+            or bool(args.get("submit"))
+        ):
             effects.append("ui_submit")
     if action == "key" and _DESTRUCTIVE_KEYS_RE.search(keys):
         effects.append("ui_destructive")
-    if action == "click" and _DESTRUCTIVE_UI_RE.search(element_name):
-        effects.append("ui_destructive")
+    if action == "click" and label:
+        if _DESTRUCTIVE_UI_RE.search(label):
+            effects.append("ui_destructive")
+        elif _COMMIT_UI_RE.search(label):
+            effects.append("ui_commit")
+    if args.get("rollback_risk") or args.get("irreversible"):
+        effects.append("ui_commit")
     return list(dict.fromkeys(effects))
 
 
@@ -541,9 +581,18 @@ def _risk_from_effects(effects: Iterable[str], targets: list[OperationTarget]) -
         "external_write",
         "upload",
         "git_push",
+        "ui_commit",
     }:
         return "high"
-    if effects & {"write", "execute", "network", "download", "ui_type", "ui_key"}:
+    if effects & {
+        "write",
+        "execute",
+        "network",
+        "download",
+        "ui_type",
+        "ui_key",
+        "ui_submit",
+    }:
         return "medium"
     return "low"
 
@@ -794,6 +843,33 @@ def detect_sensitivity(
     )
 
 
+def needs_rollback_review(
+    descriptor: OperationDescriptor,
+    sensitivity: Sensitivity | None = None,
+) -> bool:
+    """Whether a mistake in this action would be hard or impossible to undo."""
+    if not descriptor.mutating:
+        return False
+    effects = set(descriptor.effects)
+    if effects & _ROLLBACK_EFFECTS:
+        return True
+    if descriptor.reversible is False:
+        return True
+    if sensitivity is not None and sensitivity.risk in {"high", "critical"}:
+        return True
+    return False
+
+
+def needs_visual_review(
+    descriptor: OperationDescriptor,
+    sensitivity: Sensitivity | None = None,
+) -> bool:
+    """UI actions lack a textual audit trail, so their review needs an image."""
+    return descriptor.capability == "desktop.act" and needs_rollback_review(
+        descriptor, sensitivity
+    )
+
+
 def environment_profile(
     descriptor: OperationDescriptor | None = None,
     *,
@@ -835,5 +911,7 @@ __all__ = [
     "clean_args",
     "detect_sensitivity",
     "environment_profile",
+    "needs_rollback_review",
+    "needs_visual_review",
     "normalize_operation",
 ]

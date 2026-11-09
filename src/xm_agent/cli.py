@@ -12,6 +12,7 @@ from .bootstrap import build_adapter, build_provider, policy_from_config
 from .config import AgentConfig, load_config
 from .contracts import CAPABILITIES
 from .lock import LeaseLock
+from .maintenance import cleanup as cleanup_files
 from .notify import SystemNotifier
 from .policy import Policy
 from .providers.fake import ScriptedProvider
@@ -86,8 +87,42 @@ def _policy_from_config(config: AgentConfig) -> Policy:
     return policy_from_config(config)
 
 
+def _safe_cleanup(config: AgentConfig) -> None:
+    """Prune expired audit logs and screenshots before a long-running command."""
+
+    try:
+        report = cleanup_files(config)
+    except Exception:
+        return
+    if report["removed"]:
+        print(
+            f"[cleanup] 已清理 {report['removed']} 个过期文件"
+            f"（保留 {report['keep_days']} 天）"
+        )
+
+
+def _cmd_cleanup(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    report = cleanup_files(
+        config, keep_days=args.keep_days, dry_run=args.dry_run
+    )
+    verb = "将删除" if report["dry_run"] else "已删除"
+    print(
+        f"保留 {report['keep_days']} 天；{verb} {report['removed']} 个文件，"
+        f"释放 {report['freed_bytes']} 字节"
+    )
+    print(f"  审计日志: {report['audit']['path']} → {report['audit']['removed']}")
+    screenshots = report["screenshots"]
+    print(
+        f"  截图缓存: {screenshots['path']} → {screenshots['removed']}"
+        f"（保留 {screenshots['kept']} 个）"
+    )
+    return 0
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
+    _safe_cleanup(config)
     adapter_name = args.adapter or config.default_adapter
     db_path = args.db
     if db_path is None and Path(".xm-agent/app.db").is_file():
@@ -122,6 +157,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         lock=lock,
         max_steps=config.runtime.max_steps,
         max_consecutive_failures=config.runtime.max_consecutive_failures,
+        max_provider_retries=config.runtime.max_provider_retries,
+        provider_retry_delay=config.runtime.provider_retry_delay,
         confirm=confirm,
         on_event=_print_event,
     )
@@ -247,6 +284,7 @@ def _cmd_gui(args: argparse.Namespace) -> int:
     if config_path is None and Path("config/agent.example.toml").is_file():
         config_path = "config/agent.example.toml"
     config = load_config(config_path)
+    _safe_cleanup(config)
     from .ui import run_gui
 
     return run_gui(
@@ -344,6 +382,22 @@ def main(argv: list[str] | None = None) -> int:
         "demo", help="run the offline mock demo"
     )
     demo_parser.set_defaults(handler=_cmd_demo)
+
+    cleanup_parser = subparsers.add_parser(
+        "cleanup", help="prune old audit logs and screenshots"
+    )
+    cleanup_parser.add_argument("--config")
+    cleanup_parser.add_argument(
+        "--keep-days",
+        type=int,
+        help="override the audit retention window (defaults to [audit].keep_days)",
+    )
+    cleanup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be removed without deleting anything",
+    )
+    cleanup_parser.set_defaults(handler=_cmd_cleanup)
 
     resources_parser = subparsers.add_parser(
         "resources", help="check or install the bundled MCP resources"
