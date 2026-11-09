@@ -1104,6 +1104,18 @@ def test_toggle_pause_active_follows_foreground_run(server):
     app._controls.pop("run-hotkey-2", None)
 
 
+def test_ask_screen_route_reports_unknown_run(server):
+    app, url = server
+    status, body = _request(
+        url + "api/runs/missing/ask_screen",
+        "POST",
+        {"question": "屏幕上有什么？"},
+        app.token,
+    )
+    assert status == 400
+    assert body["error"] == "run not found"
+
+
 def test_pause_and_resume_update_screen_indicator(server):
     app, _ = server
     app.indicator = _RecordingIndicator()

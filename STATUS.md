@@ -41,11 +41,12 @@
 | 资源管理 | `src/xm_agent/resources/`、CLI `resources`、设置页「MCP 资源」 | 完成 | 固定版本清单、版本化目录 + junction、GitHub/国内镜像回退、安全解压、venv/npm 构建、检测悬浮窗 |
 | 面板其余页面 | `src/xm_agent/ui/static/app.js` | 完成 | 总览 / AI 模型 / 用量 / 历史 / 设置；饼图、分模型统计与资源检测悬浮窗 |
 | 用量来源统计 | `src/xm_agent/storage.py`、`src/xm_agent/ui/static/` | 完成 | `ai_usage` 按 `source` 聚合；用量页「审计 Token」卡片显示审计调用占比与次数 |
+| 截图提问 | `src/xm_agent/ui/server.py`、`src/xm_agent/ui/static/` | 完成 | 仅暂停中可问；截屏前临时最小化控制台以获得干净画面；纯文本模型前端禁用、后端拒绝；答案显示在暂停横幅内，不落库、不进入任务上下文 |
 | 数据保留清理 | `src/xm_agent/maintenance.py`、`src/xm_agent/cli.py` | 完成 | `cleanup` CLI（`--dry-run` / `--keep-days`）；只清理审计 JSONL 与截图图片，不递归删目录；`run` / `gui` 启动时自动执行 |
 | 契约测试 | `tests/test_contract.py` | 完成 | 同一组用例参数化跑 mock / windows / computer_use / xshell 四个后端（observe 结构、终止能力失败关闭、verify 结构、close 幂等） |
 | 配置 | `config/agent.example.toml`、`config/xshell-mcp.json` | 完成 | TOML 适配器映射、子进程 env/cwd、`model` 回退配置、`[runtime].screenshot_dir` |
 | 只读探测脚本 | `scripts/probe_windows_mcp.py`、`scripts/probe_computer_use_mcp.py`、`scripts/probe_xshell_mcp.py` | 完成 | Windows 端到端只读；Computer-Use 已构建；Xshell 框架保留 |
-| 测试 | `tests/` | 完成 | 305 个用例全部通过 |
+| 测试 | `tests/` | 完成 | 317 个用例全部通过 |
 | 测试用 MCP Server | `examples/fake_mcp_server.py` | 完成 | 无第三方依赖，stdio JSON-RPC |
 
 ### 已接入的第三方 MCP
@@ -66,7 +67,7 @@
 PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 ```
 
-结果：`305 passed`
+结果：`317 passed`
 
 覆盖范围：
 
@@ -165,8 +166,8 @@ Xshell MCP（框架保留，本机未安装 Xshell）：
 - [x] F8 全局暂停、顶部状态胶囊与屏幕边缘高亮（`RegisterHotKey` + `WDA_EXCLUDEFROMCAPTURE`，注册失败回退窗口内 F8）
 - [ ] 右上角 HUD：实时思考/步骤、悬停滚轮、缩放、折叠与位置记忆
 - [ ] `WDA_EXCLUDEFROMCAPTURE` 截图排除：Windows-MCP 与 Computer-Use 分别实测，准备回退方案
-- [x] 暂停菜单：继续 / AI 注入 / 结束控制（截图提问待实现）
-- [ ] 截图提问（暂停后全屏截图 + 视觉模型；纯文本模型禁用）
+- [x] 暂停菜单：继续 / AI 注入 / 截图提问 / 结束控制
+- [x] 截图提问：暂停后截全屏交视觉模型问答（`POST /api/runs/{id}/ask_screen`）；纯文本模型在界面禁用、服务端拒绝；截图前临时收起控制台，拍完恢复
 - [x] 串行队列、插队抢占与恢复；全程禁止并行任务
 - [x] 顶层 AI 审计：操作描述符、盲审、失败关闭、执行前复核
 - [x] 用户审计模式（AI 审计 / 每次确认）与确认弹窗
@@ -224,7 +225,7 @@ Xshell MCP（框架保留，本机未安装 Xshell）：
 22. **真正的多桌面隔离不可行**：Windows 虚拟桌面共享同一交互会话，只有当前桌面渲染并接收输入；隐藏 `CreateDesktop` 桌面不渲染；RDP 单客户端只允许一个交互会话。因此采用前台独占 + 单任务串行，真隔离只能上 Windows Sandbox / Hyper-V，且无法与宿主应用共享窗口。
 23. **`WDA_EXCLUDEFROMCAPTURE` 尚未实测**：顶部提示、发光层与 HUD 计划用该 API 排除出截图，但 Windows-MCP 与 Computer-Use（nut.js）的截图后端是否遵守尚未验证；失效时需回退为截图前隐藏或裁剪，可能有闪烁。
 24. **F8 有环境限制**：低级键盘钩子可能收不到 UAC/提权窗口的按键，也可能与目标应用快捷键冲突；需要可配置快捷键与 HUD/托盘暂停入口，彻底覆盖提权窗口需后期增加辅助进程。
-25. **截图提问依赖视觉模型**：活动模型 `vision=false` 时无法使用；本版本不做本地 OCR，需提示用户切换模型。
+25. **截图提问依赖视觉模型**：执行模型 `vision=false` 时按钮禁用、接口直接拒绝，需要切换可识图模型；本版本不做本地 OCR。答案只显示在暂停面板，不写入任务上下文，不会影响后续执行。
 26. **暂停与插队存在延迟**：暂停只在步骤边界生效，正在等待的模型请求需要可取消才能快速响应；单个 MCP 动作不会被强行中断。
 27. **前台独占不等于互不影响**：用户中途移动鼠标、点击或输入会改变 AI 依赖的界面状态。v1 依赖 F8 手动暂停与 Windows-MCP `USER_CONTROL` 保护；Computer-Use 没有该保护，非注入输入自动暂停列入 P1。
 28. **HUD 交互与点击穿透冲突**：运行中 HUD 必须点击穿透，否则会挡住 AI 的点击坐标；因此运行中只能悬停滚轮查看，点击/拖动 HUD 视为用户接管并暂停，暂停后才可缩放与选择文本。
@@ -246,7 +247,7 @@ Xshell MCP（框架保留，本机未安装 Xshell）：
 ## 5. 下一步
 
 1. 原生覆盖层收尾：右上角 HUD（思考/步骤、悬停滚动、折叠）；在 Windows-MCP 与 Computer-Use 两个截图后端分别实测 `WDA_EXCLUDEFROMCAPTURE`，准备失效回退。全局 F8、顶部状态胶囊与边缘高亮已完成。
-2. 暂停菜单补「截图提问」：全屏截图 + 视觉模型问答；`vision=false` 时禁用并提示切换模型；框选提问列入 P1。
+2. 截图提问增强：框选区域、多显示器负坐标与 DPI 归一化（当前为全屏）；支持把答案直接转成下一条指令。
 3. 用视觉模型跑通 Computer-Use 的“截图 → 决策 → 坐标动作 → 再截图”闭环。
 4. 前台独占增强：运行中让出桌面与结束/暂停恢复已完成；剩余窗口归属跟踪与结束操控现场策略。
 5. 继续以 Windows-MCP 为主通道，先跑 3 个固定任务，再扩到 20 个基线；UIA 失败时再切视觉通道。
@@ -374,3 +375,4 @@ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 - 2026-11-09：登录阻塞与用户接管（TECH_DESIGN 4.17）。新增 `task.await_user` 能力与系统提示：需要登录且目标/指令未提供账号密码时，模型必须中止并请求用户登录，不得绕过、猜测、注册或找回密码。运行时增加确定性兜底：UIA 观测到登录页（登录关键词 + 密码/账号字段，或「请先登录/扫码登录」）且目标、任务上下文、用户指令都不涉及登录/注册/凭据时，强制把动作改写为 `task.await_user`，任务以 `needs_human` 结束并返回待办提示。面板支持同会话恢复：用户回复「继续/已登录」时复用被阻塞任务的原目标，注入「用户已完成暂停事项，请从当前屏幕继续原任务」的上下文，队列同样透传用户消息与上下文；无待处理交接时显式 resume 返回明确错误。前端新增等待横幅、「我已登录，继续」按钮与输入提示，切换会话可恢复等待状态。新增登录阻塞、凭据豁免、恢复链路与无待办拒绝测试，测试总数 273。
 - 2026-11-09：补数据保留、用量来源统计与跨后端契约测试。`ai_usage` 增加按 `source` 聚合，用量页新增「审计 Token」卡片（占总量比例与审计调用次数），审计开销不再混在总用量里无法区分；新增 `maintenance.cleanup`：按 `[audit].keep_days` 清理过期审计 JSONL 与 `[runtime].screenshot_dir` 下的截图（只匹配扩展名、不递归目录、目录缺失不创建），CLI 增加 `cleanup --dry-run/--keep-days`，`run` 与 `gui` 启动时自动执行一次，`AuditLog.prune` 支持 `dry_run`；新增 `tests/test_contract.py`：同一组用例参数化跑 mock / windows / computer_use / xshell，验证 observe 结构、终止能力失败关闭、verify 结构与 close 幂等；新增清理与用量来源测试，测试总数 294。
 - 2026-11-09：前台独占补全（TECH_DESIGN 4.19）。新增 `ui/desktop.py` 的 `DesktopHandoff`：需要屏幕的任务开始前最小化控制台窗口，任务结束、失败、取消或等待用户接管后恢复；暂停（F8 / 面板）与用户确认弹窗会把窗口调回前台，继续后再次让出；多任务并发时以「最后一个屏幕任务结束」为恢复点，避免误恢复。`run_gui` 通过 pywebview 的启动回调把真实窗口交给接管器，浏览器模式与未创建窗口时全部静默跳过；`[runtime].release_desktop` 可整体关闭，bootstrap 暴露 `desktop_handoff` 供界面判断。新增 `tests/test_desktop.py`（幂等最小化/恢复、窗口异常吞掉、配置开关、暂停/确认联动、bootstrap 字段），测试总数 305。
+- 2026-11-09：暂停菜单补「截图提问」（TECH_DESIGN 4.20）。暂停中可对当前屏幕提问：`POST /api/runs/{id}/ask_screen` 校验任务存在且已暂停，用本次任务的模型（可识图）截图提问；纯文本模型前端禁用按钮、后端返回明确错误。截图前临时收起控制台（`DesktopHandoff.release` + 350ms），拍完立即恢复，避免窗口遮住要问的内容。答案只渲染在暂停横幅内，不入库、不进入任务上下文，桌面不会被点击或改动。新增 `tests/test_screen_ask.py`（问题校验、暂停/结束校验、纯文本拒绝、截图隐藏与恢复、截图/模型/空答案失败分支）与 `ask_screen` 路由测试，测试总数 317。

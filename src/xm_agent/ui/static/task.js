@@ -26,6 +26,7 @@
     runModelChoice: "",
     auditChoice: "",
     auditVisionAvailable: true,
+    runVision: null,
   };
 
   const AUDIT_LABEL = {
@@ -544,6 +545,7 @@
       resetStream();
       taskState.running = true;
       taskState.paused = false;
+      taskState.runVision = null;
       taskState.activeRunId = message.run_id || "";
       setRunning(true);
       const divider = el("div", "run-divider");
@@ -579,6 +581,7 @@
       return;
     }
     if (name === "model") {
+      taskState.runVision = Boolean(payload.vision);
       const divider = el("div", "run-meta");
       divider.textContent = `模型 ${payload.provider || "?"} · ${payload.model || "?"}${
         payload.vision ? " · 可识图" : ""
@@ -926,6 +929,54 @@
     $("task-pause").classList.toggle("hidden", paused);
     $("task-resume").classList.toggle("hidden", !paused);
     $("task-run-pill").textContent = paused ? "已暂停" : "运行中";
+    const ask = $("task-banner-ask");
+    const noVision = taskState.runVision === false;
+    ask.disabled = noVision;
+    ask.title = noVision
+      ? "当前模型不支持图像输入，请切换到可识图模型"
+      : "截取当前屏幕并向模型提问";
+    if (!paused) $("task-ask-panel").classList.add("hidden");
+  }
+
+  function openScreenAsk() {
+    if (taskState.runVision === false) {
+      toast("当前模型不支持图像输入，请切换到可识图模型", true);
+      return;
+    }
+    $("task-ask-panel").classList.remove("hidden");
+    $("task-ask-answer").classList.add("hidden");
+    $("task-ask-question").focus();
+  }
+
+  async function askScreen() {
+    const question = $("task-ask-question").value.trim();
+    if (!question) {
+      toast("请先输入要问的问题", true);
+      return;
+    }
+    if (!taskState.activeRunId) {
+      toast("当前没有运行中的任务", true);
+      return;
+    }
+    const answer = $("task-ask-answer");
+    answer.classList.remove("hidden", "error");
+    answer.textContent = "正在截屏并思考…";
+    $("task-ask-submit").disabled = true;
+    try {
+      const data = await api(
+        `/api/runs/${taskState.activeRunId}/ask_screen`,
+        {
+          method: "POST",
+          body: JSON.stringify({ question }),
+        },
+      );
+      answer.textContent = data.answer || "（模型没有返回内容）";
+    } catch (err) {
+      answer.textContent = err.message;
+      answer.classList.add("error");
+    } finally {
+      $("task-ask-submit").disabled = false;
+    }
   }
 
   async function togglePause() {
@@ -1917,6 +1968,17 @@
     $("task-pause").addEventListener("click", togglePause);
     $("task-resume").addEventListener("click", togglePause);
     $("task-banner-resume").addEventListener("click", togglePause);
+    $("task-banner-ask").addEventListener("click", openScreenAsk);
+    $("task-ask-submit").addEventListener("click", askScreen);
+    $("task-ask-close").addEventListener("click", () =>
+      $("task-ask-panel").classList.add("hidden"),
+    );
+    $("task-ask-question").addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        askScreen();
+      }
+    });
     $("task-cancel").addEventListener("click", cancelRun);
     $("task-banner-cancel").addEventListener("click", cancelRun);
     $("task-audit-mode").addEventListener("change", updateConversationSettings);

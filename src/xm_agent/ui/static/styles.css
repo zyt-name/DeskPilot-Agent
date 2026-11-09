@@ -946,6 +946,57 @@ input:focus, textarea:focus, select:focus {
 .await-banner strong { color: #1f5f9e; }
 .await-banner span { color: #3f5f7f; }
 
+.ask-banner {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  border-bottom-color: #d8dee9;
+  background: #f6f8fc;
+}
+
+.ask-banner strong { color: #2f3b52; }
+.ask-banner span { color: #5a6780; }
+.ask-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 340px;
+  min-width: 260px;
+}
+.ask-body textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 54px;
+  padding: 7px 9px;
+  border: 1px solid #ccd5e3;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  color: #1f2733;
+  background: #ffffff;
+}
+.ask-body textarea:focus {
+  outline: none;
+  border-color: #7aa7e6;
+  box-shadow: 0 0 0 2px rgba(90, 140, 220, 0.16);
+}
+.ask-answer {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #26303f;
+  background: #ffffff;
+  border: 1px solid #dbe2ec;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.ask-answer.error {
+  color: #a4342c;
+  border-color: #f0c6c1;
+  background: #fff7f6;
+}
+.ask-answer.hidden { display: none; }
+.ask-banner .row { gap: 8px; align-items: center; }
+
 .chat-head {
   display: flex;
   align-items: center;

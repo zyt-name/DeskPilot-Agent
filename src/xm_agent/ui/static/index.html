@@ -141,8 +141,21 @@
                 <span>桌面操作已停住，你可以输入指令后继续。</span>
               </div>
               <div class="row">
+                <button class="btn btn-ghost" id="task-banner-ask" type="button">截图提问</button>
                 <button class="btn btn-ghost" id="task-banner-resume" type="button">继续</button>
                 <button class="btn btn-danger-ghost" id="task-banner-cancel" type="button">结束控制</button>
+              </div>
+            </div>
+            <div class="pause-banner ask-banner hidden" id="task-ask-panel">
+              <div class="ask-body">
+                <strong>对当前屏幕提问</strong>
+                <span id="task-ask-note">截取屏幕后交给模型判断，不会点击或改变桌面。</span>
+                <textarea id="task-ask-question" rows="2" maxlength="300" placeholder="例如：这个弹窗里默认选中的是哪一项？"></textarea>
+                <div class="ask-answer hidden" id="task-ask-answer"></div>
+              </div>
+              <div class="row">
+                <button class="btn btn-primary" id="task-ask-submit" type="button">提问</button>
+                <button class="btn btn-ghost" id="task-ask-close" type="button">收起</button>
               </div>
             </div>
             <div class="pause-banner await-banner hidden" id="task-await-banner">

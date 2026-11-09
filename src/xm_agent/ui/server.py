@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import mimetypes
 import os
@@ -9,6 +10,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +46,7 @@ from ..resources import ResourceManager
 from ..runtime import AgentRuntime
 from ..storage import Storage
 from ..summary import FINISH_LABELS, final_summary, one_line
+from ..vision import capture_primary_screen
 
 STATIC_DIR = Path(__file__).parent / "static"
 _ASSETS = {
@@ -59,6 +62,13 @@ _TITLE_SYSTEM_PROMPT = (
     "你是任务命名助手。根据用户目标和执行结果，用不超过 16 个汉字概括任务。"
     "只输出任务名称，不要引号、标点或解释。"
 )
+_SCREEN_ASK_PROMPT = (
+    "你是桌面任务的屏幕问答助手。用户暂停了任务，就当前屏幕截图提出问题。"
+    "只依据截图里看得见的内容回答；看不到或不确定的信息直接说明看不出来，"
+    "不要猜测，也不要建议执行未确认的操作。"
+    "用简体中文回答，2–4 句话；需要列举时用短列表。不要输出 JSON。"
+)
+_SCREEN_ASK_HIDE_DELAY = 0.35
 _RESUME_TEXT = re.compile(
     r"^(继续|继续任务|继续吧|可以继续|已登录|已经登录|登录好了|登录完成|"
     r"我登录好了|我登录完成了|好了|弄好了|ok|okay|continue|resume)"
@@ -69,6 +79,19 @@ _RESUME_TEXT = re.compile(
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _accepts_image(complete: Any) -> bool:
+    try:
+        parameters = inspect.signature(complete).parameters
+    except (TypeError, ValueError):
+        return False
+    if "image_path" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _clean_task_title(text: str) -> str:
@@ -884,6 +907,105 @@ class UiServer:
         if not instruction:
             raise ValueError("instruction is required")
         return instruction
+
+    # -- screenshot question ------------------------------------------
+
+    def _run_entry(self, run_id: str) -> dict[str, Any] | None:
+        with self._runs_lock:
+            return self._runs.get(run_id)
+
+    def _capture_for_question(self) -> dict[str, Any] | None:
+        """Grab the screen without the console in the way, then put it back."""
+        hidden = False
+        if (
+            self.config.runtime.release_desktop
+            and self.desktop is not None
+            and self.desktop.available
+        ):
+            try:
+                hidden = bool(self.desktop.release())
+            except Exception:
+                hidden = False
+            if hidden:
+                time.sleep(_SCREEN_ASK_HIDE_DELAY)
+        try:
+            return capture_primary_screen(
+                self.config.runtime.screenshot_dir, prefix="ask"
+            )
+        finally:
+            if hidden:
+                try:
+                    self.desktop.reclaim()
+                except Exception:
+                    pass
+
+    def ask_screen(self, run_id: str, question: str) -> dict[str, Any]:
+        """Answer a question about the current screen while the run is paused.
+
+        Only a paused run may ask: the screen must be still, otherwise the
+        answer describes a frame the agent already changed.
+        """
+        text = " ".join(str(question or "").split()).strip()
+        if not text:
+            raise ValueError("请输入要问的问题")
+        entry = self._run_entry(run_id)
+        if entry is None:
+            raise ValueError("run not found")
+        control = self._control_for(run_id)
+        if control is None:
+            raise ValueError("任务已结束，无法对屏幕提问")
+        if not control.paused:
+            raise ValueError("请先暂停任务（F8），再对屏幕提问")
+        provider = build_provider(
+            self.config,
+            str(entry.get("adapter") or self.config.default_adapter),
+            storage=self.storage,
+            source="ui",
+            run_id=run_id,
+            model_provider_id=str(entry.get("model_provider_id") or ""),
+            model_id=str(entry.get("model_id") or ""),
+        )
+        vision = bool(
+            getattr(provider, "provider_vision", False)
+            or getattr(provider, "vision", False)
+        )
+        if not vision:
+            raise ValueError("当前模型不支持图像输入，请切换到可识图的模型")
+        shot = self._capture_for_question()
+        if shot is None:
+            raise ValueError("截图失败：当前环境无法访问桌面")
+        complete = getattr(provider, "complete", None)
+        if complete is None:
+            raise ValueError("当前模型不支持问答")
+        try:
+            if _accepts_image(complete):
+                answer = complete(
+                    _SCREEN_ASK_PROMPT,
+                    f"用户的问题：{text}",
+                    max_tokens=800,
+                    image_path=shot["path"],
+                )
+            else:
+                answer = complete(
+                    _SCREEN_ASK_PROMPT, f"用户的问题：{text}", max_tokens=800
+                )
+        except Exception as exc:
+            raise ValueError(f"截图提问失败：{exc}") from exc
+        answer = str(answer or "").strip()
+        if not answer:
+            raise ValueError("模型没有返回内容")
+        return {
+            "answer": answer,
+            "model": str(
+                getattr(provider, "provider_model", "")
+                or getattr(provider, "model", "")
+                or entry.get("model")
+                or ""
+            ),
+            "screenshot": shot.get("path"),
+            "width": shot.get("width"),
+            "height": shot.get("height"),
+        }
 
     # -- task queue ---------------------------------------------------
 
@@ -1741,6 +1863,13 @@ def _make_handler(app: UiServer):
                                 run_id, str(body.get("text", ""))
                             )
                             self._json({"ok": True, "instruction": instruction})
+                            return
+                        if verb == "ask_screen":
+                            self._json(
+                                app.ask_screen(
+                                    run_id, str(body.get("question", ""))
+                                )
+                            )
                             return
                 if path == "/api/ai/providers/save":
                     saved = app.ai.save_provider(body)
