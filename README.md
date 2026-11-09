@@ -31,6 +31,16 @@ https://github.com/2head1i/xshell-mcp/archive/709a5f59bc18a19feb8fb2237bef664d60
 
 `config/agent.example.toml` 中的适配器命令指向稳定入口（如 `vendor/Windows-MCP/.venv/Scripts/python.exe`），因此升级版本只需切换稳定入口，不需要改配置。
 
+## 环境自动初始化
+
+`.venv` 不随仓库分发，`start.cmd` 会在启动前自行准备：
+
+1. 已有 `.venv` 且解释器满足 Python 3.12+ 时直接使用。
+2. 否则依次探测：`XM_AGENT_PYTHON` 环境变量 → `py` 启动器 → 注册表 `PythonCore` 记录 → `PATH` 上的 `python`/`python3` → 常见安装目录。Microsoft Store 的占位符会被跳过。
+3. 找到兼容解释器（≥3.12，与 `pyproject.toml` 的 `requires-python` 一致）后自动创建 `.venv` 并安装 `.[dev,gui]` 依赖；找不到解释器或版本不兼容会提示后退出。
+
+需要指定解释器时设置 `XM_AGENT_PYTHON=D:\path\to\python.exe`。
+
 ## 资源自动初始化
 
 ### 启动脚本
