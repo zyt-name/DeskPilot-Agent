@@ -686,6 +686,9 @@
       return;
     }
     if (name === "step") {
+      if (payload.capability && window.browserView) {
+        window.browserView.notice(payload.capability);
+      }
       const node = ensureStep(payload.step, payload.capability);
       let state = "完成";
       let tone = "ok";

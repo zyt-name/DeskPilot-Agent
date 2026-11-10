@@ -198,6 +198,10 @@
                   <span>后端</span>
                   <select id="task-adapter"></select>
                 </label>
+                <button class="icon-btn browser-toggle hidden" id="task-browser-toggle" type="button" title="打开浏览器视图" aria-label="打开浏览器视图">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="M3 10h14" /><path d="M10 3c2.4 2.1 3.6 4.4 3.6 7s-1.2 4.9-3.6 7c-2.4-2.1-3.6-4.4-3.6-7S7.6 5.1 10 3z" /></svg>
+                  <span class="browser-dot hidden" id="task-browser-dot"></span>
+                </button>
                 <button class="icon-btn queue-toggle" id="task-side-toggle" type="button" title="显示或隐藏队列" aria-label="显示或隐藏队列">
                   <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12" /><path d="M4 10h12" /><path d="M4 14h8" /></svg>
                   <span class="queue-badge hidden" id="task-queue-badge">0</span>
@@ -260,6 +264,42 @@
               </div>
             </div>
           </aside>
+
+          <section class="browser-drawer" id="browser-drawer" aria-hidden="true">
+            <header class="browser-head">
+              <span class="browser-dot" id="browser-dot" aria-hidden="true"></span>
+              <div class="browser-title">
+                <strong id="browser-title">浏览器</strong>
+                <span class="browser-url" id="browser-url">未启动</span>
+              </div>
+              <div class="row tight">
+                <button class="icon-btn" id="browser-handoff" type="button" title="把浏览器窗口显示到桌面上（扫码时用）" aria-label="显示真实窗口">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4.5" width="14" height="11" rx="1.5" /><path d="M3 8h14" /></svg>
+                </button>
+                <button class="icon-btn" id="browser-expand" type="button" title="全屏视图（左侧保留对话）" aria-label="全屏视图">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7.5 3.5H3.5v4" /><path d="M12.5 3.5h4v4" /><path d="M16.5 12.5v4h-4" /><path d="M7.5 16.5h-4v-4" /></svg>
+                </button>
+                <button class="icon-btn" id="browser-close" type="button" title="收起浏览器视图（不影响 AI 继续运行）" aria-label="收起">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10" /><path d="M15 5L5 15" /></svg>
+                </button>
+              </div>
+            </header>
+            <div class="browser-stage" id="browser-stage">
+              <canvas id="browser-canvas"></canvas>
+              <div class="browser-empty" id="browser-empty">
+                <strong>AI 还没有打开浏览器</strong>
+                <p>当任务需要访问网页时，这里会实时显示 AI 看到的画面。你也可以手动打开一个地址：</p>
+                <form class="browser-open-form" id="browser-open-form">
+                  <input type="url" id="browser-open-url" placeholder="https://example.com" />
+                  <button class="btn btn-primary" type="submit">打开</button>
+                </form>
+              </div>
+            </div>
+            <footer class="browser-foot">
+              <span id="browser-status">未启动</span>
+              <span class="browser-frames" id="browser-frames"></span>
+            </footer>
+          </section>
         </div>
       </section>
 
@@ -612,5 +652,6 @@
   <div class="toast hidden" id="toast"></div>
   <script src="/static/app.js"></script>
   <script src="/static/task.js"></script>
+  <script src="/static/browser.js"></script>
 </body>
 </html>

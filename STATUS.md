@@ -3,7 +3,7 @@
 > 最后更新：2026-11-10
 > 当前阶段：P0 桌面链路（Windows-MCP 主通道 + Computer-Use MCP 视觉通道已接框架）；本地桌面控制台可用；多厂商 AI 配置、DPAPI 加密密钥与 Token 用量面板已可用；第三方 MCP 资源支持启动自动初始化、版本化安装与国内镜像回退；Xshell 仅保留框架。任务式界面、流式思考/输出、会话与事件持久化、串行队列与插队、暂停/继续/结束控制、可复用确认弹窗、顶层 AI 审计与两种用户审计模式已落地（TECH_DESIGN 4.14 / 4.15）；视觉提速（批量计划、截屏压缩、屏幕摘要缓存）与回退风险识图审查已落地（TECH_DESIGN 4.16），顶层审计模型强制为可识图模型。登录阻塞与用户接管已落地（TECH_DESIGN 4.17）：无凭据时中止任务等待用户登录，用户回复「继续」后沿用原目标恢复执行。全局 F8、顶部状态胶囊与任务级边缘高亮已完成；运行中控制台自动最小化让出桌面、结束/暂停/等待确认时恢复（TECH_DESIGN 4.19）；右上 HUD 与 `WDA_EXCLUDEFROMCAPTURE` 双后端实测尚未完成。
 >
-> **浏览器功能（内置浏览器通道）已接入执行链路**：支持 Microsoft Edge、Google Chrome 与内置 Chromium 兜底三种引擎，各用独立 profile（不读取用户日常浏览器数据）；独立进程 + 画面镜像 + 扫码接管，与桌面通道并列而非其子模式，详见 TECH_DESIGN 4.21。驱动方式为**纯 Python 标准库直连 CDP**，不引入 Playwright / Selenium / 任何第三方包。**已完成**：CDP 地基、引擎/会话/观测/输入/镜像六模块、通道抽象与能力路由（`channels.py`）、5 个 `browser.*` 能力契约、审计规则、CLI 与面板接入。2026-11-10 真机实测：启动 722ms、观测 62ms、按序号点击 16ms、中文输入、点击后校验命中、优雅关闭后 profile 保留；Runtime 全链路 5 步 0.9s（TECH_DESIGN 4.22.6）。**未完成**：前端镜像界面、扫码接管编排、内置 Chromium 下载、MCP 更新检测、空闲回收调度。
+> **浏览器功能（内置浏览器通道）已接入执行链路**：支持 Microsoft Edge、Google Chrome 与内置 Chromium 兜底三种引擎，各用独立 profile（不读取用户日常浏览器数据）；独立进程 + 画面镜像 + 扫码接管，与桌面通道并列而非其子模式，详见 TECH_DESIGN 4.21。驱动方式为**纯 Python 标准库直连 CDP**，不引入 Playwright / Selenium / 任何第三方包。**已完成**：CDP 地基、引擎/会话/观测/输入/镜像六模块、通道抽象与能力路由（`channels.py`）、5 个 `browser.*` 能力契约、审计规则、CLI 与面板接入、面板镜像（侧边抽屉 / 全屏视图 / SSE 帧流）。2026-11-10 真机实测：启动 722ms、观测 62ms、按序号点击 16ms、中文输入、点击后校验命中、优雅关闭后 profile 保留；Runtime 全链路 5 步 0.9s（TECH_DESIGN 4.22.6）；面板 SSE 握手 200、首帧即达、退订后停流（4.22.7）。**未完成**：扫码接管编排、内置 Chromium 下载、MCP 更新检测、空闲回收调度、纯浏览器模式。
 > 设计文档：[TECH_DESIGN.md](TECH_DESIGN.md)
 
 ## 1. 已完成
@@ -55,6 +55,7 @@
 | 浏览器通道适配 | `src/xm_agent/browser/channel.py` | 完成 | `browser.open` / `observe` / `act` / `verify` / `session` 五个能力；元素序号 `b0..bn`、登录墙识别、截图落盘、窗口前置、空闲回收；22 个用例 + 真机探针 |
 | 浏览器审计规则 | `src/xm_agent/guard/operation.py`、`auditor.py` | 完成 | 只读能力免审、点击提交类文本复用桌面 effect 规则、非 http 协议标记外部写、高风险点击强制识图复核 |
 | 浏览器通道真机探针 | `scripts/probe_browser_channel.py` | 完成 | 本地静态页跑完 open → observe → click → type → verify → close，13 项断言全通过 |
+| 面板浏览器镜像 | `src/xm_agent/ui/server.py`、`ui/static/browser.js`、`styles.css` | 完成 | `GET /api/browser` 状态、`POST /api/browser` 动作、`GET /api/browser/stream` SSE 帧流；侧边抽屉与全屏（左对话右浏览器）两形态；无人订阅即停流 |
 | 浏览器地基验证脚本 | `scripts/probe_browser_cdp.py` | 已完成使命 | 模块落地前的实测依据，保留作排障工具 |
 
 ### 已接入的第三方 MCP
@@ -75,7 +76,7 @@
 PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 ```
 
-结果：`390 passed`
+结果：`397 passed`
 
 覆盖范围：
 
@@ -114,6 +115,7 @@ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 - 浏览器通道：Observation 形状与桌面对齐、元素序号 `b0..bn` 与坐标还原、截图落盘、登录墙识别（密码框 / URL / 提示文案）与普通页面不误判、点击三种定位、中文输入与回车、选择器未命中报错、等待超时、URL/标题/正文/元素校验、会话 status/handoff/close、空闲回收保留与强制关闭
 - 跨通道端到端：同一任务内先桌面后浏览器，观测源切换正确、浏览器动作后不再截桌面、关闭会话后隐式观测回落桌面而不重启内核
 - 契约：13 项能力 schema 完整、`capabilities_prompt` 按通道过滤
+- 面板浏览器接口：状态查询（启用/未启用）、动作鉴权与未知动作拒绝、帧订阅与退订、队列上限下只留最新帧、伪通道下动作委派
 
 离线 demo：
 
@@ -216,7 +218,7 @@ Xshell MCP（框架保留，本机未安装 Xshell）：
 - [ ] 【浏览器功能】空闲回收调度：`retire_if_idle()` 与 `keep_alive_seconds` 已就位，缺后台定时器周期调用
 - [x] 【浏览器功能】`browser.*` 能力契约与适配器（open / observe / act / verify / session）
 - [x] 【浏览器功能】通道抽象与路由：`channels.py` 按能力名分发，浏览器动作后观测网页、关闭后回落桌面
-- [ ] 【浏览器功能】镜像表层：侧边抽屉、全屏视图（左侧对话列）、可选独立第二窗口（后端帧流已完成，前端组件未做）
+- [x] 【浏览器功能】镜像表层：侧边抽屉、全屏视图（左侧对话列）、SSE 帧流；可选独立第二窗口未做
 - [ ] 【浏览器功能】扫码登录与接管：登录检测、面板提示扫码、会话变化自动续跑、失败不重试轰炸；`ensure_visible()` 已可切可见模式
 - [ ] 【浏览器功能】登录态兜底：`Browser.close` 优雅退出与 `DevToolsActivePort` 残留清理已完成；DPAPI cookie 快照未做
 - [ ] 【浏览器功能】内置 Chromium 纳入资源管理：`kind="browser"`、Chrome for Testing 下载、`start.cmd` 检查、`/json/version` 完整性探针、国内镜像（引擎解析已支持 bundled 路径）

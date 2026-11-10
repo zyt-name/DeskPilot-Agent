@@ -1292,7 +1292,7 @@ resources ensure（MCP，已有）
 
 > **模块标记：浏览器功能（Browser Channel）· P1 上半**
 >
-> 状态：**已实现并真机自测**。`src/xm_agent/channels.py`（通道契约与 Hub）、`src/xm_agent/browser/channel.py`（浏览器通道）、5 个 `browser.*` 能力契约、guard 规则、CLI 与面板接入均已完成。前端镜像、扫码接管、资源管理、更新检测仍属后续阶段。
+> 状态：**已实现并真机自测**。`src/xm_agent/channels.py`（通道契约与 Hub）、`src/xm_agent/browser/channel.py`（浏览器通道）、5 个 `browser.*` 能力契约、guard 规则、CLI 与面板接入、面板镜像（抽屉 + 全屏视图 + SSE 帧流）均已完成。扫码接管编排、资源管理、更新检测、纯浏览器模式仍属后续阶段。
 
 #### 4.22.1 为什么必须先做这一层
 
@@ -1393,13 +1393,39 @@ Runtime 全链路（真实浏览器 + 桌面 MockAdapter，5 步任务）：
 总计 0.9 s；桌面只被观测 1 次
 ```
 
-#### 4.22.7 未完成（按依赖顺序）
+#### 4.22.7 镜像与界面（抽屉 / 全屏）
 
-1. **前端镜像**：侧边抽屉 + 全屏视图（左侧对话列），接 `Page.startScreencast`。基础设施 `mirror.py` 已就绪，缺的是 HTTP 通道与前端。
-2. **扫码接管**：`login_wall` 已能识别，`handoff` 已能把窗口前置；还差「识别到登录墙 → 自动 handoff + 暂停等用户」的服务端编排。
-3. **内置 Chromium 下载与资源管理**：`kind="browser"` 的 manifest、镜像源、断点续传、启动探针（4.21 已写清约定，代码未写）。
-4. **MCP 资源更新检测**：查 GitHub release、版本比较、兼容性判定。
-5. **空闲回收调度**：`retire_if_idle()` 已实现，缺一个后台定时器周期性调用。
+后端只认一个开关：**有人订阅就出帧，没人看就停流**。
+
+```text
+GET /api/browser         状态：引擎、URL、标题、是否镜像、累计帧数
+POST /api/browser        open(url) / handoff / close
+GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
+```
+
+`BrowserChannel.subscribe(callback)` 记录订阅者，必要时调 `Page.startScreencast`；`unsubscribe` 到零就 `stop_mirror()`。帧在 CDP 读线程里回调，面板侧队列只留最新几帧——用户看的是「现在」，积压只会让延迟越滚越大。
+
+界面上有两个形态，同一个 DOM，只换 CSS 布局：
+
+| 形态 | 布局 | 用途 |
+|---|---|---|
+| 抽屉（默认） | 绝对定位覆盖在任务页右侧，宽 `min(52vw, 680px)` | 边聊边看，任务页不被挤压 |
+| 全屏 | `.task-workspace` 改成两列（左对话 320–400px，右浏览器） | 长时间盯页面操作；Esc 退回抽屉 |
+
+交互约定：
+
+- AI 第一次用 `browser.*` 时自动展开抽屉一次；用户手动收起后不再自动弹出（尊重「我看完了」）。
+- 头部三个按钮：显示真实窗口（handoff，扫码用）、全屏、收起。收起不影响 AI 继续运行。
+- 空态给出地址输入框，可直接打开一个页面——用户手动动作是显式的，不会被当成 AI 行为。
+- 静止页面不出新帧是 CDP 的正常行为（`screencastFrame` 只在画面变化时触发），所以开流时先塞一张静态截图，避免面板一片空白。
+
+#### 4.22.8 未完成（按依赖顺序）
+
+1. **扫码接管编排**：`login_wall` 已能识别，`handoff` 已能把窗口前置；还差「识别到登录墙 → 自动 handoff + 暂停等用户」的服务端闭环。
+2. **内置 Chromium 下载与资源管理**：`kind="browser"` 的 manifest、镜像源、断点续传、启动探针（4.21 已写清约定，代码未写）。
+3. **MCP 资源更新检测**：查 GitHub release、版本比较、兼容性判定。
+4. **空闲回收调度**：`retire_if_idle()` 已实现并被每次任务启动时调用一次，缺一个后台定时器持续巡检。
+5. **纯浏览器模式**：当前浏览器通道与桌面后端并行，任务仍会让出桌面；要完全「不抢屏」，需要允许不挂载桌面通道。
 
 ---
 
@@ -1547,7 +1573,7 @@ Runtime 全链路（真实浏览器 + 桌面 MockAdapter，5 步任务）：
 | 面板其余页面（总览 / AI 模型 / 用量 / 历史 / 设置，饼图与资源悬浮窗） | `src/xm_agent/ui/static/` | 完成 |
 | 数据保留清理（审计 JSONL 与截图按天清理、`cleanup` CLI、启动调度） | `src/xm_agent/maintenance.py`、`src/xm_agent/cli.py` | 完成，dry-run 与保留期下限测试通过 |
 | 只读探测脚本（`tools/list`、`Snapshot`、Computer-Use 截图、Xshell 状态） | `scripts/probe_windows_mcp.py`、`scripts/probe_computer_use_mcp.py`、`scripts/probe_xshell_mcp.py` | Windows 端到端只读已验；其余待构建/环境 |
-| 测试（pytest，390 项） | `tests/` | 通过 |
+| 测试（pytest，397 项） | `tests/` | 通过 |
 | 无依赖假 MCP Server（覆盖 12 个工具，用于协议联调） | `examples/fake_mcp_server.py` | 完成 |
 
 ### 6.2 待完成
@@ -1569,7 +1595,7 @@ Runtime 全链路（真实浏览器 + 桌面 MockAdapter，5 步任务）：
 | ~~P0~~ | 顶层 AI 审计（操作描述符、盲审、失败关闭、执行前复核） | 已完成：敏感操作先规则后盲审；模型不可用或异常时升级用户确认 |
 | ~~P0~~ | 用户审计模式（AI 审计 / 执行前询问）与确认弹窗 | 已完成：两种模式可切换；批准仅对当前步骤生效 |
 | ~~P0~~ | 登录阻塞与用户接管 | 已完成：无凭据时 `task.await_user` 中止；UIA 登录页确定性兜底；同会话「继续」沿用原目标并从当前屏幕恢复，队列透传用户消息与上下文 |
-| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入。待完成：前端镜像界面、扫码接管编排、内置 Chromium 纳入资源完整性、资源更新检测、空闲回收调度 |
+| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入、面板镜像（抽屉 / 全屏 / SSE 帧流）。待完成：扫码接管编排、内置 Chromium 纳入资源完整性、资源更新检测、空闲回收调度、纯浏览器模式 |
 | P1 | 非标准登录页识别（验证码 / 二次验证 / 纯图形） | 视觉模型判定并请求用户接管；无法判定时不得绕过或猜测 |
 | P1 | 凭据安全输入 | 密码不进入任务目标、会话记录与审计日志；接入系统凭据存储 |
 | P1 | 审计决策面板、Token 统计与回放 | 缓存已实现；模型/耗时/用户决定的统计与回放待做 |

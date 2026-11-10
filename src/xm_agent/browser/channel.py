@@ -10,13 +10,17 @@
 
 from __future__ import annotations
 
+import base64
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..channels import BROWSER_KIND
 from ..types import Element, Observation, Receipt, Verification
 from .session import BrowserSession, BrowserSettings, Page
+
+FrameCallback = Callable[[str, dict[str, Any]], None]
 
 CAPABILITIES = frozenset(
     {
@@ -91,6 +95,79 @@ class BrowserChannel:
             if keep_alive_seconds is None
             else int(keep_alive_seconds)
         )
+        self._frame_lock = threading.Lock()
+        self._frame_seq = 0
+        self._frame_subscribers: dict[int, FrameCallback] = {}
+        self._frames_sent = 0
+
+    # ------------------------------------------------------------ 镜像订阅
+    def subscribe(self, callback: FrameCallback) -> int:
+        """订阅画面帧。回调收到 (data_url, meta)，在 CDP 读线程里调用。
+
+        面板打开才订阅，关掉就退订并停流——镜像不该在没人看的时候烧 CPU。
+        """
+        with self._frame_lock:
+            self._frame_seq += 1
+            sid = self._frame_seq
+            self._frame_subscribers[sid] = callback
+        self._sync_mirror()
+        return sid
+
+    def unsubscribe(self, subscriber_id: int) -> None:
+        with self._frame_lock:
+            self._frame_subscribers.pop(subscriber_id, None)
+            idle = not self._frame_subscribers
+        if idle:
+            self._stop_mirror()
+
+    @property
+    def mirror_active(self) -> bool:
+        with self._frame_lock:
+            subscribed = bool(self._frame_subscribers)
+        return subscribed and self.started
+
+    @property
+    def frames_sent(self) -> int:
+        return self._frames_sent
+
+    def _sync_mirror(self) -> None:
+        with self._frame_lock:
+            wanted = bool(self._frame_subscribers)
+        if not wanted or not self.started:
+            return
+        try:
+            self.page().start_mirror(
+                on_frame=self._on_frame,
+                fps=self.settings.mirror_fps,
+                quality=55,
+            )
+        except Exception:  # noqa: BLE001 - 镜像失败不该影响任务
+            pass
+
+    def _stop_mirror(self) -> None:
+        page = self._page
+        if page is None:
+            return
+        try:
+            page.stop_mirror()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_frame(self, data: bytes, meta: dict[str, Any]) -> None:
+        if not data:
+            return
+        try:
+            url = "data:image/jpeg;base64," + base64.b64encode(data).decode()
+        except Exception:  # noqa: BLE001
+            return
+        with self._frame_lock:
+            subscribers = list(self._frame_subscribers.values())
+        self._frames_sent += 1
+        for callback in subscribers:
+            try:
+                callback(url, meta or {})
+            except Exception:  # noqa: BLE001 - 单个订阅者出错不影响其他
+                pass
 
     # ------------------------------------------------------------ 会话
     def session(self) -> BrowserSession:
@@ -133,6 +210,8 @@ class BrowserChannel:
             "last_used": round(time.time() - self._last_used, 1)
             if self._last_used
             else None,
+            "mirror": self.mirror_active,
+            "frames": self._frames_sent,
         }
 
     # ------------------------------------------------------------ 观测
@@ -277,6 +356,7 @@ class BrowserChannel:
         if args.get("wait_loaded", True):
             self.page().wait_loaded(timeout=float(args.get("timeout_s") or 20))
         self._last_used = time.time()
+        self._sync_mirror()
         page = self.page()
         return Receipt(
             True,
@@ -466,6 +546,8 @@ class BrowserChannel:
         return True
 
     def close(self) -> None:
+        with self._frame_lock:
+            self._frame_subscribers.clear()
         page, self._page = self._page, None
         session, self._session = self._session, None
         if page is not None:

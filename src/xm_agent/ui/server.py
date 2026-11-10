@@ -186,6 +186,58 @@ class UiServer:
         self._thread.start()
         return f"http://{self.host}:{self.port}/"
 
+    def browser_snapshot(self) -> dict[str, Any]:
+        channel = self.browser
+        if channel is None:
+            return {"enabled": False, "started": False}
+        data = channel.status()
+        data["enabled"] = True
+        return data
+
+    def browser_action(
+        self, action: str, url: str = ""
+    ) -> dict[str, Any]:
+        channel = self.browser
+        if channel is None:
+            return {"ok": False, "error": "浏览器通道未启用"}
+        name = str(action or "").strip().lower()
+        if name == "open":
+            receipt = channel.execute(
+                "browser.open", {"url": url or "about:blank"}
+            )
+        elif name in {"handoff", "close"}:
+            receipt = channel.execute("browser.session", {"action": name})
+        else:
+            return {"ok": False, "error": f"未知动作: {name}"}
+        data = dict(receipt.detail or {})
+        data["ok"] = receipt.ok
+        if receipt.error:
+            data["error"] = receipt.error
+        return data
+
+    def browser_frames(
+        self,
+    ) -> tuple[int, queue_module.Queue] | tuple[None, None]:
+        """给 SSE 连接挂一个帧订阅，返回 (订阅号, 帧队列)。"""
+        channel = self.browser
+        if channel is None:
+            return None, None
+        frames: queue_module.Queue = queue_module.Queue(maxsize=4)
+
+        def push(data_url: str, meta: dict[str, Any]) -> None:
+            # 只留最新几帧：用户看的是「现在」，积压只会制造延迟
+            if frames.full():
+                try:
+                    frames.get_nowait()
+                except queue_module.Empty:
+                    pass
+            try:
+                frames.put_nowait((data_url, meta))
+            except queue_module.Full:
+                pass
+        subscriber = channel.subscribe(push)
+        return subscriber, frames
+
     def _hub_for(self, adapter: Any) -> ChannelHub:
         hub = ChannelHub(desktop=adapter)
         with self._browser_lock:
@@ -1726,6 +1778,12 @@ def _make_handler(app: UiServer):
             if path == "/api/events":
                 self._events(query)
                 return
+            if path == "/api/browser":
+                self._json(app.browser_snapshot())
+                return
+            if path == "/api/browser/stream":
+                self._browser_stream(query)
+                return
             if path == "/api/runs":
                 self._json({"runs": app.storage.list_runs(20)})
                 return
@@ -1778,9 +1836,11 @@ def _make_handler(app: UiServer):
 
         def do_POST(self) -> None:  # noqa: N802
             if not self._host_ok():
+                self._drain_body()
                 self._json({"error": "invalid host"}, 403)
                 return
             if self.headers.get("X-XM-Token") != app.token:
+                self._drain_body()
                 self._json({"error": "missing or invalid token"}, 401)
                 return
             path = urlparse(self.path).path
@@ -1807,6 +1867,14 @@ def _make_handler(app: UiServer):
                         resume=bool(body.get("resume")),
                     )
                     self._json(result, 202)
+                    return
+                if path == "/api/browser":
+                    self._json(
+                        app.browser_action(
+                            str(body.get("action") or ""),
+                            str(body.get("url") or ""),
+                        )
+                    )
                     return
                 if path == "/api/audit/model":
                     provider_id = str(body.get("provider_id") or "")
@@ -1960,6 +2028,48 @@ def _make_handler(app: UiServer):
                 return
             self._json({"error": "not found"}, 404)
 
+        def _browser_stream(self, query: dict[str, list[str]]) -> None:
+            """浏览器画面流。只在抽屉/全屏视图打开时连接，断开即停流。"""
+            token = (query.get("token") or [""])[0]
+            if token != app.token:
+                self._json({"error": "invalid token"}, 401)
+                return
+            subscriber, frames = app.browser_frames()
+            if subscriber is None or frames is None:
+                self._json({"error": "browser channel disabled"}, 404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                self._sse_write(
+                    {"event": "browser_ready", "payload": app.browser_snapshot()}
+                )
+                while True:
+                    try:
+                        data_url, meta = frames.get(timeout=15.0)
+                    except queue_module.Empty:
+                        self._sse_write({"event": "browser_ping", "payload": {}})
+                        continue
+                    self._sse_write(
+                        {
+                            "event": "browser_frame",
+                            "payload": {
+                                "image": data_url,
+                                "ts": (meta or {}).get("timestamp"),
+                            },
+                        }
+                    )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                channel = app.browser
+                if channel is not None:
+                    channel.unsubscribe(subscriber)
+
         def _events(self, query: dict[str, list[str]]) -> None:
             token = (query.get("token") or [""])[0]
             if token != app.token:
@@ -2072,6 +2182,38 @@ def _make_handler(app: UiServer):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(data)
+
+        def _drain_body(self) -> None:
+            """把请求体读干净再回错误。
+
+            不读就关连接，客户端可能还没发完 body，会收到 TCP RST
+            （表现为 ConnectionAbortedError 而不是干净的 401）。
+            """
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if 0 < length <= _MAX_BODY:
+                try:
+                    self.rfile.read(length)
+                except OSError:
+                    pass
+
+        def _drain_body(self) -> None:
+            """把请求体读干净再回错误。
+
+            不读就关连接，客户端可能还没发完 body，会收到 TCP RST
+            （表现为 ConnectionAbortedError 而不是干净的 401）。
+            """
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if 0 < length <= _MAX_BODY:
+                try:
+                    self.rfile.read(length)
+                except OSError:
+                    pass
 
         def _json(self, payload: Any, status: int = 200) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
