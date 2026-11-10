@@ -57,6 +57,7 @@ _ASSETS = {
     "/index.html": "index.html",
     "/static/app.js": "app.js",
     "/static/task.js": "task.js",
+    "/static/browser.js": "browser.js",
     "/static/styles.css": "styles.css",
 }
 _MAX_BODY = 64 * 1024

@@ -1531,6 +1531,42 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 
 **已知限制**：MCP 资源升级后，`config/agent.example.toml` 里的 `command` 仍写稳定入口（`vendor/Windows-MCP/...`），junction 换向即生效，配置不用改；但如果用户在配置里把路径写死成版本化目录，升级与探针都会落到那个固定目录上，等于绕开这套机制——升级后请在配置里保留稳定入口。
 
+#### 4.22.16 断线自愈与面板资源（真机反馈修复）
+
+用户自测「搜索自如官网」时第 1 步执行成功、第 2 步直接 `observation failed: 连接已关闭: 读线程退出: timed out`，同时面板上的浏览器按钮点了没反应。两处都是真 bug，根因互不相关：
+
+**① socket 读超时被当成断线**（`browser/cdp.py`）
+`socket.create_connection(..., timeout=connect_timeout)` 把超时同时设成了**每次 recv 的等待上限**。CDP 是事件流，页面静止时浏览器一条消息都不推，于是读线程在 `recv` 上超时 → 抛 `socket.timeout` → `except Exception` 把它当致命错误 → `_fail_all()` 把连接判死。此后每次 `call()` 都在入口直接抛「连接已关闭」，一次抖动就等于整条任务报废。
+
+修法是**把超时下沉到 `_read_exact`**：`recv` 超时就 `continue` 等下一批字节。位置很关键——如果在外层 `_read_frame` 捕获超时，已经消费掉的帧头会丢，下次从头解析会把载荷当帧头，直接把流读花；放在 `_read_exact` 里则保留半帧数据继续读，帧边界不会错。
+
+**② 连接/页面不自愈**（`browser/session.py`、`browser/channel.py`）
+连接一断就没有回头路：`start()` 见到进程还活着就直接 return，`_ensure_conn()` 于是拿回那条死连接。现在分三层：
+
+| 层次 | 行为 |
+|---|---|
+| `live_connection()` | 连接活着直接返回；断了用同一内核的 `ws_url` 原地重连并重新 attach 已有标签页；内核也没了就整套重启 |
+| `reconnect_locked()` | 先停镜像 → 新建连接 → 换掉旧连接 → 按 `target_id` 重新 attach → 按原参数重启镜像（`on_frame` 保持不变，面板不断流） |
+| `Page.call()` | 命中「连接已关闭」重连一次；命中 `Session with given id not found`（内核重启过）按 target 重挂一次；重挂不上且页面已不属于会话 → 抛 `BrowserError`，由通道放下旧页面重来一次 |
+
+`Page.conn` 现在返回活连接，`snapshot`/`input` 这些辅助模块收到的是 `_PageLink` 代理（只包一个 `call`），所以截图、快照、点击、输入**全部**自动获得自愈能力，不用在每个模块里各写一遍重试。
+
+**③ 面板资源漏登记**（`ui/server.py`）
+`index.html` 里引了 `/static/browser.js`，但 `_ASSETS` 没登记 → 404 → `browser.js` 从未执行 → 按钮永远 `hidden`（点不到），抽屉、SSE、镜像全是死代码。加一行登记，并补了一条「按 index.html 里的引用逐个请求，都必须 200」的用例——这类错误只有在这个层面才拦得住。
+
+顺带修掉两处：`BrowserChannel.status()` 取 url/title 不再向上抛（面板每 2.5s 轮询一次，抛一次就把整个浏览器区域打没）；状态栏原来显示成「… · 无头 · 无头」（description 已含模式又拼了一次）。
+
+**实测（2026-11-10，Edge 157.0.4341.42）**：
+
+| 场景 | 结果 |
+|---|---|
+| 空闲 30s 后调用 | 连接仍在（`closed=False`），`title` 正常返回 |
+| 强制 `conn.close()` | 原地重连，内核 pid 不变，原标签页照常可用，还能新开页面 |
+| 内核被 `kill()` | 下一次观测自动重启内核并成功返回（页面回到 `about:blank`，由 ReAct 循环重新打开） |
+| 面板 | 任务页点按钮抽屉滑出（653×708），SSE 首帧落到 canvas（1256×708），状态栏不再重复「无头」 |
+
+`tests/test_browser_cdp.py` 4 项（纯单元，含「超时后仍能收到回包」）、`tests/test_browser_session.py` 3 项真机（空闲 / 断连 / 内核死亡）、`tests/test_browser_ui.py` 2 项静态资源。
+
 ---
 
 ## 5. 桌面端形态与分发（后期）

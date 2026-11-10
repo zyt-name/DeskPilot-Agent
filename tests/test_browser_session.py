@@ -249,3 +249,68 @@ def test_graceful_close_keeps_login_state(tmp_path):
     finally:
         second.close()
         server.shutdown()
+
+
+def test_idle_longer_than_socket_timeout_keeps_connection(tmp_path, page_url):
+    """空闲超过 socket 读超时不能把连接判死。
+
+    真机现场：任务第 1 步执行成功，模型想了二十来秒，第 2 步观测就报
+    「连接已关闭: 读线程退出: timed out」，之后整任务全废。
+    """
+    settings = BrowserSettings(
+        profile_root=str(tmp_path / "idle"),
+        headless="always",
+        connect_timeout=1.5,
+    )
+    session = BrowserSession(settings, headless=True)
+    try:
+        page = session.open(page_url)
+        time.sleep(3.5)
+        assert session.conn is not None
+        assert session.conn.closed is False, session.conn._error
+        assert page.title == "探针页"
+        assert session.conn.closed is False
+    finally:
+        session.close()
+
+
+def test_reconnects_in_place_when_connection_drops(tmp_path, page_url):
+    """连接断了要原地重连：内核不重启、页面不丢、Cookie 不丢。"""
+    settings = BrowserSettings(
+        profile_root=str(tmp_path / "reconnect"), headless="always"
+    )
+    session = BrowserSession(settings, headless=True)
+    try:
+        page = session.open(page_url)
+        pid = session.process.proc.pid
+        session.conn.close()
+        assert session.conn.closed is True
+
+        assert session.page_urls() == [page_url]
+        assert session.conn.closed is False
+        assert session.process.proc.pid == pid, "不该为此重启内核"
+        assert page.title == "探针页", "重连后原标签页应继续可用"
+    finally:
+        session.close()
+
+
+def test_channel_recovers_after_kernel_death(tmp_path, page_url):
+    """内核被外面杀掉时，通道要能自己拉起来而不是每步都报错。"""
+    from xm_agent.browser.channel import BrowserChannel
+
+    channel = BrowserChannel(
+        BrowserSettings(profile_root=str(tmp_path / "killed"), headless="always")
+    )
+    try:
+        assert channel.execute("browser.open", {"url": page_url}).ok is True
+        session = channel._session
+        assert session is not None
+        old_pid = session.process.proc.pid
+
+        session.process.kill()
+        observation = channel.observe(1)
+
+        assert observation.source == "browser"
+        assert session.process.proc.pid != old_pid, "应当重新拉起内核"
+    finally:
+        channel.close()

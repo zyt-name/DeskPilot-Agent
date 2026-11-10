@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,37 @@ class BrowserSettings:
     connect_timeout: float = 20.0
 
 
+class _PageLink:
+    """把一个标签页包成「像 CdpConnection 一样」的对象。
+
+    `snapshot` / `input` 只用到 `call(method, params, session_id, timeout)`，
+    传这个代理进去，它们就顺带获得了断线重连与 session 失效重挂的能力，
+    不用在每个辅助模块里各写一遍重试。
+    """
+
+    __slots__ = ("_page",)
+
+    def __init__(self, page: "Page") -> None:
+        self._page = page
+
+    def call(
+        self,
+        method: str,
+        params: dict | None = None,
+        session_id: str | None = None,
+        timeout: float | None = None,
+    ) -> dict:
+        return self._page.call(method, params or {}, timeout=timeout or 20.0)
+
+
+# CDP 在「浏览器重启过 / 页面被重新 attach」后的典型报错
+_STALE_SESSION = (
+    "Session with given id not found",
+    "No session with given id",
+    "Session closed",
+)
+
+
 class Page:
     """一个标签页。所有坐标都是视口坐标。"""
 
@@ -46,31 +78,72 @@ class Page:
         self.target_id = target_id
         self.cdp_session = cdp_session
         self._screencast: ScreencastStream | None = None
+        self._link = _PageLink(self)
 
     # ---------------------------------------------------------------- 基础
     @property
     def conn(self) -> CdpConnection:
-        return self._session.conn
+        """拿一条活着的连接（镜像与关闭需要真的连接对象）。
+
+        断了就先重连，内核没了就重启——所以断线自愈对所有调用点都生效。
+        """
+        return self._session.live_connection()
 
     def call(self, method: str, params: dict | None = None, timeout: float = 20.0) -> dict:
-        return self.conn.call(method, params, self.cdp_session, timeout=timeout)
+        conn = self._session.live_connection()
+        try:
+            return conn.call(method, params, self.cdp_session, timeout=timeout)
+        except CdpError as exc:
+            detail = str(exc)
+            if "连接已关闭" in detail:
+                # 连接断了（socket 被回收、内核重启）：重连一次再试。
+                # 不重试的话一次抖动就让整个任务后半段全部失败。
+                conn = self._session.live_connection()
+                return conn.call(method, params, self.cdp_session, timeout=timeout)
+            if any(mark in detail for mark in _STALE_SESSION):
+                if self.reattach():
+                    conn = self._session.live_connection()
+                    return conn.call(method, params, self.cdp_session, timeout=timeout)
+                if not self._session.owns(self):
+                    # 内核重启过，这个 target 已经不存在；上层换个页面即可
+                    raise BrowserError("页面已失效（浏览器重启过）") from None
+            raise
+
+    def reattach(self) -> bool:
+        """用 target_id 重新 attach 一次，换一个有效的 session id。"""
+        conn = self._session.live_connection()
+        try:
+            attached = conn.call(
+                "Target.attachToTarget",
+                {"targetId": self.target_id, "flatten": True},
+            )
+            self.cdp_session = str(attached.get("sessionId") or "")
+            conn.call("Page.enable", {}, self.cdp_session)
+            conn.call("Runtime.enable", {}, self.cdp_session)
+            conn.call(
+                "Page.setLifecycleEventsEnabled", {"enabled": True}, self.cdp_session
+            )
+        except CdpError:
+            return False
+        self._session._pages[self.target_id] = self
+        return True
 
     @property
     def url(self) -> str:
-        return str(snap.evaluate(self.conn, self.cdp_session, "location.href") or "")
+        return str(snap.evaluate(self._link, self.cdp_session, "location.href") or "")
 
     @property
     def title(self) -> str:
-        return str(snap.evaluate(self.conn, self.cdp_session, "document.title") or "")
+        return str(snap.evaluate(self._link, self.cdp_session, "document.title") or "")
 
     def evaluate(self, expression: str, timeout: float = 20.0) -> Any:
-        return snap.evaluate(self.conn, self.cdp_session, expression, timeout=timeout)
+        return snap.evaluate(self._link, self.cdp_session, expression, timeout=timeout)
 
     # ---------------------------------------------------------------- 观测
     def screenshot(self, quality: int = 70, max_width: int | None = None,
                    full_page: bool = False) -> bytes:
         return snap.capture_screenshot(
-            self.conn,
+            self._link,
             self.cdp_session,
             quality=quality,
             max_width=max_width or self._session.settings.screenshot_max_width,
@@ -78,20 +151,20 @@ class Page:
         )
 
     def elements(self, limit: int = 80) -> list[dict]:
-        return snap.interactive_elements(self.conn, self.cdp_session, limit)
+        return snap.interactive_elements(self._link, self.cdp_session, limit)
 
     def meta(self) -> dict:
-        return snap.page_meta(self.conn, self.cdp_session)
+        return snap.page_meta(self._link, self.cdp_session)
 
     def text(self, limit: int = 1500) -> str:
-        return snap.visible_text(self.conn, self.cdp_session, limit)
+        return snap.visible_text(self._link, self.cdp_session, limit)
 
     def ax(self, limit: int = 120) -> list[dict]:
-        return snap.ax_summary(self.conn, self.cdp_session, limit)
+        return snap.ax_summary(self._link, self.cdp_session, limit)
 
     def snapshot(self, include_screenshot: bool = False, limit: int = 80) -> dict:
         data = snap.page_snapshot(
-            self.conn,
+            self._link,
             self.cdp_session,
             include_screenshot=include_screenshot,
             max_width=self._session.settings.screenshot_max_width,
@@ -102,10 +175,10 @@ class Page:
 
     # ---------------------------------------------------------------- 动作
     def navigate(self, url: str, timeout: float = 20.0) -> None:
-        input_ops.open_url(self.conn, self.cdp_session, url, timeout)
+        input_ops.open_url(self._link, self.cdp_session, url, timeout)
 
     def click(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
-        input_ops.click(self.conn, self.cdp_session, x, y, button=button, clicks=clicks)
+        input_ops.click(self._link, self.cdp_session, x, y, button=button, clicks=clicks)
 
     def bring_to_front(self) -> None:
         """把可见窗口前置到桌面最上层。
@@ -128,27 +201,27 @@ class Page:
         return item
 
     def type_text(self, text: str) -> None:
-        input_ops.type_text(self.conn, self.cdp_session, text)
+        input_ops.type_text(self._link, self.cdp_session, text)
 
     def type_into(self, selector: str, text: str) -> bool:
-        return input_ops.type_into(self.conn, self.cdp_session, selector, text)
+        return input_ops.type_into(self._link, self.cdp_session, selector, text)
 
     def press(self, key: str, modifiers: str = "") -> None:
-        input_ops.press_key(self.conn, self.cdp_session, key, modifiers)
+        input_ops.press_key(self._link, self.cdp_session, key, modifiers)
 
     def scroll(self, delta_y: float = 400, x: float | None = None,
                y: float | None = None) -> None:
         if x is None or y is None:
-            size = snap.viewport(self.conn, self.cdp_session)
+            size = snap.viewport(self._link, self.cdp_session)
             x = (size["width"] or 800) / 2
             y = (size["height"] or 600) / 2
-        input_ops.scroll(self.conn, self.cdp_session, x, y, delta_y)
+        input_ops.scroll(self._link, self.cdp_session, x, y, delta_y)
 
     def wait_text(self, needle: str, timeout: float = 15.0) -> bool:
-        return input_ops.wait_text(self.conn, self.cdp_session, needle, timeout)
+        return input_ops.wait_text(self._link, self.cdp_session, needle, timeout)
 
     def wait_loaded(self, timeout: float = 20.0) -> bool:
-        return input_ops.wait_loaded(self.conn, self.cdp_session, timeout)
+        return input_ops.wait_loaded(self._link, self.cdp_session, timeout)
 
     # ---------------------------------------------------------------- 镜像
     def start_mirror(self, on_frame=None, fps: int | None = None,
@@ -212,6 +285,7 @@ class BrowserSession:
         self._pages: dict[str, Page] = {}
         self._started_at = 0.0
         self._closed = False
+        self._conn_lock = threading.RLock()
 
     # ---------------------------------------------------------------- 生命周期
     @property
@@ -230,8 +304,20 @@ class BrowserSession:
         return self.process is not None and self.process.running and not self._closed
 
     def start(self) -> None:
+        with self._conn_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         if self.started:
-            return
+            if self.conn is not None and not self.conn.closed:
+                return
+            # 内核还活着，只是 CDP 连接断了：先原地重连，比重启便宜得多，
+            # 也不会丢掉已经打开、已经登录的标签页。
+            if self.reconnect_locked():
+                return
+            if self.process is not None:
+                self.process.kill()
+                self.process = None
         self._closed = False
         profile_root = Path(self.settings.profile_root)
         bundled_root = bundled_root_for(profile_root)
@@ -245,7 +331,81 @@ class BrowserSession:
         ws_url = self.process.start(timeout=self.settings.connect_timeout)
         self.conn = CdpConnection(ws_url, timeout=self.settings.connect_timeout)
         self.conn.call("Target.setDiscoverTargets", {"discover": True})
+        # 新进程里旧的 target id 全部失效，页面对象不能再复用
+        self._pages.clear()
         self._started_at = time.time()
+
+    def live_connection(self) -> CdpConnection:
+        """返回一条可用的 CDP 连接；断了就重连，内核没了就整套重启。"""
+        with self._conn_lock:
+            conn = self.conn
+            if conn is not None and not conn.closed:
+                return conn
+            if self._closed:
+                raise BrowserError("会话已关闭")
+            if self.reconnect_locked():
+                assert self.conn is not None
+                return self.conn
+            self._start_locked()
+            assert self.conn is not None
+            return self.conn
+
+    def reconnect_locked(self) -> bool:
+        """用同一个内核重建 CDP 连接，并把已有标签页接回去。"""
+        process = self.process
+        if process is None or not process.running or not process.ws_url:
+            return False
+        old = self.conn
+        # 先停镜像：再往死连接上写帧没有任何意义；重连后按原参数拉起
+        mirrors: dict[str, tuple] = {}
+        for target_id, page in list(self._pages.items()):
+            stream = page.mirror
+            if stream is not None:
+                mirrors[target_id] = (stream.on_frame, stream.fps)
+            page.stop_mirror()
+        try:
+            conn = CdpConnection(process.ws_url, timeout=self.settings.connect_timeout)
+            conn.call("Target.setDiscoverTargets", {"discover": True})
+        except CdpError:
+            return False
+        if old is not None and old is not conn:
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001 - 旧连接收尾失败不影响新连接
+                pass
+        self.conn = conn
+        self._reattach_locked()
+        for target_id, (on_frame, fps) in mirrors.items():
+            page = self._pages.get(target_id)
+            if page is None:
+                continue
+            try:
+                page.start_mirror(on_frame=on_frame, fps=fps)
+            except Exception:  # noqa: BLE001 - 镜像起不来不该影响调用
+                pass
+        return True
+
+    def _reattach_locked(self) -> None:
+        """重连后把已知标签页重新 attach；接不上的丢掉，下次观测会新开。"""
+        conn = self.conn
+        if conn is None:
+            return
+        for target_id, page in list(self._pages.items()):
+            try:
+                attached = conn.call(
+                    "Target.attachToTarget",
+                    {"targetId": target_id, "flatten": True},
+                )
+                page.cdp_session = str(attached.get("sessionId") or "")
+                conn.call("Page.enable", {}, page.cdp_session)
+                conn.call("Runtime.enable", {}, page.cdp_session)
+                conn.call(
+                    "Page.setLifecycleEventsEnabled",
+                    {"enabled": True},
+                    page.cdp_session,
+                )
+            except CdpError:
+                self._pages.pop(target_id, None)
 
     def ensure_visible(self) -> bool:
         """登录需要看真窗口时切到可见模式。返回是否发生了重启。"""
@@ -265,17 +425,16 @@ class BrowserSession:
 
     # ---------------------------------------------------------------- 标签页
     def new_page(self, url: str = "about:blank") -> Page:
-        self._ensure_conn()
-        assert self.conn is not None
-        target = self.conn.call("Target.createTarget", {"url": url})
+        conn = self.live_connection()
+        target = conn.call("Target.createTarget", {"url": url})
         target_id = target.get("targetId", "")
-        attached = self.conn.call(
+        attached = conn.call(
             "Target.attachToTarget", {"targetId": target_id, "flatten": True}
         )
         cdp_session = attached.get("sessionId", "")
-        self.conn.call("Page.enable", {}, cdp_session)
-        self.conn.call("Runtime.enable", {}, cdp_session)
-        self.conn.call("Page.setLifecycleEventsEnabled", {"enabled": True}, cdp_session)
+        conn.call("Page.enable", {}, cdp_session)
+        conn.call("Runtime.enable", {}, cdp_session)
+        conn.call("Page.setLifecycleEventsEnabled", {"enabled": True}, cdp_session)
         page = Page(self, target_id, cdp_session)
         self._pages[target_id] = page
         return page
@@ -286,10 +445,10 @@ class BrowserSession:
         return page
 
     def page_urls(self) -> list[str]:
-        assert self.conn is not None
         try:
-            targets = self.conn.call("Target.getTargets").get("targetInfos", [])
-        except CdpError:
+            conn = self.live_connection()
+            targets = conn.call("Target.getTargets").get("targetInfos", [])
+        except (BrowserError, CdpError):
             return []
         return [
             str(t.get("url", ""))
@@ -300,6 +459,10 @@ class BrowserSession:
     @property
     def pages(self) -> list[Page]:
         return list(self._pages.values())
+
+    def owns(self, page: Page) -> bool:
+        """这个页面对象还属于当前会话吗（内核重启后旧对象就失效了）。"""
+        return self._pages.get(page.target_id) is page
 
     def first_page(self) -> Page:
         if self._pages:
@@ -313,42 +476,41 @@ class BrowserSession:
     # ---------------------------------------------------------------- 关闭
     def close(self, reason: str = "用户关闭") -> None:
         """优雅关闭：`Browser.close` → 等进程退出 → 释放锁。"""
-        if self._closed:
-            return
-        for page in list(self._pages.values()):
-            page.stop_mirror()
-        self._pages.clear()
-        if self.conn is not None and not self.conn.closed:
-            try:
-                self.conn.call("Browser.close", {}, timeout=10.0)
-            except Exception:
-                pass
-            self.conn.close()
-        self.conn = None
-        if self.process is not None:
-            self.process.close(graceful=True, timeout=15.0)
-            self.process = None
-        self._closed = True
+        with self._conn_lock:
+            if self._closed:
+                return
+            for page in list(self._pages.values()):
+                page.stop_mirror()
+            self._pages.clear()
+            if self.conn is not None and not self.conn.closed:
+                try:
+                    self.conn.call("Browser.close", {}, timeout=10.0)
+                except Exception:
+                    pass
+                self.conn.close()
+            self.conn = None
+            if self.process is not None:
+                self.process.close(graceful=True, timeout=15.0)
+                self.process = None
+            self._closed = True
 
     def kill(self) -> None:
         """强制收尾，只在优雅关闭失败时用（会丢未落盘的登录态）。"""
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-            self.conn = None
-        if self.process is not None:
-            self.process.kill()
-            self.process = None
-        self._pages.clear()
-        self._closed = True
+        with self._conn_lock:
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+            if self.process is not None:
+                self.process.kill()
+                self.process = None
+            self._pages.clear()
+            self._closed = True
 
     def _ensure_conn(self) -> None:
-        if self._closed:
-            raise BrowserError("会话已关闭")
-        if self.conn is None or self.conn.closed:
-            self.start()
+        self.live_connection()
 
     # ---------------------------------------------------------------- 状态
     def stats(self) -> SessionStats:

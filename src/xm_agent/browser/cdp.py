@@ -110,7 +110,14 @@ class CdpConnection:
 
     def _read_exact(self, count: int) -> bytes:
         while len(self._buf) < count:
-            chunk = self._sock.recv(65536)
+            try:
+                chunk = self._sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                # 空闲不是错误。页面静止时浏览器一分钟也不推一条消息，
+                # 把读超时当断线会连带毁掉整条连接（真机现场：用户想几秒
+                # 问题，之后的每次调用都报「连接已关闭」）。半帧数据在
+                # _buf 里，接着等下一批字节即可。
+                continue
             if not chunk:
                 raise CdpError("连接已关闭")
             self._buf += chunk

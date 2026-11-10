@@ -48,8 +48,8 @@
     if (started) {
       setText("browser-title", data.title || "浏览器");
       setText("browser-url", data.url || "");
-      const mode = data.headless ? "无头" : "可见窗口";
-      setText("browser-status", `${data.description || ""} · ${mode}`);
+      // description 里已经带「无头 / 可见窗口」，不要再拼一次
+      setText("browser-status", data.description || "");
       setDot(data.mirror ? "live" : "on");
       el("browser-empty").classList.add("hidden");
     } else {

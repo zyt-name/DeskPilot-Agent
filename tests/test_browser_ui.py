@@ -263,3 +263,38 @@ def test_reaper_noop_when_browser_disabled(tmp_path):
     )
     assert app.browser is None
     assert app._tick_browser_reaper() is False
+
+
+
+# ---------------------------------------------------------------- 静态资源
+# 真机踩过：index.html 引了 /static/browser.js，但 _ASSETS 里没登记，
+# 于是脚本 404、浏览器按钮永远不出现。这类错误只能在「引用了就取得到」
+# 这一层拦住，所以直接按 index.html 里的引用逐个请求。
+def _raw(url: str) -> tuple[int, bytes]:
+    """取原始响应体：静态资源不是 JSON，不能走 _request。"""
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def test_every_script_and_style_in_index_is_served(server):
+    import re
+
+    _app, url = server
+    code, body = _raw(url)
+    assert code == 200
+    html = body.decode("utf-8")
+    refs = set(re.findall(r'(?:src|href)="(/static/[^"]+)"', html))
+    assert refs, "index.html 没有引用任何静态资源，测试失去意义"
+    for ref in sorted(refs):
+        code, _ = _raw(url.rstrip("/") + ref)
+        assert code == 200, f"{ref} 没有被面板提供（_ASSETS 漏登记）"
+
+
+def test_browser_view_script_is_served(server):
+    _app, url = server
+    code, body = _raw(url + "static/browser.js")
+    assert code == 200
+    assert b"browserView" in body

@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from ..channels import BROWSER_KIND
 from ..types import Element, Observation, Receipt, Verification
+from .engine import BrowserError
 from .session import BrowserSession, BrowserSettings, Page
 
 FrameCallback = Callable[[str, dict[str, Any]], None]
@@ -179,6 +180,11 @@ class BrowserChannel:
 
     def page(self) -> Page:
         session = self.session()
+        owns = getattr(session, "owns", None)
+        if self._page is not None and callable(owns) and not owns(self._page):
+            # 内核重启过，旧页面对象已经失效；重新取一个，否则后面每次
+            # 调用都会报「Session with given id not found」。
+            self._page = None
         if self._page is None:
             first = getattr(session, "first_page", None)
             self._page = first() if callable(first) else session.new_page()
@@ -206,6 +212,18 @@ class BrowserChannel:
         assert self._session is not None
         stats = self._session.stats()
         page = self._page
+        # 面板每 2.5s 轮询一次：这里任何异常都会让「浏览器」按钮整块消失，
+        # 所以取不到的字段宁可空着，也不能把状态接口打成 500。
+        url = title = ""
+        if page is not None:
+            try:
+                url = page.url
+            except Exception:  # noqa: BLE001
+                url = ""
+            try:
+                title = page.title
+            except Exception:  # noqa: BLE001
+                title = ""
         return {
             "started": True,
             "description": self._session.description(),
@@ -213,8 +231,8 @@ class BrowserChannel:
             "version": stats.version,
             "headless": stats.headless,
             "pages": stats.pages,
-            "url": page.url if page else "",
-            "title": page.title if page else "",
+            "url": url,
+            "title": title,
             "last_used": round(time.time() - self._last_used, 1)
             if self._last_used
             else None,
@@ -224,6 +242,16 @@ class BrowserChannel:
 
     # ------------------------------------------------------------ 观测
     def observe(
+        self, step: int, include_screenshot: bool = False
+    ) -> Observation:
+        try:
+            return self._observe(step, include_screenshot)
+        except BrowserError:
+            # 页面对象随内核重启失效：换一个页面再来一次，别把任务判死
+            self._page = None
+            return self._observe(step, include_screenshot)
+
+    def _observe(
         self, step: int, include_screenshot: bool = False
     ) -> Observation:
         page = self.page()
@@ -327,25 +355,35 @@ class BrowserChannel:
     # ------------------------------------------------------------ 执行
     def execute(self, capability: str, args: dict[str, Any]) -> Receipt:
         try:
-            if capability == "browser.open":
-                return self._open(args)
-            if capability == "browser.observe":
-                observation = self.observe(
-                    0, include_screenshot=bool(args.get("include_screenshot"))
-                )
-                return Receipt(True, observation.to_dict())
-            if capability == "browser.act":
-                return self._act(args)
-            if capability == "browser.verify":
-                verification = self.verify(args)
-                return Receipt(
-                    verification.ok, verification.to_dict(), verification.detail
-                )
-            if capability == "browser.session":
-                return self._session_op(args)
-            return Receipt(False, error=f"浏览器通道不支持 {capability}")
+            return self._execute(capability, args)
+        except BrowserError:
+            # 页面失效（内核重启过）：放下旧页面重来一次
+            self._page = None
+            try:
+                return self._execute(capability, args)
+            except Exception as exc:  # noqa: BLE001
+                return Receipt(False, error=f"{exc.__class__.__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001 - 统一转成回执，不抛给循环
             return Receipt(False, error=f"{exc.__class__.__name__}: {exc}")
+
+    def _execute(self, capability: str, args: dict[str, Any]) -> Receipt:
+        if capability == "browser.open":
+            return self._open(args)
+        if capability == "browser.observe":
+            observation = self.observe(
+                0, include_screenshot=bool(args.get("include_screenshot"))
+            )
+            return Receipt(True, observation.to_dict())
+        if capability == "browser.act":
+            return self._act(args)
+        if capability == "browser.verify":
+            verification = self.verify(args)
+            return Receipt(
+                verification.ok, verification.to_dict(), verification.detail
+            )
+        if capability == "browser.session":
+            return self._session_op(args)
+        return Receipt(False, error=f"浏览器通道不支持 {capability}")
 
     def _open(self, args: dict[str, Any]) -> Receipt:
         url = str(args.get("url") or "about:blank").strip()
