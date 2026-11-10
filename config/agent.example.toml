@@ -33,6 +33,12 @@ keep_alive_seconds = 300
 mirror_fps = 15
 screenshot_max_width = 1280
 connect_timeout = 20.0
+# 无头模式原生 UA 带 HeadlessChrome、navigator.webdriver 为 true，不少站点（自如的
+# 腾讯 EdgeOne 就是）据此直接返回「请求已被拦截」。这两条默认抹掉，浏览器在指纹上
+# 等于普通浏览器；不含任何绕过登录/验证码的行为。
+hide_automation = true
+# 需要固定 UA 时才填；留空 = 按当前内核版本自动生成（可见窗口不覆盖）。
+# user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
 
 [audit]
 root = ".xm-agent/audit"

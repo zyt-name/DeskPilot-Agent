@@ -55,6 +55,21 @@ _LOGIN_TEXT_HINTS = (
 )
 _PASSWORD_ROLES = ("password",)
 
+# 站点安全防护（WAF）拦截页的特征。真机：自如的 EdgeOne 会返回「请求已被拦截」，
+# 页面几乎没内容、也没有可交互元素——和「页面还没渲染完」长得一样，
+# 但重试同一地址永远过不去，得让模型知道换条路，而不是反复刷新。
+_BLOCK_HINTS = (
+    "请求已被拦截",
+    "安全策略拦截",
+    "已启用安全防护",
+    "edgeone 提供防护",
+    "访问被拒绝",
+    "access denied",
+    "attention required",
+    "unusual traffic",
+    "验证您不是机器人",
+)
+
 
 def _as_index(value: Any) -> int:
     """把 b3 / 3 / "3" 统一成整数序号。"""
@@ -284,9 +299,16 @@ class BrowserChannel:
             screenshot_path = self._save_shot(step, snap["_screenshot"])
 
         login = self._login_wall(url, text, items)
+        blocked = self._blocked_page(text, items)
         summary = f"浏览器页面「{title or '无标题'}」{url}，{len(elements)} 个可交互元素"
         if login:
             summary += "（检测到登录/扫码页）"
+        if blocked:
+            summary += (
+                "（这是站点安全防护的拦截页，不是内容页：重复请求同一地址"
+                "或刷新都不会放行，请换站内其它入口/换搜索引擎结果，"
+                "或告知用户该站点拦截了自动访问）"
+            )
 
         card = self._screen_card(title, url, text, elements)
         return Observation(
@@ -306,6 +328,7 @@ class BrowserChannel:
                 "scroll_height": meta.get("scrollHeight"),
                 "engine": snap.get("engine"),
                 "login_wall": login,
+                "blocked": blocked,
                 "element_count": len(items),
             },
         )
@@ -334,6 +357,19 @@ class BrowserChannel:
             return False
         body = (text or "").lower()
         return has_pwd or any(hint in body for hint in _LOGIN_TEXT_HINTS)
+
+    @staticmethod
+    def _blocked_page(text: str, items: list[dict[str, Any]]) -> bool:
+        """是不是 WAF 的拦截页。
+
+        两个条件同时成立才算：几乎没有可交互元素（真内容页不会这样），
+        且正文里出现拦截特征词。只看文本会误判——正常页面的帮助中心里
+        也可能写到「人机验证」。
+        """
+        if len(items) > 3:
+            return False
+        body = (text or "")[:1200].lower()
+        return any(hint in body for hint in _BLOCK_HINTS)
 
     def _save_shot(self, step: int, data: bytes) -> str:
         root = Path(self.screenshot_dir)
@@ -485,9 +521,29 @@ class BrowserChannel:
             )
             detail["amount"] = amount
         elif action in {"back", "forward", "reload"}:
-            page.evaluate(f"history.{action}()")
-            time.sleep(float(args.get("delay_s") or 0.4))
+            timeout = float(args.get("timeout_s") or args.get("timeout") or 15)
+            if action == "reload":
+                page.reload(
+                    ignore_cache=bool(args.get("ignore_cache")
+                                      or args.get("hard")),
+                    timeout=timeout,
+                )
+            else:
+                moved = (
+                    page.back(timeout=timeout)
+                    if action == "back"
+                    else page.forward(timeout=timeout)
+                )
+                if not moved:
+                    edge = "最前" if action == "back" else "最后"
+                    return Receipt(
+                        False,
+                        detail,
+                        error=f"已经是历史里的{edge}一页，无法{action}",
+                    )
+            time.sleep(float(args.get("delay_s") or 0.2))
             detail["url"] = page.url
+            detail["title"] = page.title
         elif action in {"wait", "wait_text"}:
             needle = str(args.get("text") or "")
             timeout = float(args.get("timeout_s") or 15)

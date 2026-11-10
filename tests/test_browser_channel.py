@@ -126,6 +126,24 @@ class FakePage:
     def wait_loaded(self, timeout: float = 20.0) -> bool:
         return True
 
+    def reload(self, ignore_cache: bool = False, timeout: float = 20.0) -> bool:
+        self.actions.append(("reload", ignore_cache))
+        return True
+
+    def back(self, timeout: float = 20.0) -> bool:
+        self.actions.append(("back", timeout))
+        return self.history_back
+
+    def forward(self, timeout: float = 20.0) -> bool:
+        self.actions.append(("forward", timeout))
+        return True
+
+    def go(self, delta: int, timeout: float = 20.0) -> bool:
+        self.actions.append(("go", delta))
+        return True
+
+    history_back = True
+
     def evaluate(self, expression: str, timeout: float = 20.0) -> Any:
         self.actions.append(("evaluate", expression[:20]))
         if "document.querySelector" in expression:
@@ -298,6 +316,38 @@ def test_act_rejects_unknown_action():
     assert "未支持" in (receipt.error or "")
 
 
+# -------------------------------------------------------------- 前进后退刷新
+# 真机踩过：用 `history.reload()` 实现刷新，直接抛
+# `TypeError: history.reload is not a function`，任务当场失败。
+# 正确做法是走 CDP（Page.reload / Page.getNavigationHistory），
+# 这组用例锁住「动作确实落到页面的导航方法上」。
+def test_act_reload_goes_through_page_reload():
+    channel, _, page = make_channel()
+    receipt = channel.execute("browser.act", {"action": "reload", "timeout_s": 12})
+
+    assert receipt.ok is True
+    assert ("reload", False) in page.actions
+    assert "history" not in [a[0] for a in page.actions]
+    assert receipt.detail["url"] == "https://example.com/"
+
+
+def test_act_back_and_forward_use_history_entries():
+    channel, _, page = make_channel()
+    assert channel.execute("browser.act", {"action": "back"}).ok is True
+    assert channel.execute("browser.act", {"action": "forward"}).ok is True
+    kinds = [item[0] for item in page.actions]
+    assert "back" in kinds and "forward" in kinds
+
+
+def test_act_back_at_history_start_reports_edge():
+    channel, _, page = make_channel()
+    page.history_back = False
+    receipt = channel.execute("browser.act", {"action": "back"})
+
+    assert receipt.ok is False
+    assert "最前" in (receipt.error or "")
+
+
 def test_verify_checks_url_and_text():
     channel, _, _ = make_channel()
     ok = channel.verify({"url_contains": "example.com", "text": "示例"})
@@ -366,3 +416,35 @@ def test_as_index_accepts_both_forms(value, expected):
 def test_as_index_rejects_garbage():
     with pytest.raises(ValueError):
         _as_index("第三个")
+
+
+# -------------------------------------------------------------- 拦截页识别
+def _blocked_page() -> FakePage:
+    page = FakePage("https://www.ziroom.com/")
+    page.title_text = "请求已被拦截"
+    page.text_body = (
+        "请求已被站点的安全策略拦截。本站点已启用安全防护服务以抵御在线攻击，"
+        "本次访问已被限制。由 Tencent Cloud EdgeOne 提供防护"
+    )
+    return page
+
+
+def test_block_page_is_called_out_in_observation():
+    """自己写一个假的拦截页，确认它不会和「页面没渲染完」混为一谈。"""
+    channel, _, _ = make_channel(_blocked_page())
+    observation = channel.observe(1)
+
+    assert "拦截页" in observation.summary
+    assert "刷新都不会放行" in observation.summary
+    assert observation.raw["blocked"] is True
+
+
+def test_rich_page_with_hint_words_is_not_blocked():
+    """正文提到「人机验证」的正常页面不能被误判。"""
+    page = FakePage()
+    page.text_body = "帮助中心：如果遇到人机验证，请按提示完成。" * 3
+    channel, _, _ = make_channel(page)
+    observation = channel.observe(1)
+
+    assert observation.raw["blocked"] is False
+    assert "拦截页" not in observation.summary

@@ -78,6 +78,10 @@ class BrowserConfig:
     mirror_fps: int = 15
     screenshot_max_width: int = 1280
     connect_timeout: float = 20.0
+    # 空串 = 按内核自动生成；无头模式下会把 UA 里的 HeadlessChrome 换掉
+    user_agent: str = ""
+    # 抹掉 navigator.webdriver 等自动化特征，否则不少站点直接返回拦截页
+    hide_automation: bool = True
 
 
 @dataclass
@@ -303,6 +307,12 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         ),
         connect_timeout=float(
             browser_raw.get("connect_timeout", defaults.browser.connect_timeout)
+        ),
+        user_agent=str(
+            browser_raw.get("user_agent", defaults.browser.user_agent) or ""
+        ).strip(),
+        hide_automation=bool(
+            browser_raw.get("hide_automation", defaults.browser.hide_automation)
         ),
     )
 

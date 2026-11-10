@@ -483,6 +483,8 @@ def build_browser_channel(
         mirror_fps=browser.mirror_fps,
         screenshot_max_width=browser.screenshot_max_width,
         connect_timeout=browser.connect_timeout,
+        user_agent=browser.user_agent,
+        hide_automation=browser.hide_automation,
     )
     return BrowserChannel(
         settings, screenshot_dir=screenshot_dir, headless=headless

@@ -192,7 +192,7 @@ def test_profile_dir_is_always_absolute(monkeypatch):
         pass
 
     class FakeProcess:
-        def __init__(self, engine, profile_dir, headless=True):
+        def __init__(self, engine, profile_dir, headless=True, **_kwargs):
             captured["dir"] = profile_dir
 
         def start(self, timeout=20.0):
@@ -220,3 +220,79 @@ def test_profile_dir_is_always_absolute(monkeypatch):
     profile_dir = captured["dir"]
     assert profile_dir.is_absolute()
     assert profile_dir.name == "chromium"
+
+
+# ---------------------------------------------------------------- 反自动化指纹
+# 真机踩过：无头模式的 UA 是 `HeadlessChrome/157`、`navigator.webdriver` 为 true，
+# 自如的腾讯 EdgeOne 直接返回「请求已被拦截」。这两条必须留在启动参数里。
+def test_default_user_agent_looks_like_a_real_browser():
+    from xm_agent.browser.engine import EngineInfo, default_user_agent
+
+    edge = default_user_agent(EngineInfo("edge", r"C:\msedge.exe", "157.0.4341.42", "system"))
+    assert "Headless" not in edge
+    assert "Edg/157.0.4341.42" in edge
+    # 和真机一致：Chrome 令牌只带大版本
+    assert "Chrome/157.0.0.0" in edge
+
+    chrome = default_user_agent(
+        EngineInfo("chrome", r"C:\chrome.exe", "140.0.7339.207", "system")
+    )
+    assert "Headless" not in chrome
+    assert "Edg/" not in chrome
+    assert "Chrome/140.0.0.0" in chrome
+
+
+def test_headless_command_line_hides_automation(tmp_path):
+    from xm_agent.browser.engine import BrowserProcess, EngineInfo
+
+    proc = BrowserProcess(
+        EngineInfo("edge", r"C:\msedge.exe", "157.0.4341.42", "system"),
+        tmp_path / "edge",
+        headless=True,
+    )
+    args = proc.command_args()
+    assert any(item.startswith("--user-agent=") and "Headless" not in item for item in args)
+    assert "--disable-blink-features=AutomationControlled" in args
+    assert "--headless=new" in args
+
+
+def test_visible_window_keeps_native_user_agent(tmp_path):
+    """可见窗口的 UA 本来就正常，别再覆盖一层（覆盖反而可能与版本不符）。"""
+    from xm_agent.browser.engine import BrowserProcess, EngineInfo
+
+    proc = BrowserProcess(
+        EngineInfo("edge", r"C:\msedge.exe", "157.0.4341.42", "system"),
+        tmp_path / "edge",
+        headless=False,
+    )
+    assert proc.resolved_user_agent() == ""
+    assert not [a for a in proc.command_args() if a.startswith("--user-agent=")]
+    assert "--headless=new" not in proc.command_args()
+
+
+def test_explicit_user_agent_wins(tmp_path):
+    from xm_agent.browser.engine import BrowserProcess, EngineInfo
+
+    proc = BrowserProcess(
+        EngineInfo("edge", r"C:\msedge.exe", "157.0.4341.42", "system"),
+        tmp_path / "edge",
+        headless=True,
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) Custom/1.0",
+    )
+    assert "--user-agent=Mozilla/5.0 (X11; Linux x86_64) Custom/1.0" in proc.command_args()
+
+
+def test_browser_config_reads_stealth_switches(tmp_path):
+    path = tmp_path / "agent.toml"
+    path.write_text(
+        """
+[runtime.browser]
+hide_automation = false
+user_agent = "Custom/2.0"
+""",
+        encoding="utf-8",
+    )
+    config = load_config(str(path))
+    assert config.browser.hide_automation is False
+    assert config.browser.user_agent == "Custom/2.0"
+    assert BrowserConfig().hide_automation is True

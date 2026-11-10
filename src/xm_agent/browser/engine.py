@@ -157,6 +157,26 @@ def bundled_root_for(profile_root: Path) -> Path:
     return profile_root.parent / "engines"
 
 
+def default_user_agent(engine: EngineInfo) -> str:
+    """按内核生成一条普通浏览器的 UA。
+
+    无头模式原生的 UA 是 `HeadlessChrome/<v>`，这是最容易被站点直接拦的一条
+    特征（自如的 EdgeOne 就是照这个拦的）。这里用真实产品版本重组成标准 UA：
+    Chrome 内核只带 `Chrome/<v>`，Edge 再补 `Edg/<v>`——和真人开同一个内核时
+    发出去的字符串一致。
+    """
+    version = (engine.version or "").strip() or "120.0.0.0"
+    # 和真机一致：Chrome 令牌只带大版本（x.0.0.0），Edg 令牌才带完整版本
+    major = version.split(".")[0] if version[0].isdigit() else "120"
+    base = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+    if engine.name == "edge":
+        return f"{base} Edg/{version}"
+    return base
+
+
 def resolve_engine(
     preference: str = "auto",
     bundled_root: Path | None = None,
@@ -306,17 +326,57 @@ class BrowserProcess:
         headless: bool = True,
         window_size: tuple[int, int] = (1280, 800),
         extra_args: list[str] | None = None,
+        user_agent: str = "",
+        hide_automation: bool = True,
     ):
         self.engine = engine
         self.profile_dir = Path(profile_dir)
         self.headless = headless
         self.window_size = window_size
         self.extra_args = extra_args or []
+        # 空串表示「按内核自动生成」：无头模式下必须换掉 HeadlessChrome
+        self.user_agent = user_agent
+        self.hide_automation = hide_automation
         self.proc: subprocess.Popen | None = None
         self.ws_url = ""
         self.port = 0
         self._lock = ProfileLock(self.profile_dir)
         self._closed = False
+
+    def resolved_user_agent(self) -> str:
+        if self.user_agent:
+            return self.user_agent
+        if not self.headless:
+            return ""  # 可见窗口的 UA 本来就是正常的，不用改
+        return default_user_agent(self.engine)
+
+    def command_args(self) -> list[str]:
+        """拼启动命令行。
+
+        单独成方法是为了能被单测直接检查：UA 与自动化标记这两条一旦丢了，
+        真机表现是「站点返回拦截页」而不是崩溃，很难靠别的用例发现。
+        """
+        args = [
+            self.engine.path,
+            f"--user-data-dir={self.profile_dir}",
+            "--remote-debugging-port=0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=Translate",
+            f"--window-size={self.window_size[0]},{self.window_size[1]}",
+            *self.extra_args,
+        ]
+        user_agent = self.resolved_user_agent()
+        if user_agent:
+            args.append(f"--user-agent={user_agent}")
+        if self.hide_automation:
+            # 去掉 `navigator.webdriver` 背后的自动化标记，配合 stealth.py
+            # 里注入的脚本，页面读到的就是一台普通浏览器
+            args.append("--disable-blink-features=AutomationControlled")
+        if self.headless:
+            args.append("--headless=new")
+        args.append("about:blank")
+        return args
 
     @property
     def port_file(self) -> Path:
@@ -335,19 +395,7 @@ class BrowserProcess:
             self._lock.release()
             raise BrowserError(f"删除残留 DevToolsActivePort 失败: {exc}") from exc
 
-        args = [
-            self.engine.path,
-            f"--user-data-dir={self.profile_dir}",
-            "--remote-debugging-port=0",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=Translate",
-            f"--window-size={self.window_size[0]},{self.window_size[1]}",
-            *self.extra_args,
-        ]
-        if self.headless:
-            args.append("--headless=new")
-        args.append("about:blank")
+        args = self.command_args()
 
         try:
             self.proc = subprocess.Popen(

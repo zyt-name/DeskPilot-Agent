@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .cdp import CdpConnection
+from .cdp import CdpConnection, CdpError
 from .snapshot import evaluate
 
 # key -> (windowsVirtualKeyCode, text)
@@ -148,13 +148,42 @@ def open_url(conn: CdpConnection, session_id: str, url: str, wait_timeout: float
     """导航并等待加载。"""
     conn.call("Page.navigate", {"url": url}, session_id, timeout=wait_timeout + 10)
     wait_loaded(conn, session_id, wait_timeout)
+    if url.startswith(("http://", "https://")):
+        # readyState=complete 不等于「有内容」：自如这类 SPA 首屏在 complete
+        # 之后才渲染，紧接着观测会看到空标题、0 个元素，模型就以为被拦了。
+        wait_content(conn, session_id, min(6.0, wait_timeout))
+
+
+def wait_content(conn: CdpConnection, session_id: str, timeout: float = 4.0) -> bool:
+    """等到页面真的有标题或正文；超时也算成功（有些页确实没有正文）。"""
+    probe = (
+        "(() => {const b = document.body;"
+        " return !!b && (((document.title || '').trim().length > 0)"
+        " || ((b.innerText || '').trim().length > 0));})()"
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if evaluate(conn, session_id, probe):
+                time.sleep(0.25)  # 让首屏的异步渲染再跑一小会儿
+                return True
+        except CdpError:
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def wait_loaded(conn: CdpConnection, session_id: str, timeout: float = 20.0) -> bool:
     """等 readyState 变成 complete；超时返回 False 而不是抛异常。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        state = evaluate(conn, session_id, "document.readyState")
+        try:
+            state = evaluate(conn, session_id, "document.readyState")
+        except CdpError:
+            # 导航进行中求值会报「Inspected target navigated or closed」，
+            # 这不是失败，只是这一刻没有可求值的文档——继续等就行。
+            time.sleep(0.1)
+            continue
         if state == "complete":
             time.sleep(0.15)  # 给前端框架一点渲染时间
             return True

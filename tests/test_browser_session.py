@@ -314,3 +314,59 @@ def test_channel_recovers_after_kernel_death(tmp_path, page_url):
         assert session.process.proc.pid != old_pid, "应当重新拉起内核"
     finally:
         channel.close()
+
+
+# ---------------------------------------------------- 反自动化指纹（真机）
+def test_headless_does_not_advertise_itself(session, page_url):
+    """无头模式的 UA 与 `navigator.webdriver` 都不能暴露自动化。
+
+    真机现场：自如的腾讯 EdgeOne 看到 `HeadlessChrome/157` +
+    `navigator.webdriver=true` 就直接回「请求已被拦截」，任务从第一步就废。
+    """
+    page = session.open(page_url)
+    ua = str(page.evaluate("navigator.userAgent"))
+    assert "Headless" not in ua, ua
+    assert "Chrome/" in ua, ua
+    assert page.evaluate("navigator.webdriver") in (None, False), (
+        "navigator.webdriver 仍为真，站点会据此拦截"
+    )
+
+
+def test_stealth_script_survives_new_tab_and_reload(session, page_url):
+    """伪装要跟着每个新文档走：新标签页、刷新之后都还得是普通浏览器。"""
+    page = session.open(page_url)
+    page.reload()
+    assert page.evaluate("navigator.webdriver") in (None, False)
+
+    fresh = session.new_page(page_url)
+    try:
+        assert "Headless" not in str(fresh.evaluate("navigator.userAgent"))
+        assert fresh.evaluate("navigator.webdriver") in (None, False)
+    finally:
+        session.close_page(fresh)
+
+
+# ---------------------------------------------------- 刷新与历史导航（真机）
+def test_reload_keeps_page_alive(session, page_url):
+    page = session.open(page_url)
+    assert page.reload() is True
+    assert page.title == "探针页"
+    assert page.url == page_url
+
+
+def test_back_and_forward_move_through_history(session, page_url):
+    page = session.open(page_url)
+    page.navigate(page_url + "?second=1")
+    assert page.back() is True
+    assert page.url == page_url
+    assert page.forward() is True
+    assert page.url.endswith("?second=1")
+
+
+def test_back_at_history_start_returns_false_not_error(session, page_url):
+    """退到底就返回 False；不能抛异常，否则模型会把它当成站点问题。"""
+    page = session.new_page("about:blank")
+    try:
+        assert page.back() is False
+    finally:
+        session.close_page(page)

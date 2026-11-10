@@ -24,6 +24,7 @@ from .engine import (
     resolve_engine,
 )
 from .mirror import ScreencastStream
+from .stealth import STEALTH_JS
 
 
 @dataclass
@@ -37,6 +38,10 @@ class BrowserSettings:
     mirror_fps: int = 15
     screenshot_max_width: int = 1280
     connect_timeout: float = 20.0
+    # 空串 = 按内核自动生成（无头模式下替换掉 HeadlessChrome）
+    user_agent: str = ""
+    # 抹掉 navigator.webdriver 等自动化特征，否则很多站点直接拦截
+    hide_automation: bool = True
 
 
 class _PageLink:
@@ -67,6 +72,13 @@ _STALE_SESSION = (
     "Session with given id not found",
     "No session with given id",
     "Session closed",
+    "Not attached to an active page",
+)
+
+# 导航过程中会短暂出现的错误：目标正在换文档，重试一次就好
+_TRANSIENT = (
+    "Inspected target navigated or closed",
+    "Target closed",
 )
 
 
@@ -100,13 +112,19 @@ class Page:
                 # 不重试的话一次抖动就让整个任务后半段全部失败。
                 conn = self._session.live_connection()
                 return conn.call(method, params, self.cdp_session, timeout=timeout)
+            if any(mark in detail for mark in _TRANSIENT):
+                # 文档正在换：CDP 会临时拒绝求值。等一下再来，不是错误。
+                time.sleep(0.15)
+                return conn.call(method, params, self.cdp_session, timeout=timeout)
             if any(mark in detail for mark in _STALE_SESSION):
-                if self.reattach():
-                    conn = self._session.live_connection()
-                    return conn.call(method, params, self.cdp_session, timeout=timeout)
-                if not self._session.owns(self):
-                    # 内核重启过，这个 target 已经不存在；上层换个页面即可
-                    raise BrowserError("页面已失效（浏览器重启过）") from None
+                # 换进程导航（跨站跳转、退回 about:blank）会让旧 session 失效，
+                # 稍等一下再挂通常就好了；连续两次不行才认定页面真的没了。
+                for _ in range(2):
+                    if self.reattach():
+                        conn = self._session.live_connection()
+                        return conn.call(method, params, self.cdp_session, timeout=timeout)
+                    time.sleep(0.2)
+                raise BrowserError("页面已失效（无法重新挂上标签页）") from None
             raise
 
     def reattach(self) -> bool:
@@ -126,6 +144,8 @@ class Page:
         except CdpError:
             return False
         self._session._pages[self.target_id] = self
+        # 新 session 不继承旧 session 注册过的脚本，得重新挂一遍
+        self.harden()
         return True
 
     @property
@@ -176,6 +196,54 @@ class Page:
     # ---------------------------------------------------------------- 动作
     def navigate(self, url: str, timeout: float = 20.0) -> None:
         input_ops.open_url(self._link, self.cdp_session, url, timeout)
+
+    def reload(self, ignore_cache: bool = False, timeout: float = 20.0) -> bool:
+        """重新加载当前页。
+
+        走 `Page.reload` 而不是 `location.reload()`：后者会让当前文档的执行上下文
+        立即销毁，`Runtime.evaluate` 的返回值还没回到 CDP 就没了，真机上表现为
+        「页面求值失败」。另外 `history.reload` 这个方法根本不存在——模型按直觉
+        调过一次，直接报 `TypeError: history.reload is not a function`。
+        """
+        self.call("Page.reload", {"ignoreCache": bool(ignore_cache)},
+                  timeout=timeout + 10)
+        return self.wait_loaded(timeout)
+
+    def go(self, delta: int, timeout: float = 20.0) -> bool:
+        """在会话历史里前后移动；越界返回 False（不当成错误）。"""
+        history = self.call("Page.getNavigationHistory")
+        entries = history.get("entries") or []
+        index = int(history.get("currentIndex") or 0) + int(delta)
+        if not 0 <= index < len(entries):
+            return False
+        self.call(
+            "Page.navigateToHistoryEntry",
+            {"entryId": entries[index].get("id")},
+            timeout=timeout + 10,
+        )
+        self.wait_loaded(timeout)
+        return True
+
+    def back(self, timeout: float = 20.0) -> bool:
+        return self.go(-1, timeout)
+
+    def forward(self, timeout: float = 20.0) -> bool:
+        return self.go(1, timeout)
+
+    def harden(self) -> None:
+        """注册反自动化指纹脚本：对后续每个文档生效（含刷新、跳转、新开页）。"""
+        if not self._session.settings.hide_automation:
+            return
+        try:
+            self.call("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS})
+            # 当前文档已经加载过了，补一次立即生效，否则要等下一次导航
+            self.call(
+                "Runtime.evaluate",
+                {"expression": STEALTH_JS, "returnByValue": True},
+            )
+        except (CdpError, BrowserError):
+            # 伪装失败不该让页面用不了：宁可被拦，也不能崩
+            pass
 
     def click(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
         input_ops.click(self._link, self.cdp_session, x, y, button=button, clicks=clicks)
@@ -326,7 +394,11 @@ class BrowserSession:
         # 启动探针永远等不到端口（真机踩过，默认配置就是相对路径）。
         profile_dir = (profile_root / self.engine.name).resolve()
         self.process = BrowserProcess(
-            self.engine, profile_dir, headless=self.headless
+            self.engine,
+            profile_dir,
+            headless=self.headless,
+            user_agent=self.settings.user_agent,
+            hide_automation=self.settings.hide_automation,
         )
         ws_url = self.process.start(timeout=self.settings.connect_timeout)
         self.conn = CdpConnection(ws_url, timeout=self.settings.connect_timeout)
@@ -404,6 +476,7 @@ class BrowserSession:
                     {"enabled": True},
                     page.cdp_session,
                 )
+                page.harden()
             except CdpError:
                 self._pages.pop(target_id, None)
 
@@ -426,7 +499,9 @@ class BrowserSession:
     # ---------------------------------------------------------------- 标签页
     def new_page(self, url: str = "about:blank") -> Page:
         conn = self.live_connection()
-        target = conn.call("Target.createTarget", {"url": url})
+        # 先开空白页再导航：`Target.createTarget` 直接带 URL 的话，页面在我们
+        # 注入反自动化脚本之前就已经开始加载了，第一跳仍然暴露无头特征。
+        target = conn.call("Target.createTarget", {"url": "about:blank"})
         target_id = target.get("targetId", "")
         attached = conn.call(
             "Target.attachToTarget", {"targetId": target_id, "flatten": True}
@@ -437,6 +512,9 @@ class BrowserSession:
         conn.call("Page.setLifecycleEventsEnabled", {"enabled": True}, cdp_session)
         page = Page(self, target_id, cdp_session)
         self._pages[target_id] = page
+        page.harden()
+        if url and url != "about:blank":
+            page.navigate(url)
         return page
 
     def open(self, url: str, timeout: float = 20.0) -> Page:

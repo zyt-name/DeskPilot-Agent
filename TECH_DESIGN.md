@@ -1567,6 +1567,42 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 
 `tests/test_browser_cdp.py` 4 项（纯单元，含「超时后仍能收到回包」）、`tests/test_browser_session.py` 3 项真机（空闲 / 断连 / 内核死亡）、`tests/test_browser_ui.py` 2 项静态资源。
 
+#### 4.22.17 无头指纹与导航动作（真机反馈修复）
+
+用户重跑「搜索自如官网」，这次失败换了个样子：`回执失败 · RuntimeError: 页面求值失败: TypeError: history.reload is not a function`，紧接着 `goto https://www.ziroom.com/` 的验证仍不过，连续 2 次失败后任务判死。两个独立问题：
+
+**① 刷新用了不存在的方法**（`browser/channel.py`）
+`back / forward / reload` 三个动作原来统一走 `page.evaluate(f"history.{action}()")`。`history.back()` / `forward()` 存在，但**`history.reload()` 根本不存在**——刷新在 `location` 上。而且即便写成 `location.reload()` 也有坑：求值会让当前文档的执行上下文立即销毁，`Runtime.evaluate` 的回包还没到 CDP 就没了，表现为「页面求值失败」。
+
+改成走 CDP 原生调用：
+
+| 动作 | 实现 |
+|---|---|
+| `reload` | `Page.reload {ignoreCache}` + 等 `readyState=complete` |
+| `back` / `forward` | `Page.getNavigationHistory` 取 `currentIndex ± 1` → `Page.navigateToHistoryEntry`，越界返回 False 并给出「已经是历史里的最前一页」这类明确错误，不抛异常 |
+
+配套两处容错（跨进程导航时 CDP 会短暂拒绝服务）：`input.wait_loaded` 把导航中的 `CdpError` 当作「还没好，继续等」；`Page.call` 把 `Inspected target navigated or closed` 归类为瞬时错误重试一次，把 `Not attached to an active page` 归到 stale session（原地重挂，连续两次失败才判页面失效）。
+
+**② 无头模式自报家门，被 WAF 拦死**（`browser/engine.py`、`browser/stealth.py`、`browser/session.py`）
+
+真机取样（同一台机器、同一个 Edge 157）：
+
+| 特征 | 无头默认 | 拦截面 |
+|---|---|---|
+| UA | `… Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0` 里带 `HeadlessChrome/157.0.0.0` | 腾讯 EdgeOne 直接返回「请求已被站点的安全策略拦截」 |
+| `navigator.webdriver` | `true` | 同上 |
+
+处理分两层，都只改「这是个自动化浏览器」这一条特征，不碰 Cookie、不改 `location`、不解验证码：
+
+- **进程级**：无头启动时附加 `--user-agent=`（按真实产品版本重组成标准 UA，Chrome 令牌只带大版本 `x.0.0.0`、Edge 补 `Edg/<完整版本>`）与 `--disable-blink-features=AutomationControlled`；可见窗口不覆盖 UA（本来就正常，覆盖反而可能和版本不符）。配置项 `[runtime.browser] user_agent / hide_automation`，后者默认 `true`。
+- **文档级**：每个新文档注入 `Page.addScriptToEvaluateOnNewDocument`，把 `Navigator.prototype.webdriver` 的 getter 改成 `undefined`；`new_page` 改为先建 `about:blank` → 注入 → 再导航（`Target.createTarget` 直接带 URL 会在注入前就开始加载）；重连/重挂后重新注入（新 session 不继承旧 session 注册的脚本）。
+
+另外 `navigate` 之后加了一个 `wait_content`（最多 6s）：`readyState=complete` 不等于「有内容」，自如这类 SPA 首屏在 complete 之后才渲染，紧接着观测会看到空标题、0 个元素，模型误判成被拦。同时 `_observed` 增加拦截页识别：可交互元素 ≤3 且正文含「请求已被拦截 / 安全策略拦截 / access denied」等强特征时，summary 直接写明「这是拦截页，重复请求或刷新都不会放行」。
+
+**实测（2026-11-10，Edge 157.0.4341.42，无头）**：`https://www.ziroom.com/` 打开即得真实首页（标题「北京租房网…自如官网」，39 个可交互元素）；UA 为 `… Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.42`、`navigator.webdriver` 为 `undefined`；`reload` → `goto example.com` → `back` → `back`（退到 `about:blank`，会话仍可用）→ `forward` 全部成功；`verify("自如")` 通过。对照组（不注入、不覆盖 UA）同一地址稳定返回拦截页。
+
+`tests/test_browser_engine.py` 5 项（UA 形状、启动参数、可见模式不覆盖、显式 UA 优先、配置解析）、`tests/test_browser_channel.py` 5 项（reload/back/forward 落到页面方法、历史边界、拦截页识别与误判）、`tests/test_browser_session.py` 5 项真机（指纹、注入跨新页/刷新、reload、前进后退、历史尽头）。
+
 ---
 
 ## 5. 桌面端形态与分发（后期）
