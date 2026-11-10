@@ -603,7 +603,13 @@
         ? payload.chain.join(" → ")
         : "";
       const divider = el("div", "run-meta");
-      divider.textContent = `${switching ? "后端切换" : "自动路由"} · ${adapterLabel(
+      const modeLabel =
+        payload.mode === "browser"
+          ? "纯浏览器模式"
+          : switching
+            ? "后端切换"
+            : "自动路由";
+      divider.textContent = `${modeLabel} · ${adapterLabel(
         payload.adapter,
       )}${payload.reason ? ` · ${payload.reason}` : ""}${
         chain ? ` · 链路 ${chain}` : ""
@@ -1464,9 +1470,15 @@
     });
   }
 
+  const ADAPTER_LABEL = {
+    auto: "auto（自动）",
+    browser: "内置浏览器",
+    mock: "mock（演示）",
+  };
+
   function adapterLabel(name) {
     if (!name) return "";
-    return name === "auto" ? "auto（自动）" : name;
+    return ADAPTER_LABEL[name] || name;
   }
 
   function defaultAdapter(config, profile) {

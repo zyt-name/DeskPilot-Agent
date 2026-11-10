@@ -27,6 +27,9 @@ from .providers.fake import HeuristicMockProvider
 from .providers.openai_compat import OpenAICompatProvider
 from .storage import Storage
 
+# 虚拟后端名：不是 MCP 适配器，而是「只用浏览器通道」的模式。
+BROWSER_ADAPTER = "browser"
+
 _ADAPTERS = {
     "windows_mcp": WindowsMcpAdapter,
     "xshell_mcp": XshellMcpAdapter,
@@ -37,6 +40,10 @@ _VISION_ONLY_KINDS = {"computer_use_mcp"}
 
 
 def build_adapter(config: AgentConfig, name: str):
+    if name == BROWSER_ADAPTER:
+        raise RuntimeError(
+            "browser 是通道模式，不是 MCP 适配器；请由 build_hub 挂载浏览器通道"
+        )
     adapter_config = config.adapters.get(name)
     if adapter_config is None:
         raise RuntimeError(f"adapter is not configured: {name}")
@@ -114,7 +121,7 @@ def build_provider(
         if active is not None:
             return ensure_vision(config, adapter_name, active)
     if config.model.provider == "fake":
-        if adapter_name != "mock":
+        if adapter_name not in {"mock", BROWSER_ADAPTER}:
             raise RuntimeError(
                 "model.provider=fake only supports the mock adapter; "
                 "configure an active AI model in the desktop console or set "
@@ -464,11 +471,15 @@ def build_browser_channel(
 
 def build_hub(
     config: AgentConfig,
-    adapter: Any,
+    adapter: Any | None,
     *,
     screenshot_dir: str = ".xm-agent/screenshots",
 ) -> ChannelHub:
-    """桌面通道 + 浏览器通道。桌面后端始终存在，浏览器按配置挂载。"""
+    """桌面通道 + 浏览器通道。
+
+    adapter 为 None 时表示纯浏览器模式：不挂桌面通道，全程不截屏、
+    不让出桌面。此时能力清单只剩 browser.* 与 task.*。
+    """
     hub = ChannelHub(desktop=adapter)
     channel = build_browser_channel(config, screenshot_dir=screenshot_dir)
     if channel is not None:
@@ -477,6 +488,7 @@ def build_hub(
 
 
 __all__ = [
+    "BROWSER_ADAPTER",
     "build_adapter",
     "build_audit_gate",
     "build_browser_channel",

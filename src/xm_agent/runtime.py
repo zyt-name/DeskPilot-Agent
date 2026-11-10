@@ -10,7 +10,7 @@ from typing import Any, Callable
 from . import vision
 from .adapters.base import Adapter
 from .audit import AuditLog
-from .channels import ChannelHub, is_observe
+from .channels import DESKTOP_KIND, ChannelHub, is_observe
 from .control import RunCancelled, RunControl, RunPreempted
 from .guard.gate import AuditGate, GateDecision
 from .lock import LeaseLock
@@ -74,7 +74,7 @@ class AgentRuntime:
 
     def __init__(
         self,
-        adapter: Adapter,
+        adapter: Adapter | None,
         provider: Provider,
         policy: Policy,
         audit: AuditLog,
@@ -968,14 +968,25 @@ class AgentRuntime:
         return planned
 
     def _capture_for_audit(self) -> str | None:
-        capture = getattr(self.adapter, "capture_screenshot", None)
-        if callable(capture):
+        """审计要图：先问当前通道，再退回桌面截图。
+
+        纯浏览器模式没有桌面通道，绝不能顺手截一张桌面——那既无用，
+        也违背「不占用用户屏幕」的约定。
+        """
+        for candidate in (self.adapter, self.hub.active()):
+            if candidate is None:
+                continue
+            capture = getattr(candidate, "capture_screenshot", None)
+            if not callable(capture):
+                continue
             try:
                 path = capture()
             except Exception:
                 path = None
             if path:
                 return str(path)
+        if self.hub.get(DESKTOP_KIND) is None:
+            return None
         saved = vision.capture_primary_screen(
             getattr(self.adapter, "screenshot_dir", ".xm-agent/screenshots"),
             prefix="audit",

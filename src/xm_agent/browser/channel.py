@@ -180,8 +180,8 @@ class BrowserChannel:
     def page(self) -> Page:
         session = self.session()
         if self._page is None:
-            pages = session.pages()
-            self._page = pages[0] if pages else session.new_page()
+            first = getattr(session, "first_page", None)
+            self._page = first() if callable(first) else session.new_page()
         return self._page
 
     @property
@@ -191,6 +191,14 @@ class BrowserChannel:
     def available(self) -> bool:
         """已启动的通道才能被隐式观测；未启动时由 Hub 回落到桌面。"""
         return self.started
+
+    def activate(self) -> None:
+        """唤醒内核并确保有一个标签页。
+
+        只有「没有别的通道可用」时 Hub 才会调用它——正常混合模式下，
+        没 open 过的浏览器不该被一次观测顺手拉起来。
+        """
+        self.page()
 
     def status(self) -> dict[str, Any]:
         if not self.started:

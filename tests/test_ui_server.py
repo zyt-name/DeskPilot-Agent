@@ -92,7 +92,9 @@ def test_bootstrap_returns_token_and_config(server):
     assert status == 200
     assert data["token"] == app.token
     assert data["profile"]["display_name"]
-    assert data["config"]["adapters"] == ["mock"]
+    # mock 是配置里的后端；browser 是虚拟后端，代表纯浏览器通道模式
+    assert "mock" in data["config"]["adapters"]
+    assert "browser" in data["config"]["adapters"]
     assert data["config"]["model"]["api_key_env"]
     assert data["hotkey"] == {"enabled": False, "key": "F8"}
     assert data["screen_indicator"] is False

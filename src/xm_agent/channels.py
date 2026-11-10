@@ -97,11 +97,18 @@ class ChannelHub:
     observe 一遍，既慢又会给模型看错的界面。
     """
 
-    def __init__(self, desktop: Any | None = None) -> None:
+    def __init__(
+        self,
+        desktop: Any | None = None,
+        *,
+        browser_only: Any | None = None,
+    ) -> None:
         self._channels: dict[str, Any] = {}
         self._last_kind = DESKTOP_KIND
         if desktop is not None:
             self.register(desktop, kind=DESKTOP_KIND)
+        if browser_only is not None:
+            self.register(browser_only, kind=BROWSER_KIND)
 
     # ------------------------------------------------------------ 注册
     def register(self, channel: Any, kind: str | None = None) -> None:
@@ -187,6 +194,17 @@ class ChannelHub:
         for candidate in self._channels.values():
             if channel_available(candidate):
                 return candidate
+        # 全都没就绪：纯浏览器模式的首帧，唤醒唯一通道（拉内核）
+        if len(self._channels) == 1:
+            channel = next(iter(self._channels.values()))
+            wake = getattr(channel, "activate", None)
+            if callable(wake):
+                try:
+                    wake()
+                except Exception:  # noqa: BLE001 - 唤醒失败按无通道处理
+                    return None
+                if channel_available(channel):
+                    return channel
         return None
 
     # ------------------------------------------------------------ 执行

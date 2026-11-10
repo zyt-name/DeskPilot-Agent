@@ -31,6 +31,7 @@ from ..ai.catalog import is_vision_model
 from ..ai.service import AiService
 from ..audit import AuditLog
 from ..bootstrap import (
+    BROWSER_ADAPTER,
     build_adapter,
     build_audit_gate,
     build_browser_channel,
@@ -363,7 +364,14 @@ class UiServer:
             ),
             "audit": self.audit_snapshot(),
             "config": {
-                "adapters": sorted(self.config.adapters),
+                "adapters": sorted(
+                    set(self.config.adapters)
+                    | (
+                        {BROWSER_ADAPTER}
+                        if self.config.browser.enabled
+                        else set()
+                    )
+                ),
                 "auto_available": auto_available(self.config),
                 "default_adapter": self.config.default_adapter,
                 "model": {
@@ -582,6 +590,8 @@ class UiServer:
     def _adapter_allowed(self, name: str) -> bool:
         if name in self.config.adapters:
             return True
+        if name == BROWSER_ADAPTER:
+            return self.config.browser.enabled and self.browser is not None
         return name == AUTO_ADAPTER and auto_available(self.config)
 
     def _validate_model_selection(
@@ -1465,7 +1475,19 @@ class UiServer:
                     "vision": vision,
                 },
             )
-            if adapter_name == AUTO_ADAPTER:
+            if adapter_name == BROWSER_ADAPTER:
+                # 纯浏览器模式：不挂桌面通道，不截屏、不占屏、不让出桌面
+                needs_screen = False
+                on_event(
+                    "route",
+                    {
+                        "mode": "browser",
+                        "adapter": BROWSER_ADAPTER,
+                        "reason": "内置浏览器通道，全程不占用桌面",
+                        "chain": [],
+                    },
+                )
+            elif adapter_name == AUTO_ADAPTER:
                 primary, route_reason = choose_primary(
                     self.config, goal, provider, vision_available=vision
                 )
