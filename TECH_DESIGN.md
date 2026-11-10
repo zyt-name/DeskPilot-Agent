@@ -45,7 +45,7 @@
 | 审计 | JSONL + 截图 + 动作回执 | SQLite 索引 + OpenTelemetry | 每一步可回放 |
 | 配置与密钥 | SQLite + Windows DPAPI 加密 | Vault（企业） | 禁止明文存放密码与私钥；界面只显示密文提示 |
 | 打包 | Python 运行时 + CLI，用户会话内托盘进程 | Tauri 桌面壳（后续） | 不注册为系统服务（见 5.4）；v0.1 先做 CLI 与本地运行时 |
-| 测试 | pytest + 固定任务集 + 回放 | Playwright（浏览器场景） | 先建基线，再谈优化 |
+| 测试 | pytest + 固定任务集 + 回放 | 自建 CDP 断言（复用 `browser` 模块，不引入新依赖） | 先建基线，再谈优化 |
 
 ### 1.2 关键取舍
 
@@ -991,6 +991,303 @@ always_confirm = ["file.transfer", "terminal.exec"]
 
 ---
 
+### 4.21 内置浏览器通道（浏览器功能模块 · 规划中）
+
+> **模块标记：浏览器功能（Browser Channel）**
+>
+> - 归属：**独立执行通道**，与「桌面操控」「终端」并列，不是桌面适配器的一个子模式。
+> - 状态：**地基已实测通过，功能尚未实现**（见 4.21.14 实测数据；`src/xm_agent/browser/` 尚未创建）。本节是设计约定，落地前不得在 README 或 STATUS 的「已完成」中描述为已有能力。
+> - 引擎：**仅支持 Microsoft Edge、Google Chrome，以及内置 Chromium 兜底**；其他浏览器不在支持范围。
+> - 数据：三种引擎**各用独立 profile**，互不共享，也不读取用户日常浏览器的资料。
+> - 驱动：**纯 Python 标准库直连 CDP**，不依赖 Playwright、Selenium 或任何第三方包。
+
+#### 4.21.1 定位与边界
+
+一句话：让 Agent 在**自有浏览器进程**里完成任务，不占用、不截取、不点击用户的 Windows 桌面。
+
+| 维度 | 桌面通道 | 浏览器通道（本模块） |
+|---|---|---|
+| 可见性 | 与用户共享同一桌面 | 无系统窗口，用户只看到镜像 |
+| 运行前提 | 必须让出桌面、收起控制台 | 控制台可最小化，AI 照常工作 |
+| 观测 | 屏幕像素 + UIA 树 | 页面截图 + DOM/无障碍树 |
+| 坐标 | 受 DPI 与多显示器影响 | 视口坐标，无 DPI 问题 |
+| 登录 | 用户在自己浏览器登录，Agent 无法继承 | 独立 profile 持久化，首次扫码后可复用 |
+| 并发 | 串行、独占 | 一个进程多标签 |
+
+明确不做：不把浏览器窗口嵌进面板；不读取或复制用户日常 Edge/Chrome 的用户数据；不在该通道里模拟桌面快捷键或跨应用操作；不承诺绕过验证码与风控，不代填密码。
+
+#### 4.21.2 形态与驱动选型
+
+**形态：不做 WebView2 内嵌控件。** 三个死结：
+
+1. WebView2 是 UI 控件，随主窗口最小化停止渲染，AI 无法后台工作。
+2. 无法单独截取该控件，只能拍整个屏幕，等于退回抢占桌面。
+3. pywebview 一窗口一 WebView2，覆盖层与 HUD 的层级、点击穿透会被破坏。
+
+因此采用**引擎与显示解耦**：引擎是独立浏览器进程（可无窗口），显示是把画面镜像进前端 canvas。
+
+**驱动：不走 Playwright / Selenium，直接说 CDP。**
+
+CDP（Chrome DevTools Protocol）就是 Playwright 内部真正在用的那层协议。我们需要的每一个动作都有原生方法，而 Playwright 提供的额外价值（选择器重试、自动等待、测试夹具）对「AI 看图决策」这个场景没有用：
+
+| 需求 | CDP 原生方法 | Playwright 中的对应物 |
+|---|---|---|
+| AI 看页面像素 | `Page.captureScreenshot` | 同（转发） |
+| 用户看实时镜像 | `Page.startScreencast` | 无公开等价 API |
+| 点击 / 拖拽 / 滚轮 | `Input.dispatchMouseEvent` | `page.mouse.*` |
+| 中文与密码输入 | `Input.insertText` | `page.keyboard.insertText` |
+| 键位控制 | `Input.dispatchKeyEvent` | `page.keyboard.*` |
+| 结构快照 | `Accessibility.getFullAXTree` / `DOM.*` | `page.accessibility.*` |
+| Cookie 读写 | `Storage.getCookies` / `Network.setCookie` | `context.cookies()` |
+
+放弃 Playwright 换来的是四条**对分发至关重要的性质**：
+
+1. **零第三方依赖**。WebSocket 客户端按 RFC 6455 用 `socket` + `hashlib` + `struct` 实现（约 150 行），全链路只用标准库。打包后不需要 `pip install` 任何东西。
+2. **不需要下载内核驱动**。Playwright 必须 `playwright install chromium`（约 150MB，从 `cdn.playwright.dev` 拉取，国内经常超时），我们直接启动系统已装的 Edge/Chrome。
+3. **不需要版本对齐**。Playwright 与浏览器版本有兼容窗口，系统自动升级 Edge 后可能失效；裸 CDP 只要协议版本兼容就一直可用。
+4. **没有 `headless shell` 指纹问题**。Playwright 新版默认无头用的是精简 shell，更容易被风控识别；我们自己决定 `--headless=new` 还是带窗口。
+
+代价也要写清：等待、重试、元素定位这些便利要自己写（在 `browser/session.py` 里做，约 200 行）；将来若要支持 Firefox 必须换 WebDriver 栈——本模块已明确不支持 Firefox，不构成问题。
+
+#### 4.21.3 引擎选择与 profile 隔离
+
+三种引擎能力等价（都是 Chromium 系，CDP 全能力），差别只在**可执行文件从哪来**：
+
+| 引擎 | 定位方式 | 来源 | 适用场景 |
+|---|---|---|---|
+| Edge | `msedge.exe` 常见安装路径 + `App Paths` 注册表 | 系统已装 | 默认首选，指纹与编解码最完整 |
+| Chrome | `chrome.exe` 常见安装路径 + `App Paths` 注册表 | 系统已装 | 用户 Chrome 习惯 |
+| Chromium | `.xm-agent/browser/engines/chromium-<ver>/` | 资源管理下载（Chrome for Testing） | Edge/Chrome 缺失或损坏时兜底 |
+
+**解析顺序**：用户在任务/设置里显式指定 → `[runtime.browser].engine` → `auto`（Edge → Chrome → Chromium）。指定引擎缺失时不静默换引擎，而是明确提示「未检测到 X，已回落 Y」并记入运行事件。
+
+**启动方式**：直接 `subprocess.Popen` 拉起可执行文件，参数固定为
+
+```text
+--user-data-dir=<profile> --remote-debugging-port=0 --no-first-run
+--no-default-browser-check [--headless=new] <url>
+```
+
+`--remote-debugging-port=0` 让内核自己分配端口并把端口与 ws 路径写入 `<profile>/DevToolsActivePort`。**必须先删除该文件再启动**，否则会读到上一次实例的残留端口而连接被拒（实测踩到，见 4.21.14）。
+
+**profile 隔离**（本版明确采用独立 profile，不复用用户真实浏览器数据）：
+
+- 路径：`.xm-agent/browser/profiles/<engine>/`，例如 `edge/`、`chrome/`、`chromium/`。
+- 每个引擎一个 profile，Cookie、localStorage、IndexedDB、Service Worker 各自独立，互不串号。
+- 首次使用某引擎需扫码一次，之后长期有效；换引擎等于换环境，需要重新登录。
+- 同一 profile 加写锁，只允许一个引擎实例；并发任务排队而不是争抢。
+- 空闲回收可关闭 context，登录态在磁盘，重开即恢复（**必须优雅关闭**，见 4.21.8）。
+- 目录已被 `.gitignore` 覆盖，不进版本库、不进备份。
+
+配置草案：
+
+```toml
+[runtime.browser]
+engine = "auto"                              # auto | edge | chrome | chromium
+profile_root = ".xm-agent/browser/profiles"
+headless = "auto"                            # auto | always | never
+keep_alive_seconds = 300                     # 空闲多久后关闭内核
+
+[resources]
+update_check = "notify"                      # off | notify | auto
+check_interval_hours = 24
+include_prerelease = false
+```
+
+#### 4.21.4 内置 Chromium 与资源完整性
+
+内置 Chromium 不是手工安装，也不是 Playwright 的构建，而是 **Chrome for Testing** 的独立发行版——它就是 Google 官方给自动化场景出的 Chromium 构建，带完整编解码，有稳定的版本化 URL，纯 HTTP 直下：
+
+```text
+https://storage.googleapis.com/chrome-for-testing-public/<version>/win64/chrome-win64.zip
+```
+
+纳入现有资源管理：
+
+- 新增资源类型 `kind="browser"`，走独立安装分支：下载 zip → 标准库 `zipfile` 解压到 `engines/chromium-<version>/` → 探针验证。
+- 版本来源：`https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json`（JSON，取 `Stable`）。
+- 完整性校验用**启动探针**而非文件哈希：拉起内核读 `/json/version` 拿真实版本，探不起来即为损坏并重装。这比哈希更贴近「能不能用」。
+- 国内镜像：`https://registry.npmmirror.com/-/binary/chrome-for-testing/`，失败再回落官方源，与 MCP 资源共用同一套镜像策略。
+- marker 记录版本、来源、安装时间与探针结果，供状态面板与更新检测共用。
+- `start.cmd` 在现有 `resources ensure` 之后追加浏览器检查；缺失才下载，已存在不重复安装。
+
+安全打包：`chrome-win64.zip` 是 Google 官方发行的二进制，签名由 Windows 校验；解压走现有 `resources` 的安全解压逻辑（拒绝绝对路径、`..` 穿越与符号链接），不新写一套。
+- 面板「资源」页展示三种引擎的可用性：已装版本、profile 路径、登录状态（只显示「已登录/未登录」，不展示内容）。
+
+#### 4.21.5 双视觉通路
+
+- **AI 的眼睛**：`Page.captureScreenshot`，只在浏览器进程内合成，不经过桌面捕获 API；用户切到别的窗口也不受影响。
+- **用户的眼睛**：`Page.startScreencast`（JPEG q≈60、`maxWidth` 1280）经 SSE 推到 canvas；面板收起即停流。
+- 两条通路互不绑定：AI 可高频取图决策，用户画面可低频刷新。
+
+#### 4.21.6 输入回传与中文
+
+- 鼠标：canvas 坐标按视口比例换算后 `Input.dispatchMouseEvent`（move/down/up 与滚轮）。
+- 文本：`Input.insertText` 整段落入，绕开输入法逐键模拟；密码框同路径。
+- 控制键：`Input.dispatchKeyEvent` 承载 Enter / Tab / Esc。
+- 接管态：面板切到「手动」，同样的输入直接转发给页面，AI 暂停动作但保持观察。
+
+#### 4.21.7 能力契约与通道抽象
+
+- 新增命名空间 `browser.*`：`open` / `observe` / `act` / `verify` / `tab` / `wait`；`task.finish`、`task.await_user` 保持全局。
+- `Channel` 需声明：能力集、观测模型、是否独占桌面、是否支持并发、界面表层。运行时按通道下发提示词，模型看不到当前通道不存在的能力。
+- 路由：`auto` 按目标文本与用户选择决定通道；任务级与全局设置均可强制「内置浏览器」，并可再指定引擎。
+- 生命周期解耦：仅当 `channel.uses_desktop` 为真，才触发现有 `indicator.show()`、`DesktopHandoff.release()` 与 `needs_screen` 分支。
+- 契约测试扩到第 5 个后端（浏览器 mock page），新增通道或引擎不改用例。
+
+#### 4.21.8 登录与扫码接管
+
+1. `browser.open` 目标站点后做登录检测：复用 `_login_wall` 启发式，并扩展 DOM 规则（密码框、二维码 canvas、「扫码登录」文案、URL 特征）。
+2. 命中且当前引擎的 profile 无有效会话 → `task.await_user(kind="login")`，界面自动展开镜像面板并提示「请在面板中扫码」，同时注明当前引擎。若判定为无头模式不利于扫码，自动以 `--headless=new` 之外的可见模式重开一次（`headless = "auto"` 的语义）。
+3. 扫码期间面板处于接管态；检测到会话 Cookie 变化或跳转到登录后首页，自动续跑，或由用户点「我已登录，继续」。
+4. 登录失败或被风控拦截：明确告知并停止，不做重试轰炸。
+
+**登录态落盘必须优雅关闭**。实测结论（4.21.14）：直接 `TerminateProcess` 会丢掉内存中的 Cookie 与 localStorage，磁盘上虽然存在 `Default/Network/Cookies` 文件但内容未写入；必须走 `Browser.close` 让内核自己退出。因此：
+
+- 所有关闭路径统一走 `Browser.close`，等待进程退出（超时 10s 再降级强杀并告警）；
+- 兜底双保险：登录成功后主动 `Storage.getCookies` 导出，用现有 DPAPI 密钥加密存一份快照；下次启动若发现 profile 里没有会话，提示可用快照恢复（快照只存 cookie 与 localStorage，不含密码）；
+- 崩溃恢复：检测到 `DevToolsActivePort` 残留且端口不可连，先清理再启动。
+
+#### 4.21.9 界面形态
+
+三种表层共用同一个镜像组件：
+
+- **侧边抽屉**：任务页右侧可展开/收起，含地址栏、标签、引擎标识、自动/手动切换；不离开对话即可看页面。
+- **全屏视图**：整个内容区变为浏览器，左侧一条可展开的对话列（复用会话流），适合长流程任务。
+- **独立第二窗口**（可选）：pywebview 多窗口打开 `/browser`，适合双屏。
+
+引擎切换放在设置页与任务页两处：任务级只影响本次任务，全局作为默认值。
+
+#### 4.21.10 安全、审计与数据
+
+- 浏览器动作与桌面动作走同一条 `guard` 管线；风险类别复用「提交订单 / 删除 / 公开发布 / 上传」，审计提示词改带 URL 与元素文本。
+- profile 是 Chromium 明文格式，等价于账号凭据：仅当前用户 ACL、不进 git 与备份、界面明示存储内容、支持一键清除与按引擎清除。
+- 因为不读取用户真实浏览器数据，账号泄露面仅限 Agent 自己登录过的站点；代价是每个引擎首次都要扫码。
+- 不读系统密码管理器、不代填密码；密码键入走 `insertText` 且不写日志。
+- 下载文件落 `.xm-agent/downloads/`，纳入 `maintenance.cleanup` 保留期。
+
+#### 4.21.11 资源更新检测
+
+面向第三方 MCP 与内置 Chromium，统一做版本发现与安全升级：
+
+| 环节 | 做法 |
+|---|---|
+| 发现 | GitHub Releases（首选）或 Tags；带 ETag 与 `last_check` 缓存，默认 24 小时查一次 |
+| 兼容门禁 | Python 版本要求、Node `engines`、资源声明的 `runtime_checks`、MCP `tools/list` 探针 |
+| 安装 | 下载解压到新的版本化目录，绝不覆盖在用目录 |
+| 激活 | 探针全过才切换 junction；任一失败保留旧版并记录原因 |
+| 回滚 | 保留上一版本目录，切回只需改链接 |
+| 策略 | `update_check = "off" / "notify" / "auto"`；`auto` 只跟稳定版，且必须无运行中任务 |
+| 限流 | 未认证 60 次/小时，靠缓存摊薄；可选 `GITHUB_TOKEN` 提升上限 |
+
+内置 Chromium 的更新口径不同：跟随 Chrome for Testing 的 `Stable` 版本，升级后重装内核并用 `/json/version` 复核实际版本，不与 MCP 资源混在同一条流水线。Edge/Chrome 由系统或用户自行升级，本系统只做**兼容探测**（启动 + `/json/version`），不主动更新用户的浏览器。
+
+#### 4.21.12 已知风险与不承诺
+
+| 风险 | 说明 | 应对 |
+|---|---|---|
+| 引擎缺失或升级 | 目标机器未装 Edge/Chrome，或系统升级后启动参数变化 | 回落内置 Chromium 并明示；不静默降级 |
+| 自动化识别 | 部分站点会拦截无头浏览器 | 真实内核 + 持久 profile + 拟人节奏；提供「可见模式」与人工接管 |
+| 验证码 | 滑块、点选类无法自动通过 | 转人工，镜像面板可见 |
+| 内存 | 单页 150–300MB，三个引擎各占一份 | 空闲回收；同引擎并发排队 |
+| 镜像延迟 | 实测约 72ms/帧（约 14fps），见 4.21.14 | 面板隐藏停流；AI 取图与用户画面独立 |
+| 登录态丢失 | 非优雅退出会丢 Cookie（实测） | 统一 `Browser.close` + DPAPI 快照兜底，见 4.21.8 |
+| 跨域 iframe | DOM 引用需带 frame 限定 | 视觉坐标兜底 |
+| 合规 | 自动化可能违反站点条款 | 首次启用时明示，责任在使用方 |
+
+#### 4.21.13 分阶段
+
+| 阶段 | 出口标准 |
+|---|---|
+| P0 地基验证 | **已完成**，见 4.21.14 实测数据 |
+| P1 引擎与适配器 | Edge / Chrome / Chromium 三选一可跑通；独立 profile 生效；`browser.*` 能力可被模型调用；契约测试覆盖第 5 个后端 |
+| P2 通道抽象 | 浏览器通道运行时不截屏、不显覆盖层、不让出桌面；路由与引擎可强制指定 |
+| P3 界面三表层 | 抽屉、全屏视图（含左侧对话列）、可选独立窗口均可用 |
+| P4 登录与接管 | 每个引擎首次扫码、接管、自动续跑全链路通过；profile 可按引擎清除 |
+| P5 资源与更新 | 内置 Chromium 纳入 `ensure` 与完整性探针；MCP 资源更新检测可发现、可门禁、可回滚 |
+| P6 加固 | 反爬兜底、可见模式、下载上传、性能 |
+
+#### 4.21.14 地基实测（2026-11-10，本机 Edge 157 + 纯标准库 CDP）
+
+验证脚本只 import 标准库，未安装 Playwright、Selenium 或任何 WebSocket 包。全部数字来自本机实测：
+
+| 指标 | 结果 |
+|---|---|
+| 内核启动到可连 CDP | **0.16s**（`--headless=new`，Edge 157.0.4341.42） |
+| 页面截图 `Page.captureScreenshot` | **133ms**，JPEG q70 = 7.0 KB，magic `ffd8` 正确 |
+| 坐标点击（move + press + release） | **14ms**，命中注入按钮，`clientX/Y` 精确等于派发坐标 `[200,140]` |
+| 中文输入 `Input.insertText` | 焦点在输入框时完整写入「第二个字段」；无焦点时丢弃（**必须先聚焦**） |
+| 无障碍树 `Accessibility.getFullAXTree` | 5 节点（最小页面） |
+| 实时镜像 `Page.startScreencast` | **6 帧 / 4 秒采样内间隔 72ms ≈ 14fps**，单帧 base64 约 13–14 KB |
+| Cookie 持久化（硬杀 `terminate`） | **丢失**：磁盘有 20 KB `Default/Network/Cookies`，但内容未 flush |
+| Cookie + localStorage（`Browser.close`） | **完整保留**：重开后 `sessionid=token-xyz-999`、`localStorage.user='tester'` 均在 |
+| headful 可见模式 | 可启动并可截图（10020 字节），供扫码时给用户看真窗口 |
+
+同时暴露两个必须写进代码的坑：
+
+1. **`DevToolsActivePort` 残留**：profile 目录里该文件存在时，直接读会拿到上次实例的端口，连接报 `WinError 10061`。启动前必须先删除该文件，再等待新文件出现并**校验端口可连**，不能只判断文件存在。
+2. **`Input.insertText` 依赖焦点**：无焦点时静默丢弃，不报错。输入前必须先 `Runtime.evaluate` 聚焦目标元素，或用 `DOM.focus`。
+
+验证脚本已入库：`scripts/probe_browser_cdp.py`（纯标准库，与 `probe_windows_mcp.py` 等并列）。复跑命令：
+
+```bat
+PYTHONPATH=src .venv\Scripts\python.exe scripts\probe_browser_cdp.py
+PYTHONPATH=src .venv\Scripts\python.exe scripts\probe_browser_cdp.py --engine chrome
+PYTHONPATH=src .venv\Scripts\python.exe scripts\probe_browser_cdp.py --headful
+```
+
+该脚本里的 `CdpClient` 与 `Engine` 就是 P1 `browser/cdp.py`、`browser/engine.py` 的原型，落地时拆成模块并补断言到 `tests/`。
+
+#### 4.21.15 打包与零环境依赖
+
+目标：分发之后，目标机器上**不需要预装 Playwright、Node、驱动或任何 Python 包**，只要能联网（甚至完全离线也能用本机已装的 Edge/Chrome）。
+
+依赖分三层，每层的来源都不同：
+
+| 层 | 内容 | 来源 | 目标机器是否需要联网 |
+|---|---|---|---|
+| 运行时 | Python 解释器 + 本项目代码 + 现有第三方包 | PyInstaller 打包进发行包 | 否 |
+| 驱动 | WebSocket / HTTP / 解压 / JSON | **Python 标准库**，无第三方包 | 否 |
+| 内核 | Edge / Chrome / Chromium | 先找系统已装；都没有才下载 Chrome for Testing | 仅在无系统浏览器时需要 |
+
+**为什么能做到零依赖**：浏览器通道不引入任何新的 Python 依赖。WebSocket 客户端 150 行、CDP 调用封装 200 行、zip 解压用 `zipfile`、HTTP 用 `urllib.request`——全在标准库里。所以 `pyproject.toml` 的 `dependencies` 不因这个模块增加一项，PyInstaller 也不需要打任何 `hooks`。
+
+对比传统 Playwright 方案在分发时的成本：
+
+| 环节 | Playwright 方案 | 本方案 |
+|---|---|---|
+| 安装 Python 包 | `pip install playwright`（约 40MB wheel + `greenlet` + `pyee`） | 不需要 |
+| 安装内核 | `playwright install chromium`（约 150MB，`cdn.playwright.dev`） | 有 Edge/Chrome 则 0 字节 |
+| 安装系统依赖 | Linux 需 `install-deps`，Windows 需 VC 运行库 | 不需要 |
+| 版本漂移 | Playwright 版本与内核版本绑定，升级要重装 | 协议兼容即可，内核随系统升级 |
+| 打包体积 | +150MB 内核 + 40MB 包 | 0（用系统浏览器时） |
+
+**下载器的实现约定**（仅在内核缺失时走这条路径）：
+
+1. 纯 `urllib.request` 流式下载到 `.xm-agent/browser/downloads/*.part`，边下边算 SHA-256，完成后原子重命名。
+2. 断点续传：`Range` 请求 + `.part` 大小续接；服务端不支持就重下。
+3. 源顺序：`[resources].download_sources` 配置的镜像列表 → 官方源。默认把 npmmirror 放第一位（国内可用性）。
+4. 并发与超时：单线程，30s 连接超时、读超时 120s，失败重试 2 次并指数退避；总量上限 400MB 防误配。
+5. 解压用现有 `resources` 的安全解压（拒绝绝对路径、`..`、符号链接、超大单文件）。
+6. 下载完立刻跑启动探针；探针失败即删除该版本目录，不留半成品。
+7. 全部失败时给明确出口：提示用户自行安装 Edge 或 Chrome（给出官方链接），不静默卡住。
+
+**首次运行流程**（`start.cmd` 串行执行）：
+
+```text
+resources ensure（MCP，已有）
+  → browser ensure（检查 Edge → Chrome → 本地 Chromium）
+      → 命中：记录引擎与版本，直接进入
+      → 全缺失：下载 Chrome for Testing（走镜像），探针验证
+  → 启动面板
+```
+
+**离线场景**：系统有 Edge/Chrome 时，整个浏览器通道完全离线可用（CDP 是本地回环 socket，不出网）。只有内置 Chromium 缺失且无网络时才会失败，此时降级为「桌面通道」并明确告知原因。
+
+**打包注意**：PyInstaller 需额外收集 `certifi` 的 CA 包（`urllib` 走 https 时需要）。若使用 `--onefile`，首次解压会增加启动延迟，建议 `--onedir`，内核下载到用户目录而不是包内目录（包内目录可能只读）。
+
+---
+
 ## 5. 桌面端形态与分发（后期）
 
 ### 5.1 结论
@@ -1157,6 +1454,7 @@ always_confirm = ["file.transfer", "terminal.exec"]
 | ~~P0~~ | 顶层 AI 审计（操作描述符、盲审、失败关闭、执行前复核） | 已完成：敏感操作先规则后盲审；模型不可用或异常时升级用户确认 |
 | ~~P0~~ | 用户审计模式（AI 审计 / 执行前询问）与确认弹窗 | 已完成：两种模式可切换；批准仅对当前步骤生效 |
 | ~~P0~~ | 登录阻塞与用户接管 | 已完成：无凭据时 `task.await_user` 中止；UIA 登录页确定性兜底；同会话「继续」沿用原目标并从当前屏幕恢复，队列透传用户消息与上下文 |
+| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21） | Edge / Chrome / 内置 Chromium 三引擎解析与独立 profile 跑通；画面镜像 + 扫码接管 + 运行时不截屏/不显覆盖层/不让出桌面；内置 Chromium 纳入资源完整性；资源更新检测可发现、门禁、回滚；未实现前不得计入「已完成」 |
 | P1 | 非标准登录页识别（验证码 / 二次验证 / 纯图形） | 视觉模型判定并请求用户接管；无法判定时不得绕过或猜测 |
 | P1 | 凭据安全输入 | 密码不进入任务目标、会话记录与审计日志；接入系统凭据存储 |
 | P1 | 审计决策面板、Token 统计与回放 | 缓存已实现；模型/耗时/用户决定的统计与回放待做 |
