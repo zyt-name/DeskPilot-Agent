@@ -532,6 +532,9 @@ class UiServer:
         with self._browser_lock:
             if self.browser is not None:
                 self.browser.retire_if_idle()
+                # 只留一个标签页：任务过程中开出来的多余标签不带到下一次，
+                # 当前这一页留着——用户可能正站在上面等 AI 接手
+                self.browser.focus_single_tab()
                 hub.register(self.browser)
         return hub
 
@@ -1920,13 +1923,12 @@ class UiServer:
                     adapter.close()
                 except Exception:
                     pass
-            self.storage.finish_run(run_id, status, reason, steps)
-            with self._runs_lock:
-                entry = self._runs.get(run_id)
-                if entry is not None:
-                    entry["status"] = status
-                    entry["reason"] = reason
-                    entry["steps"] = steps
+            # 任务结束不关浏览器：把真窗口提到最前，用户可以直接在里面接着操作
+            if self.browser is not None:
+                try:
+                    self.browser.bring_to_front()
+                except Exception:  # noqa: BLE001 - 前置失败不影响任务结果
+                    pass
             if conversation_id:
                 text = (
                     summary
@@ -1950,6 +1952,16 @@ class UiServer:
                     },
                 )
                 self.storage.touch_conversation(conversation_id)
+            # 顺序要紧：先落消息、再宣告 run 终态。反过来的话，轮询方一看到
+            # needs_human 就来读对话，很可能读到的最后一条还是用户那句「继续」，
+            # 界面上就变成「任务暂停了但没有 AI 的提示」。这是真的踩到过的。
+            self.storage.finish_run(run_id, status, reason, steps)
+            with self._runs_lock:
+                entry = self._runs.get(run_id)
+                if entry is not None:
+                    entry["status"] = status
+                    entry["reason"] = reason
+                    entry["steps"] = steps
             if task_id:
                 self.storage.set_queue_status(
                     task_id,

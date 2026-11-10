@@ -25,9 +25,11 @@ enabled = true
 engine = "auto"
 # 每个引擎独立 profile，互不共享，也不读取你日常浏览器的数据；首次使用需扫码一次。
 profile_root = ".xm-agent/browser/profiles"
-# auto = 默认无头，遇到需要扫码的登录页自动切可见窗口；always / never 强制。
+# auto = 可见窗口（带地址栏/前进后退），任务结束后窗口留着，你可以直接接手；
+# 没有桌面会话时自动回退无头。always 强制无头（服务器/纯自动化），never 强制可见。
 headless = "auto"
-# 空闲多久后关闭内核（登录态在磁盘，重开即恢复）。
+# 无头会话空闲多久后关闭内核（登录态在磁盘，重开即恢复）。
+# 可见窗口不按空闲关：那是用户手上的浏览器，关掉等于把东西收走。
 keep_alive_seconds = 300
 # 镜像帧率与截图宽度。面板收起时停流，成本归零。
 mirror_fps = 15

@@ -25,6 +25,7 @@ from .engine import (
 )
 from .mirror import ScreencastStream
 from .stealth import STEALTH_JS
+from .window import raise_window
 
 
 @dataclass
@@ -33,7 +34,9 @@ class BrowserSettings:
 
     engine: str = "auto"
     profile_root: str = ".xm-agent/browser/profiles"
-    headless: str = "auto"  # auto | always | never
+    # auto = 可见窗口（任务结束后用户能直接接着用）；无桌面时自动回退无头
+    # always = 强制无头；never = 强制可见
+    headless: str = "auto"
     keep_alive_seconds: int = 300
     mirror_fps: int = 15
     screenshot_max_width: int = 1280
@@ -81,6 +84,13 @@ _TRANSIENT = (
     "Target closed",
 )
 
+# target 真的没了（用户在可见窗口里关掉了标签页）：重挂也回不来，只能换一个
+_TARGET_GONE = (
+    "No target with given id",
+    "Target closed",
+    "target does not exist",
+)
+
 
 class Page:
     """一个标签页。所有坐标都是视口坐标。"""
@@ -91,6 +101,8 @@ class Page:
         self.cdp_session = cdp_session
         self._screencast: ScreencastStream | None = None
         self._link = _PageLink(self)
+        # 用户关掉标签页后这个对象就作废了；留着它调用只会一路报错
+        self.dead = False
 
     # ---------------------------------------------------------------- 基础
     @property
@@ -141,7 +153,13 @@ class Page:
             conn.call(
                 "Page.setLifecycleEventsEnabled", {"enabled": True}, self.cdp_session
             )
-        except CdpError:
+        except CdpError as exc:
+            detail = str(exc)
+            if any(mark in detail for mark in _TARGET_GONE):
+                # 标签页被用户关掉了：标记作废，下次取页面时自动开一个新的，
+                # 而不是一直抱着一个已经不存在的 target 报错。
+                self.dead = True
+                self._session.drop_page(self)
             return False
         self._session._pages[self.target_id] = self
         # 新 session 不继承旧 session 注册过的脚本，得重新挂一遍
@@ -251,12 +269,16 @@ class Page:
     def bring_to_front(self) -> None:
         """把可见窗口前置到桌面最上层。
 
-        只在 headful 下有意义；headless 没有窗口可前置，调用会被忽略。
+        CDP 的 `Page.bringToFront` 只激活标签页，不够：真机上 IDE 占着前台时
+        它不会有任何可见效果。所以再补一次 Win32 的窗口前置（见 window.py）。
+        无头模式没有窗口，两步都会被跳过。
         """
         try:
             self.call("Page.bringToFront", {})
         except CdpError:
             pass
+        pid = getattr(getattr(self._session.process, "proc", None), "pid", 0) or 0
+        raise_window(int(pid))
 
     def click_element(self, index: int, elements: list[dict] | None = None,
                       limit: int = 80) -> dict:
@@ -328,6 +350,7 @@ class Page:
             self.conn.call("Target.closeTarget", {"targetId": self.target_id}, timeout=5.0)
         except Exception:
             pass
+        self.dead = True
 
 
 @dataclass
@@ -363,9 +386,15 @@ class BrowserSession:
         mode = (self.settings.headless or "auto").lower()
         if mode == "always":
             return True
-        if mode == "never":
-            return False
-        return True  # auto 默认无头；登录需要可见时由 ensure_visible 重开
+        # auto 与 never 一样给可见窗口：这个浏览器是「用户之后还要接着用」的
+        # 那一个，无头窗口用户没法接手，任务一结束就等于白开了。
+        return False
+
+    def auto_mode(self) -> bool:
+        """配置是 auto、调用方也没强制指定模式：允许按环境回退无头。"""
+        return self._headless is None and (
+            self.settings.headless or "auto"
+        ).lower() == "auto"
 
     @property
     def started(self) -> bool:
@@ -400,7 +429,22 @@ class BrowserSession:
             user_agent=self.settings.user_agent,
             hide_automation=self.settings.hide_automation,
         )
-        ws_url = self.process.start(timeout=self.settings.connect_timeout)
+        try:
+            ws_url = self.process.start(timeout=self.settings.connect_timeout)
+        except BrowserError:
+            # auto 档：没有桌面会话（服务/远程）时可见窗口起不来。退一步用无头，
+            # 至少任务还能跑；用户要窗口就显式配 headless = "never"。
+            if not self.auto_mode():
+                raise
+            self.process = BrowserProcess(
+                self.engine,
+                profile_dir,
+                headless=True,
+                user_agent=self.settings.user_agent,
+                hide_automation=self.settings.hide_automation,
+            )
+            ws_url = self.process.start(timeout=self.settings.connect_timeout)
+            self._headless = True
         self.conn = CdpConnection(ws_url, timeout=self.settings.connect_timeout)
         self.conn.call("Target.setDiscoverTargets", {"discover": True})
         # 新进程里旧的 target id 全部失效，页面对象不能再复用
@@ -478,6 +522,7 @@ class BrowserSession:
                 )
                 page.harden()
             except CdpError:
+                page.dead = True
                 self._pages.pop(target_id, None)
 
     def ensure_visible(self) -> bool:
@@ -543,13 +588,71 @@ class BrowserSession:
         return self._pages.get(page.target_id) is page
 
     def first_page(self) -> Page:
-        if self._pages:
-            return next(iter(self._pages.values()))
+        for page in list(self._pages.values()):
+            if not page.dead:
+                return page
+        adopted = self._adopt_startup_page()
+        if adopted is not None:
+            return adopted
         return self.new_page()
+
+    def _adopt_startup_page(self) -> Page | None:
+        """接管内核启动时自己开的那一个标签页。
+
+        内核启动后已经有一页（Edge 是 edge://newtab）。我们另开 `Target.createTarget`
+        就会多出一个标签，用户看到两个标签，其中一个永远空着——「只有一个浏览器」
+        这件事在观感上就已经破了。这里先附着到已有的页，没有再新建。
+        """
+        conn = self.conn
+        if conn is None or conn.closed:
+            # 还没启动：先把内核拉起来，否则下面永远拿不到「已存在的那一页」，
+            # 退化成新开标签，窗口里就会多出一个空白标签。
+            try:
+                conn = self.live_connection()
+            except BrowserError:
+                return None
+        if conn is None or conn.closed:
+            return None
+        try:
+            targets = conn.call("Target.getTargets").get("targetInfos", [])
+        except CdpError:
+            return None
+        for target in targets:
+            if str(target.get("type") or "") != "page":
+                continue
+            target_id = str(target.get("targetId") or "")
+            if not target_id or target_id in self._pages:
+                continue
+            try:
+                attached = conn.call(
+                    "Target.attachToTarget",
+                    {"targetId": target_id, "flatten": True},
+                )
+            except CdpError:
+                continue
+            session_id = str(attached.get("sessionId") or "")
+            if not session_id:
+                continue
+            page = Page(self, target_id, session_id)
+            self._pages[target_id] = page
+            for method in ("Page.enable", "Runtime.enable"):
+                conn.call(method, {}, session_id)
+            conn.call(
+                "Page.setLifecycleEventsEnabled", {"enabled": True}, session_id
+            )
+            page.harden()
+            return page
+        return None
+
+    def drop_page(self, page: Page) -> None:
+        """把一个已经失效的标签页从登记表里摘掉（不关 target）。"""
+        if self._pages.get(page.target_id) is page:
+            self._pages.pop(page.target_id, None)
 
     def close_page(self, page: Page) -> None:
         page.close()
-        self._pages.pop(page.target_id, None)
+        page.dead = True
+        self.drop_page(page)
 
     # ---------------------------------------------------------------- 关闭
     def close(self, reason: str = "用户关闭") -> None:

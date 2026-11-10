@@ -200,6 +200,9 @@ class BrowserChannel:
             # 内核重启过，旧页面对象已经失效；重新取一个，否则后面每次
             # 调用都会报「Session with given id not found」。
             self._page = None
+        if self._page is not None and getattr(self._page, "dead", False):
+            # 用户在他那边的窗口里把标签页关了：换一个，别对着空气操作
+            self._page = None
         if self._page is None:
             first = getattr(session, "first_page", None)
             self._page = first() if callable(first) else session.new_page()
@@ -427,11 +430,10 @@ class BrowserChannel:
         if args.get("new_tab"):
             self._page = session.new_page(url)
         else:
-            if not session.started:
-                self._page = session.open(url)
-            else:
-                self._page = self.page()
-                self._page.navigate(url)
+            # 不带 new_tab 就复用当前页：启动时会接管内核自带的那一页，
+            # 不再多开一个永远空着的标签
+            self._page = self.page()
+            self._page.navigate(url)
         session = self.session()
         if not session.headless:
             session.ensure_visible()
@@ -611,6 +613,44 @@ class BrowserChannel:
         )
 
     # ------------------------------------------------------------ 校验
+    def bring_to_front(self) -> bool:
+        """把真窗口提到最前，任务结束后用户能立刻接手。
+
+        无头模式没有窗口可提，返回 False（这不算失败）。
+        """
+        if not self.started or self._session is None:
+            return False
+        if self._session.headless:
+            return False
+        try:
+            self.page().bring_to_front()
+        except Exception:  # noqa: BLE001 - 前置失败不该影响任务结果的判定
+            return False
+        return True
+
+    def focus_single_tab(self) -> int:
+        """只留一个标签页：关掉任务过程中开出来的多余标签。
+
+        只关本通道自己开的（登记在 `_pages` 里的），用户自己在窗口里按
+        Ctrl+T 开的标签不在名册上，不会被误伤。
+        """
+        if not self.started or self._session is None:
+            return 0
+        keep = self.page()
+        pages = getattr(self._session, "pages", None)
+        if callable(pages):
+            pages = pages()
+        closed = 0
+        for page in list(pages or []):
+            if page is keep or getattr(page, "dead", False):
+                continue
+            try:
+                self._session.close_page(page)
+                closed += 1
+            except Exception:  # noqa: BLE001 - 关不掉就留着，不该中断任务
+                continue
+        return closed
+
     def verify(self, expect: str | dict[str, Any] | None) -> Verification:
         if not expect:
             return Verification(True, "浏览器动作已执行")
@@ -662,6 +702,8 @@ class BrowserChannel:
 
         负的 `keep_alive_seconds` 表示永不自动回收（一直开着等下次用）。
         有人在看镜像时不回收——用户正盯着页面，关掉等于打断他。
+        可见窗口也不自动回收：那个窗口就是用户手上的浏览器，他可能正在
+        里面填表、翻页，按空闲时长关掉等于把他正在用的东西收走。
         """
         if not self.started or self._session is None:
             return False
@@ -669,6 +711,8 @@ class BrowserChannel:
             if self.mirror_active:
                 return False
             if self.keep_alive_seconds < 0:
+                return False
+            if not self._session.headless:
                 return False
             idle = time.time() - (self._last_used or time.time())
             if idle < self.keep_alive_seconds:

@@ -273,7 +273,7 @@
                 <span class="browser-url" id="browser-url">未启动</span>
               </div>
               <div class="row tight">
-                <button class="icon-btn" id="browser-handoff" type="button" title="把浏览器窗口显示到桌面上（扫码时用）" aria-label="显示真实窗口">
+                <button class="icon-btn" id="browser-handoff" type="button" title="把浏览器真窗口提到最前（任务结束后可直接在里面接手）" aria-label="提到前台">
                   <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4.5" width="14" height="11" rx="1.5" /><path d="M3 8h14" /></svg>
                 </button>
                 <button class="icon-btn" id="browser-expand" type="button" title="全屏视图（左侧保留对话）" aria-label="全屏视图">
@@ -288,7 +288,7 @@
               <canvas id="browser-canvas"></canvas>
               <div class="browser-empty" id="browser-empty">
                 <strong>AI 还没有打开浏览器</strong>
-                <p>当任务需要访问网页时，这里会实时显示 AI 看到的画面。你也可以手动打开一个地址：</p>
+                <p>当任务需要访问网页时，这里会实时显示 AI 看到的画面，桌面上也会开着同一个浏览器窗口；任务结束后窗口留着，你可以直接在里面接着操作。也可以手动打开一个地址：</p>
                 <form class="browser-open-form" id="browser-open-form">
                   <input type="url" id="browser-open-url" placeholder="https://example.com" />
                   <button class="btn btn-primary" type="submit">打开</button>

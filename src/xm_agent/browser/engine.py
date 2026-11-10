@@ -362,7 +362,11 @@ class BrowserProcess:
             "--remote-debugging-port=0",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-features=Translate",
+            # 翻译气泡会盖在页面右上角（Edge 的窗口类也是 Chrome_WidgetWin_1，
+            # 还会被 window.py 误当成一个顶层窗口），既挡视线又干扰截图。
+            # 真机对比过：只关 Translate/TranslateUI 时气泡照样弹（Edge 走自己的
+            # 开关名），把 msEdgeTranslate、EdgeTranslate 一起关掉才彻底不出现。
+            "--disable-features=Translate,TranslateUI,msEdgeTranslate,EdgeTranslate",
             f"--window-size={self.window_size[0]},{self.window_size[1]}",
             *self.extra_args,
         ]
@@ -373,9 +377,14 @@ class BrowserProcess:
             # 去掉 `navigator.webdriver` 背后的自动化标记，配合 stealth.py
             # 里注入的脚本，页面读到的就是一台普通浏览器
             args.append("--disable-blink-features=AutomationControlled")
+            # 上面这条会被内核当成「不受支持的命令行标记」，在页面顶部挂一条
+            # 黄色提示条，把内容往下挤一截。--test-type 就是让内核别为此报警。
+            args.append("--test-type")
         if self.headless:
             args.append("--headless=new")
-        args.append("about:blank")
+        # 不传 URL：内核自己开一个起始页就够了。传 `about:blank` 会让 Edge 多开
+        # 一个空白标签（真机：窗口里并排两个标签，其中一个永远空着），
+        # 而「只有一个浏览器」在观感上不能有两个标签。
         return args
 
     @property

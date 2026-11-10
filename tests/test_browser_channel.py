@@ -54,6 +54,7 @@ class FakePage:
         self.fronted = 0
         self.text_body = "欢迎来到示例站点"
         self.snapshot_kwargs: dict[str, Any] = {}
+        self.dead = False
 
     @property
     def url(self) -> str:
@@ -161,21 +162,36 @@ class FakeSession:
         self.started = True
         self.engine = None
         self._page = page or FakePage()
+        self.tabs: list[FakePage] = [self._page]
+        self.closed_pages: list[FakePage] = []
         self.opened: list[str] = []
         self.visible_calls = 0
         self.close_calls = 0
 
+    @property
     def pages(self) -> list[FakePage]:
-        return [self._page]
+        return list(self.tabs)
+
+    def first_page(self) -> FakePage:
+        for page in self.tabs:
+            if not page.dead:
+                return page
+        return self.new_page()
+
+    def close_page(self, page: FakePage) -> None:
+        self.closed_pages.append(page)
+        page.dead = True
+        if page in self.tabs:
+            self.tabs.remove(page)
 
     def new_page(self, url: str = "about:blank") -> FakePage:
         self._page = FakePage(url)
+        self.tabs.append(self._page)
         return self._page
 
     def open(self, url: str, timeout: float = 20.0) -> FakePage:
         self.opened.append(url)
-        self._page = FakePage(url)
-        return self._page
+        return self.new_page(url)
 
     def ensure_visible(self) -> bool:
         self.visible_calls += 1
@@ -403,6 +419,38 @@ def test_unknown_capability_returns_receipt():
     receipt = channel.execute("browser.teleport", {})
     assert receipt.ok is False
     assert "不支持" in (receipt.error or "")
+
+
+# ---------------------------------------------------------------- 单窗口与接手
+def test_focus_single_tab_closes_extra_tabs():
+    """只留一个标签页：多余的是任务过程里开出来的，留着会让人不知道看哪个。"""
+    channel, session, first = make_channel()
+    extra = FakePage("https://second.test/")
+    session.tabs.append(extra)
+
+    assert channel.focus_single_tab() == 1
+    assert session.closed_pages == [extra]
+    assert channel.page() is first
+
+
+def test_bring_to_front_only_for_visible_window():
+    channel, session, page = make_channel()
+    assert channel.bring_to_front() is True
+    assert page.fronted == 1
+
+    session.headless = True
+    assert channel.bring_to_front() is False
+    assert page.fronted == 1
+
+
+def test_closed_tab_is_replaced_instead_of_erroring():
+    """可见窗口里用户可以随手关掉标签页：下一次动作该开一个新的，而不是报错。"""
+    channel, session, first = make_channel()
+    first.dead = True
+    session.tabs.remove(first)
+
+    assert channel.page() is not first
+    assert channel.page().dead is False
 
 
 @pytest.mark.parametrize(

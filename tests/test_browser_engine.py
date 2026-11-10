@@ -117,8 +117,87 @@ def test_browser_session_reports_not_started():
 def test_browser_headless_mode_resolution():
     assert BrowserSession(BrowserSettings(headless="always")).headless is True
     assert BrowserSession(BrowserSettings(headless="never")).headless is False
-    assert BrowserSession(BrowserSettings(headless="auto")).headless is True
-    assert BrowserSession(BrowserSettings(headless="auto"), headless=False).headless is False
+    # auto = 可见窗口：任务结束后用户要能直接在这个窗口里接手继续操作
+    assert BrowserSession(BrowserSettings(headless="auto")).headless is False
+    assert BrowserSession(BrowserSettings(headless="auto"), headless=True).headless is True
+
+
+def test_auto_mode_falls_back_to_headless(monkeypatch, tmp_path):
+    """auto 档：可见窗口起不来（无桌面会话）时退回无头。
+
+    否则在没有桌面的机器上，浏览器通道直接等于不可用——这比用户看不到窗口
+    更糟。never 是显式要求窗口，不做这个回退。
+    """
+    import types
+
+    from xm_agent.browser import session as session_mod
+
+    started: list[bool] = []
+
+    class FakeProcess:
+        def __init__(self, engine, profile_dir, headless=True, **_kwargs):
+            self.headless = headless
+
+        def start(self, timeout=20.0):
+            started.append(self.headless)
+            raise BrowserError(f"起不来（headless={self.headless}）")
+
+    monkeypatch.setattr(session_mod, "BrowserProcess", FakeProcess)
+    monkeypatch.setattr(
+        session_mod,
+        "resolve_engine",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            name="edge", path="msedge.exe", version="157.0",
+            source="system", label="Microsoft Edge",
+        ),
+    )
+
+    browser = BrowserSession(BrowserSettings(profile_root=str(tmp_path / "p")))
+    with pytest.raises(BrowserError):
+        browser.start()
+    assert started == [False, True]
+
+    forced = BrowserSession(
+        BrowserSettings(profile_root=str(tmp_path / "q"), headless="never")
+    )
+    with pytest.raises(BrowserError):
+        forced.start()
+    assert started == [False, True, False]
+
+
+def test_first_page_adopts_the_startup_tab():
+    """内核按 about:blank 启动时已经有一页：直接接管，别再新开一个空标签。
+
+    不接管的话用户看到两个标签，其中一个永远空白；「只有一个浏览器」的
+    观感就破了。
+    """
+    created: list[tuple[str, object]] = []
+
+    class FakeConn:
+        closed = False
+
+        def call(self, method, params=None, session_id=None, timeout=None):
+            created.append((method, session_id))
+            if method == "Target.getTargets":
+                return {
+                    "targetInfos": [
+                        {"type": "page", "targetId": "T1", "url": "about:blank"}
+                    ]
+                }
+            if method == "Target.attachToTarget":
+                return {"sessionId": "S1"}
+            return {}
+
+    browser = BrowserSession(BrowserSettings())
+    browser.conn = FakeConn()
+    browser._closed = False
+
+    page = browser.first_page()
+    assert page.target_id == "T1"
+    assert page.cdp_session == "S1"
+    assert browser.first_page() is page
+    assert "Target.createTarget" not in [name for name, _ in created]
+    assert ("Page.enable", "S1") in created
 
 
 def test_js_str_escapes_quotes_and_newlines():
@@ -256,6 +335,31 @@ def test_headless_command_line_hides_automation(tmp_path):
     assert "--headless=new" in args
 
 
+def test_automation_flag_comes_with_infobar_suppressor(tmp_path):
+    """`--disable-blink-features=AutomationControlled` 会让内核在页面顶部挂一条
+    「不受支持的命令行标记」提示条，把内容往下挤；`--test-type` 正是让它别报警。
+    两者必须成对出现，否则界面看起来像被篡改过。
+    """
+    from xm_agent.browser.engine import BrowserProcess, EngineInfo
+
+    hiding = BrowserProcess(
+        EngineInfo("edge", r"C:\msedge.exe", "157.0.4341.42", "system"),
+        tmp_path / "a",
+        headless=False,
+    )
+    args = hiding.command_args()
+    assert "--disable-blink-features=AutomationControlled" in args
+    assert "--test-type" in args
+
+    plain = BrowserProcess(
+        EngineInfo("edge", r"C:\msedge.exe", "157.0.4341.42", "system"),
+        tmp_path / "b",
+        headless=False,
+        hide_automation=False,
+    )
+    assert "--test-type" not in plain.command_args()
+
+
 def test_visible_window_keeps_native_user_agent(tmp_path):
     """可见窗口的 UA 本来就正常，别再覆盖一层（覆盖反而可能与版本不符）。"""
     from xm_agent.browser.engine import BrowserProcess, EngineInfo
@@ -268,6 +372,15 @@ def test_visible_window_keeps_native_user_agent(tmp_path):
     assert proc.resolved_user_agent() == ""
     assert not [a for a in proc.command_args() if a.startswith("--user-agent=")]
     assert "--headless=new" not in proc.command_args()
+    # 翻译气泡是独立顶层窗口，会盖住页面右上角（截图里也是一块遮挡）。
+    # Edge 走自己的开关名，只关 Translate/TranslateUI 时气泡照样弹——
+    # 真机对比过，四个 feature 一起关才彻底不出现。
+    features = [
+        a for a in proc.command_args()
+        if a.startswith("--disable-features=")
+    ][0]
+    for name in ("Translate", "TranslateUI", "msEdgeTranslate", "EdgeTranslate"):
+        assert name in features.split("=", 1)[1].split(",")
 
 
 def test_explicit_user_agent_wins(tmp_path):

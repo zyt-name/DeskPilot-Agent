@@ -105,6 +105,16 @@ class IdleRetireTests(unittest.TestCase):
         self.assertFalse(self.channel.mirror_active)
         self.assertTrue(self.channel.retire_if_idle())
 
+    def test_visible_window_is_never_auto_retired(self):
+        """可见窗口是用户手上的浏览器：他可能正在里面操作，不能按空闲收走。"""
+        self.session.headless = False
+        self._idle_for(99999)
+        self.assertFalse(self.channel.retire_if_idle())
+        self.assertEqual(self.session.close_calls, 0)
+        # 显式关闭仍然有效
+        self.assertTrue(self.channel.retire_if_idle(force=True))
+        self.assertEqual(self.session.close_calls, 1)
+
     def test_force_retires_even_when_watched(self):
         self.channel.subscribe(lambda image, meta: None)
         self.assertTrue(self.channel.retire_if_idle(force=True))

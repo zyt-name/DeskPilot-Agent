@@ -73,7 +73,9 @@ class BrowserConfig:
     enabled: bool = True
     engine: str = "auto"  # auto | edge | chrome | chromium
     profile_root: str = ".xm-agent/browser/profiles"
-    headless: str = "auto"  # auto | always | never
+    # auto = 可见窗口（任务结束后用户能直接接着用），无桌面时回退无头；
+    # always = 强制无头；never = 强制可见
+    headless: str = "auto"
     keep_alive_seconds: int = 300
     mirror_fps: int = 15
     screenshot_max_width: int = 1280
