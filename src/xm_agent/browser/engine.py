@@ -171,7 +171,8 @@ def resolve_engine(
     if preference == "auto":
         raise EngineNotFound(
             "未检测到可用的浏览器内核（Edge / Chrome / 内置 Chromium 均缺失）。"
-            "请安装 Edge 或 Chrome，或执行 xm-agent resources ensure 下载内置内核。"
+            "请安装 Edge 或 Chrome，或在控制台「资源」里安装内置 Chromium，"
+            "也可以执行 python -m xm_agent resources ensure --only chromium（约 210MB）。"
         )
     raise EngineNotFound(
         f"未检测到 {ENGINE_LABELS.get(preference, preference)}，且已指定引擎不自动替换。"

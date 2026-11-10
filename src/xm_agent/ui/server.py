@@ -602,7 +602,22 @@ class UiServer:
                     90 + int(index / max(1, total) * 9),
                 )
             try:
-                result = probe_adapter_kind(self.config, state.id, timeout=20)
+                resource = next(
+                    (
+                        item
+                        for item in self.resources.resources
+                        if item.id == state.id
+                    ),
+                    None,
+                )
+                if resource is not None and resource.kind == "browser":
+                    # 内核不是 MCP 服务，探针要跑 --version，不能当适配器启动
+                    ok, detail = self.resources.probe_browser(state.id)
+                    result = {"ok": ok, "detail": detail, "tools": []}
+                else:
+                    result = probe_adapter_kind(
+                        self.config, state.id, timeout=20
+                    )
             except Exception as exc:
                 result = {
                     "ok": False,

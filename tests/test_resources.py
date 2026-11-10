@@ -80,16 +80,77 @@ def test_manifest_resources_are_pinned():
     assert {resource.id for resource in RESOURCES} == {
         "windows_mcp",
         "computer_use_mcp",
+        "chromium",
         "xshell_mcp",
     }
     for resource in RESOURCES:
         assert resource.version
-        assert len(resource.ref) == 40
         assert resource.repo.count("/") == 1
         assert resource.dest.endswith(f"-{resource.version}")
         assert resource.link.endswith(resource.directory)
-        assert resource.archive.startswith("https://github.com/")
         assert resource.license
+        if resource.kind == "browser":
+            # 内核来自 Chrome for Testing，不是 GitHub 仓库归档
+            assert resource.archive.startswith("https://")
+            assert {label for label, _ in resource.sources} >= {
+                "npmmirror",
+                "google",
+            }
+            assert resource.entry == "chrome.exe"
+            assert len(resource.sources) >= 2  # 官方 + 国内镜像
+            continue
+        assert len(resource.ref) == 40
+        assert resource.archive.startswith("https://github.com/")
+
+
+def test_browser_resource_installs_from_explicit_source(tmp_path):
+    # Chrome for Testing 的 zip 里是单个顶层目录 chrome-win64/，解压后要能
+    # 直接落到 chromium-<version>/chrome.exe，引擎解析才找得到。
+    payload = _archive({"chrome.exe": "fake-binary"}, root="chrome-win64")
+    httpd = _server(payload)
+    port = httpd.server_address[1]
+    resource = Resource(
+        id="chromium",
+        name="内置 Chromium",
+        version="1.2.3.4",
+        repo="GoogleChromeLabs/chrome-for-testing",
+        ref="1.2.3.4",
+        kind="browser",
+        directory="chromium",
+        install_dir="engines",
+        entry="chrome.exe",
+        purpose="测试用内核",
+        required=False,
+        license="BSD-3-Clause",
+        downloads=(("local", f"http://127.0.0.1:{port}/mirror.zip"),),
+    )
+    manager = ResourceManager(tmp_path, resources=(resource,))
+    try:
+        state = manager.ensure(only=["chromium"])[0]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert state.status == "ready"
+    assert state.source == "local"
+    assert (tmp_path / resource.dest / "chrome.exe").is_file()
+    # 内核不需要稳定入口链接，引擎解析直接按版本目录找
+    assert not (tmp_path / resource.link).exists()
+    assert not (tmp_path / "vendor").exists()
+
+
+def test_browser_probe_rejects_non_browser_resource(tmp_path):
+    manager = ResourceManager(tmp_path)
+    ok, detail = manager.probe_browser("windows_mcp")
+    assert ok is False
+    assert "浏览器" in detail
+
+
+def test_browser_probe_reports_missing_install(tmp_path):
+    manager = ResourceManager(tmp_path)
+    ok, detail = manager.probe_browser("chromium")
+    assert ok is False
+    assert detail
 
 
 def test_status_reads_versioned_install(tmp_path):

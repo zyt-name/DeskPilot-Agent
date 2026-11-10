@@ -1,7 +1,6 @@
 import threading
 import time
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -19,7 +18,6 @@ from xm_agent.types import (
     Action,
     Element,
     Observation,
-    PolicyDecision,
     Receipt,
     StepRecord,
     Verification,

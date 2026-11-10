@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 
-from xm_agent.contracts import CAPABILITIES
 from xm_agent.guard import (
     AuditGate,
     TopLevelAuditor,
@@ -11,7 +10,6 @@ from xm_agent.guard import (
     rule_verdict,
 )
 from xm_agent.guard.auditor import fallback_verdict
-from xm_agent.policy import Policy
 from xm_agent.types import Action, Element, Observation, PolicyDecision
 
 

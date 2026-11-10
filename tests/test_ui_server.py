@@ -1121,7 +1121,7 @@ def test_ask_screen_route_reports_unknown_run(server):
 def test_pause_and_resume_update_screen_indicator(server):
     app, _ = server
     app.indicator = _RecordingIndicator()
-    control = _register_running(app, "run-indicator")
+    _register_running(app, "run-indicator")
     try:
         assert app.pause_run("run-indicator") is True
         assert app.indicator.paused is True

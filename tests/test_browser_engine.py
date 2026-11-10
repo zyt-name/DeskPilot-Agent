@@ -174,3 +174,49 @@ def test_browser_config_dataclass_defaults():
     config = BrowserConfig()
     assert config.engine == "auto"
     assert config.keep_alive_seconds == 300
+
+
+def test_profile_dir_is_always_absolute(monkeypatch):
+    """相对 profile 路径会让 Chromium 把 DevToolsActivePort 写到别处。
+
+    默认配置就是相对路径（`.xm-agent/browser/profiles`），所以这条必须锁住：
+    传给内核的 `--user-data-dir` 一律解析成绝对路径。
+    """
+    import types
+
+    from xm_agent.browser import session as session_mod
+
+    captured: dict[str, object] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class FakeProcess:
+        def __init__(self, engine, profile_dir, headless=True):
+            captured["dir"] = profile_dir
+
+        def start(self, timeout=20.0):
+            raise _Stop("stop here")
+
+    monkeypatch.setattr(session_mod, "BrowserProcess", FakeProcess)
+    monkeypatch.setattr(
+        session_mod,
+        "resolve_engine",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            name="chromium",
+            path="chromium.exe",
+            version="157.0",
+            source="bundled",
+            label="内置 Chromium",
+        ),
+    )
+    browser = BrowserSession(
+        BrowserSettings(profile_root="relative/profiles", engine="chromium"),
+        headless=True,
+    )
+    with pytest.raises(_Stop):
+        browser.start()
+
+    profile_dir = captured["dir"]
+    assert profile_dir.is_absolute()
+    assert profile_dir.name == "chromium"

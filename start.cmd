@@ -85,6 +85,17 @@ if errorlevel 1 (
   echo [xm-agent] open Settings and use "检测并修复资源" to retry.
 )
 
+rem Browser channel uses system Edge/Chrome, with bundled Chromium only as fallback.
+rem The kernel is ~210MB, so it is installed on demand instead of every startup.
+if exist "%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe" goto :browser_ok
+if exist "%ProgramFiles%\Microsoft\Edge\Application\msedge.exe" goto :browser_ok
+if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" goto :browser_ok
+if exist "%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe" goto :browser_ok
+if exist "%ROOT%.xm-agent\browser\engines\chromium-*\chrome.exe" goto :browser_ok
+echo [xm-agent] no Edge/Chrome detected. The browser channel needs a kernel:
+echo   "%PY%" -m xm_agent resources ensure --only chromium
+:browser_ok
+
 rem Pass "debug" to open devtools; other arguments are forwarded as-is.
 set "EXTRA=%*"
 if /i "%~1"=="debug" set "EXTRA=--debug"

@@ -996,7 +996,7 @@ always_confirm = ["file.transfer", "terminal.exec"]
 > **模块标记：浏览器功能（Browser Channel）**
 >
 > - 归属：**独立执行通道**，与「桌面操控」「终端」并列，不是桌面适配器的一个子模式。
-> - 状态：**P1 已完成**。`browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块，加上 4.22 的通道抽象、`browser.*` 能力契约、审计规则、CLI 与面板接入、面板镜像、纯浏览器模式、空闲回收调度、扫码登录接管，均已落地并真机自测。**未完成**：内置 Chromium 下载与资源管理、MCP 资源更新检测。这两项不得在 README 或 STATUS 的「已完成」中描述为已有能力。
+> - 状态：**P1 已完成**。`browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块，加上 4.22 的通道抽象、`browser.*` 能力契约、审计规则、CLI 与面板接入、面板镜像、纯浏览器模式、空闲回收调度、扫码登录接管，均已落地并真机自测。内置 Chromium 已纳入资源管理（按需安装、双源下载、`--version` 探针）。**未完成**：资源更新检测（自动发现新版本）。这一项不得在 README 或 STATUS 的「已完成」中描述为已有能力。
 > - 引擎：**仅支持 Microsoft Edge、Google Chrome，以及内置 Chromium 兜底**；其他浏览器不在支持范围。
 > - 数据：三种引擎**各用独立 profile**，互不共享，也不读取用户日常浏览器的资料。
 > - 驱动：**纯 Python 标准库直连 CDP**，不依赖 Playwright、Selenium 或任何第三方包。
@@ -1454,10 +1454,30 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 
 注意：目标本身就是要登录（`登录/注册/密码/账号` 等关键词）时不触发暂停——那是用户明确要求的事；任务上下文里已给出密码时同样不暂停。
 
-#### 4.22.12 未完成（按依赖顺序）
+#### 4.22.12 内置 Chromium 纳入资源管理（已实现）
 
-1. **内置 Chromium 下载与资源管理**：`kind="browser"` 的 manifest、镜像源、断点续传、启动探针（4.21 已写清约定，代码未写）。
-2. **MCP 资源更新检测**：查 GitHub release、版本比较、兼容性判定。
+内核是 210MB 的二进制，不能塞进安装包，也不能每次启动都检查下载。做法：
+
+- 清单里新增 `chromium` 资源：`kind="browser"`、`install_dir=".xm-agent/browser/engines"`、`entry="chrome.exe"`。
+  `install_dir` 与引擎解析的 `bundled_root`（`profile_root/../engines`）对齐，装完不用改配置就能被 `find_engine_path` 找到（它按 `chromium-*/chrome.exe` 取最新版本）。
+- 下载源写成显式列表（`Resource.downloads`）：Google 官方 `storage.googleapis.com/chrome-for-testing-public` 与 npmmirror 镜像；这两个都不是 GitHub，所以**不走 GitHub 代理**，直接按顺序试。
+- 安装分支只做「下载 → 安全解压 → 校验入口」：不建 junction、不跑构建。Chrome for Testing 的 zip 顶层目录是 `chrome-win64/`，现有解压逻辑会把它剥掉，最终落在 `chromium-<version>/chrome.exe`。
+- **默认不装**：`ensure()` 不传 `only` 时跳过 `kind="browser"` 的资源，避免「检测并修复资源」顺手拉 210MB。安装入口是面板里该项的安装按钮，或 `python -m xm_agent resources ensure --only chromium`。
+- 启动探针：`ResourceManager.probe_browser()` 真的执行一次 `chrome.exe --version`。只看文件是否存在不够——解压不全的 exe 也会存在，一启动就退出。面板的资源探针按 kind 分流，不会把内核当成 MCP 服务去起。
+- `start.cmd` 增加内核检查：有 Edge/Chrome 就直接过，都没有才提示安装内置内核。
+- 版本号固定为 `157.0.8103.50`（与 2026-11 的 Stable 一致）；临时文件、下载缓存都在 `.xm-agent/resources` 下，已在 `.gitignore` 中。
+
+**踩坑记录**：默认配置的 `profile_root` 是相对路径，Chromium 在相对 `--user-data-dir` 下会把 `DevToolsActivePort` 写到别处，启动探针 20s 后报「未就绪」。此前的实测都用临时绝对路径，所以没暴露；现在 `BrowserSession.start()` 一律 `resolve()`，并加了回归用例。
+
+**实测**（内置 Chromium 157.0.8103.50，npmmirror 源 10.6 MB/s，约 20s 下完 200.9 MB）：安装后 `chrome.exe --version` 返回 `Google Chrome for Testing 157.0.8103.50`；`resolve_engine("chromium")` 命中 `source=bundled`；启动 1.41s、观测 example.com、按序号点击 b0 均成功。
+
+**踩坑记录**：默认配置的 `profile_root` 是相对路径，Chromium 在相对 `--user-data-dir` 下会把 `DevToolsActivePort` 写到别处，启动探针 20s 后报「未就绪」。此前的实测都用临时绝对路径，所以没暴露；现在 `BrowserSession.start()` 一律 `resolve()`，并加了回归用例。
+
+**实测**（内置 Chromium 157.0.8103.50，npmmirror 源 10.6 MB/s，约 20s 下完 200.9 MB）：安装后 `chrome.exe --version` 返回 `Google Chrome for Testing 157.0.8103.50`；`resolve_engine("chromium")` 命中 `source=bundled`；启动 1.41s、观测 example.com、按序号点击 b0 均成功。
+
+#### 4.22.13 未完成
+
+1. **资源更新检测**（含第三方 MCP）：查 GitHub Releases/Tags、版本比较、兼容门禁、旁路安装、探针通过才切换、失败回滚、`off/notify/auto` 三档。当前只支持「清单里写死的版本」，没有自动发现新版本。
 
 ---
 
@@ -1605,7 +1625,7 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 | 面板其余页面（总览 / AI 模型 / 用量 / 历史 / 设置，饼图与资源悬浮窗） | `src/xm_agent/ui/static/` | 完成 |
 | 数据保留清理（审计 JSONL 与截图按天清理、`cleanup` CLI、启动调度） | `src/xm_agent/maintenance.py`、`src/xm_agent/cli.py` | 完成，dry-run 与保留期下限测试通过 |
 | 只读探测脚本（`tools/list`、`Snapshot`、Computer-Use 截图、Xshell 状态） | `scripts/probe_windows_mcp.py`、`scripts/probe_computer_use_mcp.py`、`scripts/probe_xshell_mcp.py` | Windows 端到端只读已验；其余待构建/环境 |
-| 测试（pytest，419 项） | `tests/` | 通过 |
+| 测试（pytest，423 项） | `tests/` | 通过 |
 | 无依赖假 MCP Server（覆盖 12 个工具，用于协议联调） | `examples/fake_mcp_server.py` | 完成 |
 
 ### 6.2 待完成
@@ -1627,7 +1647,7 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 | ~~P0~~ | 顶层 AI 审计（操作描述符、盲审、失败关闭、执行前复核） | 已完成：敏感操作先规则后盲审；模型不可用或异常时升级用户确认 |
 | ~~P0~~ | 用户审计模式（AI 审计 / 执行前询问）与确认弹窗 | 已完成：两种模式可切换；批准仅对当前步骤生效 |
 | ~~P0~~ | 登录阻塞与用户接管 | 已完成：无凭据时 `task.await_user` 中止；UIA 登录页确定性兜底；同会话「继续」沿用原目标并从当前屏幕恢复，队列透传用户消息与上下文 |
-| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入、面板镜像（抽屉 / 全屏 / SSE 帧流）、纯浏览器模式、空闲回收调度、扫码登录接管。待完成：内置 Chromium 纳入资源完整性、资源更新检测 |
+| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入、面板镜像（抽屉 / 全屏 / SSE 帧流）、纯浏览器模式、空闲回收调度、扫码登录接管。内置 Chromium 已纳入资源管理（按需安装、双源、启动探针）。待完成：资源更新检测 |
 | P1 | 非标准登录页识别（验证码 / 二次验证 / 纯图形） | 视觉模型判定并请求用户接管；无法判定时不得绕过或猜测 |
 | P1 | 凭据安全输入 | 密码不进入任务目标、会话记录与审计日志；接入系统凭据存储 |
 | P1 | 审计决策面板、Token 统计与回放 | 缓存已实现；模型/耗时/用户决定的统计与回放待做 |

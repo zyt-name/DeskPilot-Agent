@@ -7,7 +7,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -204,7 +203,13 @@ class ResourceManager:
     # ----------------------------------------------------------------- inspect
     def _select(self, only: Sequence[str] | None) -> list[Resource]:
         if not only:
-            return list(self.resources)
+            # 浏览器内核有 200MB+，绝不能在「检测资源完整性」时顺手拉下来。
+            # 它是兜底引擎，只在用户显式安装、或引擎解析真的需要时才装。
+            return [
+                resource
+                for resource in self.resources
+                if resource.kind != "browser"
+            ]
         wanted = {str(item) for item in only}
         known = {resource.id for resource in self.resources}
         unknown = wanted - known
@@ -383,14 +388,19 @@ class ResourceManager:
                 resource_percent=74,
             )
 
-        self._ensure_link(resource, link, dest, phase)
-        phase("build", "准备运行环境", 82)
-        if resource.kind == "python":
-            self._build_python(resource, dest, phase)
-        elif resource.kind == "node":
-            self._build_node(resource, dest, phase)
+        if resource.kind == "browser":
+            # 内核是解压即用的二进制，不需要构建，也不需要稳定入口链接：
+            # 引擎解析按 chromium-<version>/chrome.exe 直接找最新版本。
+            phase("verify", "校验内核文件", 90)
         else:
-            raise ResourceError(f"unknown resource kind: {resource.kind}")
+            self._ensure_link(resource, link, dest, phase)
+            phase("build", "准备运行环境", 82)
+            if resource.kind == "python":
+                self._build_python(resource, dest, phase)
+            elif resource.kind == "node":
+                self._build_node(resource, dest, phase)
+            else:
+                raise ResourceError(f"unknown resource kind: {resource.kind}")
 
         if not (dest / resource.entry).exists():
             raise ResourceError(f"构建完成但缺少入口文件：{resource.entry}")
@@ -426,11 +436,16 @@ class ResourceManager:
         if cache.is_file() and zipfile.is_zipfile(cache):
             return cache, "本地缓存"
 
-        sources = [("GitHub", resource.archive, 20)]
-        sources += [
-            (name, template.format(url=resource.archive), 60)
-            for name, template in self.mirrors
-        ]
+        if resource.sources:
+            # 显式下载源（如 Chrome for Testing）自带官方与国内镜像，
+            # 不再套 GitHub 代理——代理对非 GitHub 域名无效。
+            sources = [(label, url, 60) for label, url in resource.sources]
+        else:
+            sources = [("GitHub", resource.archive, 20)]
+            sources += [
+                (name, template.format(url=resource.archive), 60)
+                for name, template in self.mirrors
+            ]
         errors: list[str] = []
         part = cache.with_suffix(".zip.part")
         for label, url, timeout in sources:
@@ -780,7 +795,40 @@ class ResourceManager:
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    def probe_browser(self, resource_id: str = "chromium") -> tuple[bool, str]:
+        """启动探针：真的跑一次 `--version`，确认内核能起来。
+
+        只看文件存在不够——解压不全的 chrome.exe 也会存在，但一启动就退出。
+        """
+        resource = next(
+            (item for item in self.resources if item.id == resource_id), None
+        )
+        if resource is None or resource.kind != "browser":
+            return False, "不是浏览器内核资源"
+        state = self._inspect(resource)
+        if not state.ok:
+            return False, state.detail or state.status
+        executable = Path(state.location) / resource.entry
+        try:
+            result = subprocess.run(
+                [str(executable), "--version"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=20,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"内核启动失败：{exc}"
+        text = (result.stdout or result.stderr or "").strip()
+        if result.returncode != 0 or not text:
+            return False, f"内核未正常响应（退出码 {result.returncode}）"
+        return True, text.splitlines()[0][:120]
+
     def _read_version(self, resource: Resource, path: Path) -> str:
+        if resource.kind == "browser":
+            return str(self._read_marker(path).get("version") or "")
         if resource.kind == "python":
             for name in ("manifest.json", "package.json"):
                 version = self._json_version(path / name)

@@ -178,7 +178,6 @@ def test_confirmation_brings_console_back(tmp_path):
 
     import threading
 
-    import xm_agent.ui.server as server_module
 
     original_publish = app._publish
 

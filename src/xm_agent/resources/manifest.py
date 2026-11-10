@@ -19,20 +19,35 @@ class Resource:
     required: bool = True
     license: str = ""
     archive_url: str | None = None
+    # 非 GitHub 归档的显式下载源，按顺序尝试；`{version}` 会被版本号替换。
+    downloads: tuple[tuple[str, str], ...] = ()
+    install_dir: str = "vendor"
 
     @property
     def archive(self) -> str:
         if self.archive_url:
             return self.archive_url
+        if self.downloads:
+            return self.downloads[0][1].replace("{version}", self.version)
         return f"https://github.com/{self.repo}/archive/{self.ref}.zip"
 
     @property
+    def sources(self) -> tuple[tuple[str, str], ...]:
+        """(标签, 地址) 列表。显式下载源自带镜像，不再走 GitHub 代理。"""
+        if self.downloads:
+            return tuple(
+                (label, url.replace("{version}", self.version))
+                for label, url in self.downloads
+            )
+        return ()
+
+    @property
     def dest(self) -> str:
-        return f"vendor/{self.directory}-{self.version}"
+        return f"{self.install_dir}/{self.directory}-{self.version}"
 
     @property
     def link(self) -> str:
-        return f"vendor/{self.directory}"
+        return f"{self.install_dir}/{self.directory}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +114,34 @@ RESOURCES: tuple[Resource, ...] = (
         purpose="视觉通道：基于截图的坐标级桌面操作，需要支持图像输入的模型。",
         required=False,
         license="MIT",
+    ),
+    Resource(
+        id="chromium",
+        name="内置 Chromium",
+        version="157.0.8103.50",
+        repo="GoogleChromeLabs/chrome-for-testing",
+        ref="157.0.8103.50",
+        kind="browser",
+        directory="chromium",
+        # 与 BrowserChannel 的 bundled_root（profile_root/../engines）对齐，
+        # 这样引擎解析不用额外配置就能找到它。
+        install_dir=".xm-agent/browser/engines",
+        entry="chrome.exe",
+        purpose="兜底内核：机器上没有 Edge/Chrome 时使用；独立 profile，不读用户浏览器数据。",
+        required=False,
+        license="BSD-3-Clause（Chromium）",
+        # npmmirror 在前：国内实测 10.6 MB/s，Google 直连只有 0.15 MB/s，
+        # 放后面等于默认慢速。两者内容一致，任一可用即可。
+        downloads=(
+            (
+                "npmmirror",
+                "https://cdn.npmmirror.com/binaries/chrome-for-testing/{version}/win64/chrome-win64.zip",
+            ),
+            (
+                "google",
+                "https://storage.googleapis.com/chrome-for-testing-public/{version}/win64/chrome-win64.zip",
+            ),
+        ),
     ),
     Resource(
         id="xshell_mcp",

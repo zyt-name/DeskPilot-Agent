@@ -236,7 +236,9 @@ class BrowserSession:
         profile_root = Path(self.settings.profile_root)
         bundled_root = bundled_root_for(profile_root)
         self.engine = resolve_engine(self.settings.engine, bundled_root)
-        profile_dir = profile_root / self.engine.name
+        # 必须是绝对路径：相对路径下 Chromium 会把 DevToolsActivePort 写到别处，
+        # 启动探针永远等不到端口（真机踩过，默认配置就是相对路径）。
+        profile_dir = (profile_root / self.engine.name).resolve()
         self.process = BrowserProcess(
             self.engine, profile_dir, headless=self.headless
         )
