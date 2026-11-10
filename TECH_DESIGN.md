@@ -996,7 +996,7 @@ always_confirm = ["file.transfer", "terminal.exec"]
 > **模块标记：浏览器功能（Browser Channel）**
 >
 > - 归属：**独立执行通道**，与「桌面操控」「终端」并列，不是桌面适配器的一个子模式。
-> - 状态：**地基已实测通过，功能尚未实现**（见 4.21.14 实测数据；`src/xm_agent/browser/` 尚未创建）。本节是设计约定，落地前不得在 README 或 STATUS 的「已完成」中描述为已有能力。
+> - 状态：**P0 地基已验证，P1 引擎与适配器已完成一半**（`src/xm_agent/browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块已落地并自测；`browser.*` 能力契约、通道抽象、前端镜像、扫码接管、资源管理、更新检测尚未实现）。未完成部分不得在 README 或 STATUS 的「已完成」中描述为已有能力。
 > - 引擎：**仅支持 Microsoft Edge、Google Chrome，以及内置 Chromium 兜底**；其他浏览器不在支持范围。
 > - 数据：三种引擎**各用独立 profile**，互不共享，也不读取用户日常浏览器的资料。
 > - 驱动：**纯 Python 标准库直连 CDP**，不依赖 Playwright、Selenium 或任何第三方包。
@@ -1200,9 +1200,9 @@ https://storage.googleapis.com/chrome-for-testing-public/<version>/win64/chrome-
 | 阶段 | 出口标准 |
 |---|---|
 | P0 地基验证 | **已完成**，见 4.21.14 实测数据 |
-| P1 引擎与适配器 | Edge / Chrome / Chromium 三选一可跑通；独立 profile 生效；`browser.*` 能力可被模型调用；契约测试覆盖第 5 个后端 |
+| P1 引擎与适配器 | 引擎与观测动作层**已完成**（`browser/cdp|engine|session|snapshot|input|mirror.py`，32 个用例）；剩余：`browser.*` 能力契约、契约测试扩到第 5 个后端 |
 | P2 通道抽象 | 浏览器通道运行时不截屏、不显覆盖层、不让出桌面；路由与引擎可强制指定 |
-| P3 界面三表层 | 抽屉、全屏视图（含左侧对话列）、可选独立窗口均可用 |
+| P3 界面三表层 | 抽屉、全屏视图（含左侧对话列）、可选独立窗口均可用（后端帧流已完成） |
 | P4 登录与接管 | 每个引擎首次扫码、接管、自动续跑全链路通过；profile 可按引擎清除 |
 | P5 资源与更新 | 内置 Chromium 纳入 `ensure` 与完整性探针；MCP 资源更新检测可发现、可门禁、可回滚 |
 | P6 加固 | 反爬兜底、可见模式、下载上传、性能 |
@@ -1223,10 +1223,12 @@ https://storage.googleapis.com/chrome-for-testing-public/<version>/win64/chrome-
 | Cookie + localStorage（`Browser.close`） | **完整保留**：重开后 `sessionid=token-xyz-999`、`localStorage.user='tester'` 均在 |
 | headful 可见模式 | 可启动并可截图（10020 字节），供扫码时给用户看真窗口 |
 
-同时暴露两个必须写进代码的坑：
+同时暴露三个必须写进代码的坑：
 
 1. **`DevToolsActivePort` 残留**：profile 目录里该文件存在时，直接读会拿到上次实例的端口，连接报 `WinError 10061`。启动前必须先删除该文件，再等待新文件出现并**校验端口可连**，不能只判断文件存在。
 2. **`Input.insertText` 依赖焦点**：无焦点时静默丢弃，不报错。输入前必须先 `Runtime.evaluate` 聚焦目标元素，或用 `DOM.focus`。
+3. **镜像 ack 会在读线程里死锁**：`Page.screencastFrame` 的 handler 在读线程中执行，若在里面同步 `call("Page.screencastFrameAck")`，读线程会等一个只能由它自己置位的响应。必须提供「只发不等」的 `post()` 通道。
+4. **静止页面不推帧**：screencast 只在画面可见变化时出帧，新建镜像会一直空白。启动时先截一张静态图作为首帧兜底。
 
 验证脚本已入库：`scripts/probe_browser_cdp.py`（纯标准库，与 `probe_windows_mcp.py` 等并列）。复跑命令：
 
@@ -1236,7 +1238,7 @@ PYTHONPATH=src .venv\Scripts\python.exe scripts\probe_browser_cdp.py --engine ch
 PYTHONPATH=src .venv\Scripts\python.exe scripts\probe_browser_cdp.py --headful
 ```
 
-该脚本里的 `CdpClient` 与 `Engine` 就是 P1 `browser/cdp.py`、`browser/engine.py` 的原型，落地时拆成模块并补断言到 `tests/`。
+该脚本里的 `CdpClient` 与 `Engine` 已提炼为正式模块 `browser/cdp.py`、`browser/engine.py`，脚本保留作排障工具。等价断言写在 `tests/test_browser_engine.py`（18 项逻辑）与 `tests/test_browser_session.py`（14 项真机，无浏览器自动跳过）。
 
 #### 4.21.15 打包与零环境依赖
 

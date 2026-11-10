@@ -67,12 +67,26 @@ class AdapterConfig:
 
 
 @dataclass
+class BrowserConfig:
+    """内置浏览器通道。见 TECH_DESIGN 4.21。"""
+
+    engine: str = "auto"  # auto | edge | chrome | chromium
+    profile_root: str = ".xm-agent/browser/profiles"
+    headless: str = "auto"  # auto | always | never
+    keep_alive_seconds: int = 300
+    mirror_fps: int = 15
+    screenshot_max_width: int = 1280
+    connect_timeout: float = 20.0
+
+
+@dataclass
 class AgentConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
     audit_ai: AuditAiConfig = field(default_factory=AuditAiConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    browser: BrowserConfig = field(default_factory=BrowserConfig)
     adapters: dict[str, AdapterConfig] = field(
         default_factory=lambda: {"mock": AdapterConfig()}
     )
@@ -242,12 +256,52 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
             f"default adapter {default_adapter!r} is not defined in [adapters]"
         )
 
+    browser_raw = runtime_raw.get("browser", {})
+    if not isinstance(browser_raw, dict):
+        browser_raw = {}
+    browser_engine = str(
+        browser_raw.get("engine", defaults.browser.engine)
+    ).strip().lower()
+    if browser_engine not in {"auto", "edge", "chrome", "chromium"}:
+        raise ValueError(
+            "runtime.browser.engine must be one of auto / edge / chrome / chromium"
+        )
+    browser_headless = str(
+        browser_raw.get("headless", defaults.browser.headless)
+    ).strip().lower()
+    if browser_headless not in {"auto", "always", "never"}:
+        raise ValueError("runtime.browser.headless must be one of auto / always / never")
+    browser = BrowserConfig(
+        engine=browser_engine,
+        profile_root=str(
+            browser_raw.get("profile_root", defaults.browser.profile_root)
+        ),
+        headless=browser_headless,
+        keep_alive_seconds=int(
+            browser_raw.get(
+                "keep_alive_seconds", defaults.browser.keep_alive_seconds
+            )
+        ),
+        mirror_fps=int(
+            browser_raw.get("mirror_fps", defaults.browser.mirror_fps)
+        ),
+        screenshot_max_width=int(
+            browser_raw.get(
+                "screenshot_max_width", defaults.browser.screenshot_max_width
+            )
+        ),
+        connect_timeout=float(
+            browser_raw.get("connect_timeout", defaults.browser.connect_timeout)
+        ),
+    )
+
     return AgentConfig(
         runtime=runtime,
         audit=audit,
         audit_ai=audit_ai,
         model=model,
         policy=policy,
+        browser=browser,
         adapters=adapters,
         default_adapter=default_adapter,
     )

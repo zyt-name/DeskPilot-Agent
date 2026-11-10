@@ -15,6 +15,23 @@ lock_ttl_seconds = 60
 # Linux 等任务走 xshell；Windows-MCP 观测失败时回退 computer_use（需可识图模型）。
 default_adapter = "mock"
 
+# 内置浏览器通道（浏览器功能）。见 TECH_DESIGN 4.21。
+# 只支持 Edge / Chrome / 内置 Chromium，其他浏览器不在支持范围。
+[runtime.browser]
+# auto = 按 Edge → Chrome → 内置 Chromium 顺序回落；指定具体引擎时缺失会直接报错，
+# 不会静默换成别的浏览器。
+engine = "auto"
+# 每个引擎独立 profile，互不共享，也不读取你日常浏览器的数据；首次使用需扫码一次。
+profile_root = ".xm-agent/browser/profiles"
+# auto = 默认无头，遇到需要扫码的登录页自动切可见窗口；always / never 强制。
+headless = "auto"
+# 空闲多久后关闭内核（登录态在磁盘，重开即恢复）。
+keep_alive_seconds = 300
+# 镜像帧率与截图宽度。面板收起时停流，成本归零。
+mirror_fps = 15
+screenshot_max_width = 1280
+connect_timeout = 20.0
+
 [audit]
 root = ".xm-agent/audit"
 keep_days = 7

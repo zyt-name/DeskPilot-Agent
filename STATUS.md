@@ -48,9 +48,10 @@
 | 契约测试 | `tests/test_contract.py` | 完成 | 同一组用例参数化跑 mock / windows / computer_use / xshell 四个后端（observe 结构、终止能力失败关闭、verify 结构、close 幂等） |
 | 配置 | `config/agent.example.toml`、`config/xshell-mcp.json` | 完成 | TOML 适配器映射、子进程 env/cwd、`model` 回退配置、`[runtime].screenshot_dir` |
 | 只读探测脚本 | `scripts/probe_windows_mcp.py`、`scripts/probe_computer_use_mcp.py`、`scripts/probe_xshell_mcp.py` | 完成 | Windows 端到端只读；Computer-Use 已构建；Xshell 框架保留 |
-| 测试 | `tests/` | 完成 | 317 个用例全部通过 |
+| 测试 | `tests/` | 完成 | 349 个用例全部通过（含 14 项浏览器真机集成） |
 | 测试用 MCP Server | `examples/fake_mcp_server.py` | 完成 | 无第三方依赖，stdio JSON-RPC |
-| 浏览器通道地基（验证脚本） | `scripts/probe_browser_cdp.py` | 已验证 | 纯标准库 CDP：启动 156ms、截图 73ms/7KB、点击 8ms 精确命中、镜像约 12fps、中文 inputText、`Browser.close` 后登录态保留、headful 可启动 |
+| 浏览器通道核心（引擎 / 会话 / 观测 / 输入 / 镜像） | `src/xm_agent/browser/`（`cdp.py`、`engine.py`、`session.py`、`snapshot.py`、`input.py`、`mirror.py`） | 完成 | 纯标准库 CDP：启动、导航、截图、可交互元素清单（带坐标）、中文 `insertText`、坐标点击、镜像帧流、优雅关闭保留登录态；32 个用例（18 逻辑 + 14 真机） |
+| 浏览器地基验证脚本 | `scripts/probe_browser_cdp.py` | 已完成使命 | 模块落地前的实测依据，保留作排障工具 |
 
 ### 已接入的第三方 MCP
 
@@ -70,7 +71,7 @@
 PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 ```
 
-结果：`317 passed`
+结果：`349 passed`
 
 覆盖范围：
 
@@ -199,17 +200,18 @@ Xshell MCP（框架保留，本机未安装 Xshell）：
 
 > 与桌面通道并列的独立执行通道，详见 TECH_DESIGN 4.21。不占用、不截取、不点击用户桌面。
 
-- [x] 【浏览器功能】P0 地基验证：无头内核启动 0.16s、截图 133ms、坐标点击 14ms 精确命中、镜像约 14fps、中文输入、`Browser.close` 后登录态仍在新（TECH_DESIGN 4.21.14，纯标准库，无第三方依赖）
-- [ ] 【浏览器功能】`browser/` 子包落地：标准库 CDP 客户端、引擎解析、会话与标签、快照、输入、镜像帧
-- [ ] 【浏览器功能】引擎解析：Edge / Chrome / 内置 Chromium 三级回落，缺失时明确提示不静默降级
-- [ ] 【浏览器功能】独立 profile：按引擎隔离目录、写锁、空闲回收、首次扫码与按引擎清除
+- [x] 【浏览器功能】P0 地基验证：无头内核启动 156ms、截图 73ms、坐标点击 8ms 精确命中、镜像约 12fps、中文输入、`Browser.close` 后登录态仍在（TECH_DESIGN 4.21.14，纯标准库，无第三方依赖）
+- [x] 【浏览器功能】`browser/` 子包落地：标准库 CDP 客户端（后台读线程 / 写锁 / 事件订阅 / 死锁规避）、引擎解析、会话与标签、快照、输入、镜像帧
+- [x] 【浏览器功能】引擎解析：Edge / Chrome / 内置 Chromium 三级回落，指定引擎缺失时明确报错不静默降级；版本探测走 `--product-version`
+- [x] 【浏览器功能】独立 profile：按引擎隔离目录 + 进程内注册表与跨进程 pid 锁文件（含残留锁清理）
+- [x] 【浏览器功能】零依赖分发：`pyproject.toml` 未新增任何依赖，WebSocket/解压/HTTP 全走标准库
+- [ ] 【浏览器功能】空闲回收：`keep_alive_seconds` 到期自动优雅关闭（配置项已就位，调度未接）
 - [ ] 【浏览器功能】`browser.*` 能力契约与适配器，契约测试扩到第 5 个后端
 - [ ] 【浏览器功能】通道抽象与路由：浏览器通道运行时不截屏、不显示覆盖层、不让出桌面
-- [ ] 【浏览器功能】镜像表层：侧边抽屉、全屏视图（左侧对话列）、可选独立第二窗口
-- [ ] 【浏览器功能】扫码登录与接管：登录检测、面板提示扫码、会话变化自动续跑、失败不重试轰炸
-- [ ] 【浏览器功能】登录态兜底：`Browser.close` 优雅退出 + `DevToolsActivePort` 残留清理 + DPAPI cookie 快照
-- [ ] 【浏览器功能】内置 Chromium 纳入资源管理：`kind="browser"`、Chrome for Testing 下载、`start.cmd` 检查、`/json/version` 完整性探针、国内镜像
-- [ ] 【浏览器功能】零依赖分发：确认 `pyproject.toml` 不新增依赖、PyInstaller 无需新 hooks、离线场景可降级
+- [ ] 【浏览器功能】镜像表层：侧边抽屉、全屏视图（左侧对话列）、可选独立第二窗口（后端帧流已完成，前端组件未做）
+- [ ] 【浏览器功能】扫码登录与接管：登录检测、面板提示扫码、会话变化自动续跑、失败不重试轰炸；`ensure_visible()` 已可切可见模式
+- [ ] 【浏览器功能】登录态兜底：`Browser.close` 优雅退出与 `DevToolsActivePort` 残留清理已完成；DPAPI cookie 快照未做
+- [ ] 【浏览器功能】内置 Chromium 纳入资源管理：`kind="browser"`、Chrome for Testing 下载、`start.cmd` 检查、`/json/version` 完整性探针、国内镜像（引擎解析已支持 bundled 路径）
 - [ ] 【浏览器功能】资源更新检测：GitHub Releases/Tags + 兼容门禁 + 旁路安装 + 探针通过才切换 + 回滚 + `off/notify/auto`
 - [ ] 【浏览器功能】风控兜底：可见模式、人工接管、验证码转人工，明确告知失败原因
 
@@ -400,3 +402,4 @@ PYTHONPATH=src .venv/Scripts/python.exe -m pytest -q
 - 2026-11-10：新增「浏览器功能（内置浏览器通道）」设计（TECH_DESIGN 4.21），仅文档，未实现代码。明确该模块为与桌面/终端并列的独立执行通道：独立 Chromium 进程 + 持久化 profile + CDP 截图与 DOM 快照 + screencast 镜像 + 扫码接管；运行时不截屏、不显覆盖层、不让出桌面。同步 STATUS 头部标注与 P1 待办（8 项，全部未开始）、README 新增「规划中」章节，避免文档把规划当成已完成。依赖未安装、测试数仍为 317。
 - 2026-11-10：浏览器功能方案修订（TECH_DESIGN 4.21 重写）。引擎范围收敛为 **Microsoft Edge、Google Chrome、内置 Chromium 兜底**三种，其余不支持；明确采用**独立 profile**（按引擎隔离，不复用用户真实浏览器数据，首次各扫一次码）。新增 4.21.3 引擎解析与 profile 隔离、4.21.4 内置 Chromium 接入资源完整性（`kind="browser"`、`start.cmd` 检查、`/json/version` 探针、国内镜像）、4.21.11 资源更新检测（Releases/Tags + 兼容门禁 + 旁路安装 + 探针通过才切换 + 回滚 + off/notify/auto）。分阶段补 P5 资源与更新。仍未实现代码。
 - 2026-11-10：浏览器通道**放弃 Playwright，改为纯标准库直连 CDP**，并完成 P0 地基实测。起因是 `pip install playwright` 在本机反复 `ReadTimeoutError`（`files.pythonhosted.org` 拉大 wheel 超时），排查后确认 CDP 层已足够覆盖全部需求，且去掉依赖能直接满足「打包后零环境依赖」。TECH_DESIGN 4.21 相应重写：新增 4.21.2 驱动选型（CDP 方法与 Playwright 对应物对照、四条分发优势、代价）、4.21.3 改为直接 Popen 启动 + 删除 `DevToolsActivePort` 残留、4.21.4 内置内核改用 Chrome for Testing 官方构建、4.21.8 补登录态必须优雅关闭 + DPAPI 快照兜底、新增 4.21.14 实测数据与两个必踩坑、新增 4.21.15 打包与零环境依赖（依赖分层、下载器约定、首次运行流程、离线降级）。实测：启动 0.16s、截图 133ms/7KB、点击 14ms 精确命中、镜像 72ms/帧约 14fps、中文 insertText 需先聚焦、硬杀丢 Cookie 而 `Browser.close` 保留、headful 可启动。STATUS 浏览器待办从 10 条调整为 13 条（P0 已完成，新增 `browser/` 子包、登录态兜底、零依赖分发三项）。代码仍未落地，测试数仍为 317。
+- 2026-11-10：**浏览器通道核心模块落地**（TECH_DESIGN 4.21 P1 前半）。新增 `src/xm_agent/browser/`：`cdp.py`（RFC 6455 分帧 + 后台读线程 + 写锁 + 事件订阅 + `post()` 只发不等，避免镜像 ack 在读线程里同步等待导致死锁）、`engine.py`（引擎解析含注册表 App Paths、`--product-version` 版本探测、`ProfileLock` 进程内注册表 + 跨进程 pid 锁文件 + 残留锁清理、启动前删 `DevToolsActivePort`、优雅关闭）、`session.py`（`BrowserSession` / `Page`，多标签、导航、观测、动作、镜像、`ensure_visible()` 切可见模式）、`snapshot.py`（截图按 `clip+scale` 缩放、可交互元素清单带中心点坐标、无障碍树精简、可见文本）、`input.py`（鼠标/滚轮/`insertText`/按键映射/等待）、`mirror.py`（帧流 + 只留最新帧 + 静止页面兜底首帧）。配置新增 `[runtime.browser]`（engine / profile_root / headless / keep_alive_seconds / mirror_fps / screenshot_max_width / connect_timeout）并校验非法值。新增 32 个用例：`tests/test_browser_engine.py` 18 项纯逻辑（三级回落与降级提示、指定引擎不静默替换、锁互斥与残留清理、配置解析与校验、JS 转义），`tests/test_browser_session.py` 14 项真机（启动、导航、快照结构、JPEG、坐标点击命中、按序号点击、中文输入、无焦点丢弃、按键与滚轮、等待文本、镜像帧、静止页首帧、AX 树、统计、优雅关闭保留登录态），无浏览器环境自动跳过。测试总数 349。
