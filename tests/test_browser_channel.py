@@ -51,12 +51,16 @@ class FakePage:
         self.title_text = "示例站点"
         self.actions: list[tuple[str, Any]] = []
         self.mirror_stops = 0
+        self.fronted = 0
         self.text_body = "欢迎来到示例站点"
         self.snapshot_kwargs: dict[str, Any] = {}
 
     @property
     def url(self) -> str:
         return self._url
+
+    def bring_to_front(self) -> None:
+        self.fronted += 1
 
     @property
     def title(self) -> str:
@@ -310,13 +314,16 @@ def test_verify_accepts_plain_string():
 
 
 def test_session_status_and_handoff():
-    channel, session, _ = make_channel()
+    channel, session, page = make_channel()
     status = channel.execute("browser.session", {"action": "status"})
     assert status.ok and status.detail["started"] is True
 
     handoff = channel.execute("browser.session", {"action": "handoff"})
     assert handoff.ok and handoff.detail["visible"] is True
-    assert session.visible_calls == 1
+    # 已经是可见窗口：只前置，不重启（重启会丢掉当前页面状态）
+    assert handoff.detail["restarted"] is False
+    assert session.visible_calls == 0
+    assert page.fronted == 1
 
 
 def test_session_close_shuts_the_browser():

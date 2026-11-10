@@ -206,3 +206,60 @@ def test_browser_action_delegates_when_fake_channel(tmp_path):
 
     app.browser_action("open", "https://a.test/x")
     assert fake.calls[-1] == ("browser.open", {"url": "https://a.test/x"})
+
+
+class _RetirableBrowser(_FakeBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.retired = 0
+        self.status_calls = 0
+
+    def retire_if_idle(self) -> bool:
+        self.retired += 1
+        return True
+
+    def status(self) -> dict:
+        self.status_calls += 1
+        return {"started": False, "description": "已释放"}
+
+
+def test_reaper_retires_idle_browser(tmp_path):
+    app = UiServer(
+        _config(tmp_path),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    fake = _RetirableBrowser()
+    app.browser = fake
+
+    assert app._tick_browser_reaper() is True
+    assert fake.retired == 1
+    assert fake.status_calls == 1  # 回收后把新状态播出去
+    assert fake.calls == []  # 不触发任何用户动作
+
+
+def test_reaper_leaves_browser_alone_while_task_runs(tmp_path):
+    app = UiServer(
+        _config(tmp_path),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    fake = _RetirableBrowser()
+    app.browser = fake
+
+    assert app._active.acquire(blocking=False)
+    try:
+        assert app._tick_browser_reaper() is False
+    finally:
+        app._active.release()
+    assert fake.retired == 0
+
+
+def test_reaper_noop_when_browser_disabled(tmp_path):
+    app = UiServer(
+        _config(tmp_path, enabled=False),
+        db_path=tmp_path / "app.db",
+        resources_root=tmp_path / "resource-root",
+    )
+    assert app.browser is None
+    assert app._tick_browser_reaper() is False

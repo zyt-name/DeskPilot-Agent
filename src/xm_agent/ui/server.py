@@ -185,7 +185,50 @@ class UiServer:
             target=self._httpd.serve_forever, daemon=True
         )
         self._thread.start()
+        self._start_browser_reaper()
         return f"http://{self.host}:{self.port}/"
+
+    # ------------------------------------------------------------ 浏览器回收
+    def _tick_browser_reaper(self) -> bool:
+        """空闲回收的一拍。任务在跑、或有人在看镜像时都不动它。"""
+        channel = self.browser
+        if channel is None or self._stopping.is_set():
+            return False
+        if self._active.locked():
+            return False
+        try:
+            retired = bool(channel.retire_if_idle())
+        except Exception:  # noqa: BLE001 - 回收失败不该影响面板
+            return False
+        if retired:
+            self._publish(
+                "browser",
+                {"event": "retired", **channel.status()},
+                persist=False,
+            )
+        return retired
+
+    def _start_browser_reaper(self) -> None:
+        """后台定时回收空闲的浏览器内核。
+
+        内核常驻会白占几百 MB；`keep_alive_seconds` 就是「上次用完还能留多久」。
+        配成负数表示永不自动回收（调试或希望窗口一直开着时用）。
+        """
+        channel = self.browser
+        if channel is None:
+            return
+        keep = int(getattr(channel, "keep_alive_seconds", 0) or 0)
+        if keep < 0:
+            return
+        interval = max(5, min(60, keep // 3 or 10))
+
+        def loop() -> None:
+            while not self._stopping.wait(interval):
+                self._tick_browser_reaper()
+
+        threading.Thread(
+            target=loop, daemon=True, name="browser-reaper"
+        ).start()
 
     def browser_snapshot(self) -> dict[str, Any]:
         channel = self.browser

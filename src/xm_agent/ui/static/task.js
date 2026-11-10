@@ -618,6 +618,17 @@
       scrollChat();
       return;
     }
+    if (name === "browser_handoff") {
+      const detail = payload.detail || {};
+      const divider = el("div", "run-meta");
+      divider.textContent = detail.restarted
+        ? "已把浏览器切换为可见窗口，扫码登录后回来点“继续”"
+        : detail.note || "浏览器窗口已前置，请在其中完成登录";
+      $("task-messages").appendChild(divider);
+      scrollChat();
+      if (window.browserView) window.browserView.refresh();
+      return;
+    }
     if (name === "observation_retry") {
       const divider = el("div", "run-meta");
       divider.textContent = `第 ${payload.step || "?"} 步观察失败，正在重新观察${

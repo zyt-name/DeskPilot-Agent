@@ -107,6 +107,16 @@ class Page:
     def click(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
         input_ops.click(self.conn, self.cdp_session, x, y, button=button, clicks=clicks)
 
+    def bring_to_front(self) -> None:
+        """把可见窗口前置到桌面最上层。
+
+        只在 headful 下有意义；headless 没有窗口可前置，调用会被忽略。
+        """
+        try:
+            self.call("Page.bringToFront", {})
+        except CdpError:
+            pass
+
     def click_element(self, index: int, elements: list[dict] | None = None,
                       limit: int = 80) -> dict:
         """按元素序号点击（坐标来自刚取的元素清单，避免模型算错）。"""

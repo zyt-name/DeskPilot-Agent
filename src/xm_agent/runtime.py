@@ -10,7 +10,7 @@ from typing import Any, Callable
 from . import vision
 from .adapters.base import Adapter
 from .audit import AuditLog
-from .channels import DESKTOP_KIND, ChannelHub, is_observe
+from .channels import BROWSER_KIND, DESKTOP_KIND, ChannelHub, is_observe
 from .control import RunCancelled, RunControl, RunPreempted
 from .guard.gate import AuditGate, GateDecision
 from .lock import LeaseLock
@@ -887,11 +887,36 @@ class AgentRuntime:
             return None
         if _LOGIN_GOAL_TEXT.search(goal or ""):
             return None
-        if not self._login_wall(observation):
+        raw_login = bool((observation.raw or {}).get("login_wall"))
+        browser = str(observation.source or "") == BROWSER_KIND
+        if not (raw_login and browser) and not self._login_wall(observation):
             return None
         combined = "\n".join([task_context, *self._user_notes])
         if _CREDENTIAL_VALUE.search(combined):
             return None
+        if browser:
+            # 网页登录多半要扫码：把窗口显示出来，否则用户看不见二维码
+            shown = self._browser_handoff()
+            window = str(observation.active_window or "").strip()
+            target = f"“{window}”" if window else "当前网页"
+            head = (
+                "已把浏览器切换到可见窗口，请在弹出的窗口里扫码或登录。"
+                if shown
+                else "网页需要登录，请在浏览器窗口里扫码或登录。"
+            )
+            prompt = f"{target}需要登录。{head}完成后在输入框发送“继续”。"
+            return Action(
+                "task.await_user",
+                {
+                    "kind": "login",
+                    "prompt": prompt,
+                    "summary": (
+                        f"任务已暂停，等你登录网页。\n\n{prompt}\n\n"
+                        "登录完成后输入“继续”，我会从当前页面接着执行原任务。"
+                    ),
+                },
+                rationale="网页登录页需要用户扫码或输入账号",
+            )
         window = str(observation.active_window or "").strip()
         target = f"“{window}”" if window else "当前窗口"
         prompt = (
@@ -910,6 +935,24 @@ class AgentRuntime:
             },
             rationale="登录页需要用户先登录",
         )
+
+    def _browser_handoff(self) -> bool:
+        """把浏览器窗口交还给用户看（扫码用）。失败不阻塞暂停流程。"""
+        channel = self.hub.get(BROWSER_KIND)
+        handoff = getattr(channel, "handoff", None)
+        if not callable(handoff):
+            return False
+        try:
+            receipt = handoff()
+        except Exception:  # noqa: BLE001 - 显示窗口失败也要让用户知道要登录
+            return False
+        if receipt is None or not getattr(receipt, "ok", False):
+            return False
+        self._emit(
+            "browser_handoff",
+            {"detail": dict(getattr(receipt, "detail", None) or {})},
+        )
+        return True
 
     @staticmethod
     def _observation_digest(observation: Observation) -> str:

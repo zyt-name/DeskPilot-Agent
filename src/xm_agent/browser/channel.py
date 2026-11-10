@@ -475,18 +475,7 @@ class BrowserChannel:
         if action == "status":
             return Receipt(True, self.status())
         if action in {"handoff", "show"}:
-            if not self.started:
-                return Receipt(False, error="浏览器尚未启动，无需接管")
-            assert self._session is not None
-            shown = self._session.ensure_visible()
-            return Receipt(
-                True,
-                {
-                    "visible": shown,
-                    "description": self._session.description(),
-                    "url": self._page.url if self._page else "",
-                },
-            )
+            return self.handoff()
         if action in {"close", "quit"}:
             self.close()
             return Receipt(True, {"closed": True})
@@ -494,6 +483,38 @@ class BrowserChannel:
             closed = self.retire_if_idle(force=True)
             return Receipt(True, {"closed": closed})
         return Receipt(False, error=f"未支持的会话动作: {action}")
+
+    def handoff(self) -> Receipt:
+        """把浏览器显示到用户桌面——扫码登录时需要人眼看窗口。
+
+        无头模式没法「显示」，只能带着同一个 profile 重开成可见窗口：
+        优雅关闭保证 Cookie 落盘，重开后已登录的站点仍是登录态。
+        """
+        if not self.started or self._session is None:
+            return Receipt(False, error="浏览器尚未启动，无需接管")
+        session = self._session
+        restarted = False
+        if session.headless:
+            self._page = None
+            restarted = bool(session.ensure_visible())
+            self._page = session.first_page()
+            note = "已切换到可见窗口"
+        else:
+            self.page().bring_to_front()
+            note = "浏览器窗口已前置"
+        self._last_used = time.time()
+        self._sync_mirror()
+        page = self.page()
+        return Receipt(
+            True,
+            {
+                "visible": True,
+                "restarted": restarted,
+                "description": session.description(),
+                "url": page.url,
+                "note": note,
+            },
+        )
 
     # ------------------------------------------------------------ 校验
     def verify(self, expect: str | dict[str, Any] | None) -> Verification:
@@ -543,10 +564,18 @@ class BrowserChannel:
 
     # ------------------------------------------------------------ 生命周期
     def retire_if_idle(self, force: bool = False) -> bool:
-        """空闲回收：超时则优雅关闭内核，profile 与登录态留在磁盘。"""
+        """空闲回收：超时则优雅关闭内核，profile 与登录态留在磁盘。
+
+        负的 `keep_alive_seconds` 表示永不自动回收（一直开着等下次用）。
+        有人在看镜像时不回收——用户正盯着页面，关掉等于打断他。
+        """
         if not self.started or self._session is None:
             return False
-        if not force and self.keep_alive_seconds >= 0:
+        if not force:
+            if self.mirror_active:
+                return False
+            if self.keep_alive_seconds < 0:
+                return False
             idle = time.time() - (self._last_used or time.time())
             if idle < self.keep_alive_seconds:
                 return False

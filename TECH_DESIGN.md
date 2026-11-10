@@ -996,7 +996,7 @@ always_confirm = ["file.transfer", "terminal.exec"]
 > **模块标记：浏览器功能（Browser Channel）**
 >
 > - 归属：**独立执行通道**，与「桌面操控」「终端」并列，不是桌面适配器的一个子模式。
-> - 状态：**P0 地基与 P1 上半已完成**。`browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块，加上 4.22 的通道抽象、`browser.*` 能力契约、审计规则、CLI 与面板接入，均已落地并真机自测。**未完成**：前端镜像界面、扫码接管编排、内置 Chromium 下载与资源管理、MCP 资源更新检测、空闲回收调度。这些不得在 README 或 STATUS 的「已完成」中描述为已有能力。
+> - 状态：**P1 已完成**。`browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块，加上 4.22 的通道抽象、`browser.*` 能力契约、审计规则、CLI 与面板接入、面板镜像、纯浏览器模式、空闲回收调度、扫码登录接管，均已落地并真机自测。**未完成**：内置 Chromium 下载与资源管理、MCP 资源更新检测。这两项不得在 README 或 STATUS 的「已完成」中描述为已有能力。
 > - 引擎：**仅支持 Microsoft Edge、Google Chrome，以及内置 Chromium 兜底**；其他浏览器不在支持范围。
 > - 数据：三种引擎**各用独立 profile**，互不共享，也不读取用户日常浏览器的资料。
 > - 驱动：**纯 Python 标准库直连 CDP**，不依赖 Playwright、Selenium 或任何第三方包。
@@ -1419,13 +1419,45 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 - 空态给出地址输入框，可直接打开一个页面——用户手动动作是显式的，不会被当成 AI 行为。
 - 静止页面不出新帧是 CDP 的正常行为（`screencastFrame` 只在画面变化时触发），所以开流时先塞一张静态截图，避免面板一片空白。
 
-#### 4.22.8 未完成（按依赖顺序）
+#### 4.22.9 纯浏览器模式（已实现）
 
-1. **扫码接管编排**：`login_wall` 已能识别，`handoff` 已能把窗口前置；还差「识别到登录墙 → 自动 handoff + 暂停等用户」的服务端闭环。
-2. **内置 Chromium 下载与资源管理**：`kind="browser"` 的 manifest、镜像源、断点续传、启动探针（4.21 已写清约定，代码未写）。
-3. **MCP 资源更新检测**：查 GitHub release、版本比较、兼容性判定。
-4. **空闲回收调度**：`retire_if_idle()` 已实现并被每次任务启动时调用一次，缺一个后台定时器持续巡检。
-5. **纯浏览器模式**：当前浏览器通道与桌面后端并行，任务仍会让出桌面；要完全「不抢屏」，需要允许不挂载桌面通道。
+选 `adapter=browser` 时，桌面通道根本不挂载：
+
+- `build_hub(config, None)` 只注册浏览器通道，能力清单只剩 `browser.*`（`task.*` 由 Runtime 内部分支处理，不经通道）。
+- 模型拿到的提示词由 `system_prompt(hub.capabilities())` 生成，`desktop.act` 不会出现，模型也就不会尝试调它。
+- 不显示屏幕覆盖层、不让出桌面、审计要图只问当前通道（`_capture_for_audit` 依次问 adapter 与 hub.active()，没有桌面通道时直接返回 None）。
+- 首帧观测的坑：纯浏览器模式下通道尚未启动，`available()` 为假会让观测直接失败。Hub 在「一个可用通道都没有且只注册了一个通道」时调用 `activate()` 唤醒它；混合模式不会走这条路，避免一次观测顺手拉起内核。
+
+真机实测（本机 Edge，无头）：5 步 0.8s 完成「打开本地页 → 点输入框 → 输入 → 点搜索 → 校验结果」，全部观测 `source=browser`，审计目录没有一张桌面截图。
+
+#### 4.22.10 空闲回收调度（已实现）
+
+内核常驻会白占内存，`keep_alive_seconds` 定义「上次用完还能留多久」：
+
+- 面板启动后拉一个后台线程，间隔 `clamp(keep_alive/3, 5, 60)` 秒巡检一次，调用 `_tick_browser_reaper()`。
+- 正在跑任务（`_active` 被占）不回收；有人在看镜像（`mirror_active`）也不回收——用户正盯着页面，关掉等于打断他。
+- `keep_alive_seconds < 0` 表示永不自动回收（调试或希望窗口一直开着）。
+- 回收走优雅关闭，profile 与登录态留在磁盘；回收后广播 `browser` 事件，面板底部状态自动刷新。
+
+#### 4.22.11 扫码登录接管（已实现）
+
+网页登录十有八九要扫码，无头模式里用户根本看不到二维码。闭环如下：
+
+1. `BrowserChannel.observe()` 在 `raw.login_wall` 里标记登录墙（密码框 + URL 关键词 + 提示文案三重判定）。
+2. Runtime 的 `_login_wall_action()` 发现「浏览器来源 + login_wall」时，先调 `handoff()`：
+   - 无头 → 带着同一个 profile 优雅关闭再以可见模式重开（实测 0.5s），并把原 URL 开回来；
+   - 已可见 → `Page.bringToFront` 前置窗口，不重启（重启会丢当前页面状态）。
+3. 然后返回 `task.await_user`（`kind=login`），任务停在 `needs_human`，提示「扫码登录后发送继续」。
+4. 用户登录后回复「继续」，Runtime 复用原目标继续，此时 Cookie 已落盘，后续无头会话直接是登录态。
+
+实测：无头下写入持久 Cookie → handoff → 重开后 `document.cookie` 仍是 `probe=kept`；无 `max-age` 的会话 Cookie 会随重启丢失，这是浏览器行为，不是缺陷。
+
+注意：目标本身就是要登录（`登录/注册/密码/账号` 等关键词）时不触发暂停——那是用户明确要求的事；任务上下文里已给出密码时同样不暂停。
+
+#### 4.22.12 未完成（按依赖顺序）
+
+1. **内置 Chromium 下载与资源管理**：`kind="browser"` 的 manifest、镜像源、断点续传、启动探针（4.21 已写清约定，代码未写）。
+2. **MCP 资源更新检测**：查 GitHub release、版本比较、兼容性判定。
 
 ---
 
@@ -1573,7 +1605,7 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 | 面板其余页面（总览 / AI 模型 / 用量 / 历史 / 设置，饼图与资源悬浮窗） | `src/xm_agent/ui/static/` | 完成 |
 | 数据保留清理（审计 JSONL 与截图按天清理、`cleanup` CLI、启动调度） | `src/xm_agent/maintenance.py`、`src/xm_agent/cli.py` | 完成，dry-run 与保留期下限测试通过 |
 | 只读探测脚本（`tools/list`、`Snapshot`、Computer-Use 截图、Xshell 状态） | `scripts/probe_windows_mcp.py`、`scripts/probe_computer_use_mcp.py`、`scripts/probe_xshell_mcp.py` | Windows 端到端只读已验；其余待构建/环境 |
-| 测试（pytest，397 项） | `tests/` | 通过 |
+| 测试（pytest，419 项） | `tests/` | 通过 |
 | 无依赖假 MCP Server（覆盖 12 个工具，用于协议联调） | `examples/fake_mcp_server.py` | 完成 |
 
 ### 6.2 待完成
@@ -1595,7 +1627,7 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 | ~~P0~~ | 顶层 AI 审计（操作描述符、盲审、失败关闭、执行前复核） | 已完成：敏感操作先规则后盲审；模型不可用或异常时升级用户确认 |
 | ~~P0~~ | 用户审计模式（AI 审计 / 执行前询问）与确认弹窗 | 已完成：两种模式可切换；批准仅对当前步骤生效 |
 | ~~P0~~ | 登录阻塞与用户接管 | 已完成：无凭据时 `task.await_user` 中止；UIA 登录页确定性兜底；同会话「继续」沿用原目标并从当前屏幕恢复，队列透传用户消息与上下文 |
-| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入、面板镜像（抽屉 / 全屏 / SSE 帧流）。待完成：扫码接管编排、内置 Chromium 纳入资源完整性、资源更新检测、空闲回收调度、纯浏览器模式 |
+| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入、面板镜像（抽屉 / 全屏 / SSE 帧流）、纯浏览器模式、空闲回收调度、扫码登录接管。待完成：内置 Chromium 纳入资源完整性、资源更新检测 |
 | P1 | 非标准登录页识别（验证码 / 二次验证 / 纯图形） | 视觉模型判定并请求用户接管；无法判定时不得绕过或猜测 |
 | P1 | 凭据安全输入 | 密码不进入任务目标、会话记录与审计日志；接入系统凭据存储 |
 | P1 | 审计决策面板、Token 统计与回放 | 缓存已实现；模型/耗时/用户决定的统计与回放待做 |
