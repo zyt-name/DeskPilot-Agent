@@ -186,6 +186,15 @@ def _rule_purpose(descriptor: OperationDescriptor) -> str:
     if capability == "file.transfer":
         direction = str(descriptor.args.get("direction", "")).casefold()
         return "上传文件到外部" if direction == "upload" else "从外部下载文件"
+    if capability == "browser.act":
+        action = descriptor.action
+        if action in {"click", "tap"}:
+            return "在网页上点击元素（可能提交、发布或跳转）"
+        if action in {"type", "fill", "input"}:
+            return "向网页输入框填写内容"
+        if action in {"goto", "navigate", "open"}:
+            return "在受管浏览器中打开网址"
+        return f"执行网页操作 {action}"
     if capability == "desktop.act":
         action = descriptor.action
         if action == "click":

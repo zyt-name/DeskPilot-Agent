@@ -98,6 +98,26 @@ Rules:
 Available capabilities:
 """
 
+BROWSER_PROMPT = """
+Managed browser (browser.* capabilities):
+- The browser is a separate process with its own persistent profile. A login
+  done once survives restarts, so reuse it instead of logging in again.
+- Prefer the browser over the desktop when the task is a website, needs a
+  logged-in session, or must not take over the user's screen.
+- Flow: browser.open (or browser.act action=goto) -> read observation ->
+  browser.act with element_index from the observation. Never invent indexes.
+- observation.source is "browser" when the page is what you are looking at;
+  observation.source is "desktop" otherwise. Act on the channel you observed.
+- After a click that navigates (submit, search, login, pagination), stop the
+  batch and wait for the next observation instead of batching more actions.
+- Login walls: when the page shows a QR code or a password form and the task
+  gave no credentials, call browser.session with {"action": "handoff"} to
+  bring the window to the user, then task.await_user with {"kind": "login"}.
+  Do not try other routes, and never invent credentials.
+- browser.verify checks exact strings (url_contains, title_contains, text,
+  element_text). Use short verbatim fragments, not sentences.
+"""
+
 VERIFY_SYSTEM_PROMPT = """You verify whether a Windows desktop task is complete.
 You receive the task goal, the agent's claimed summary, and a screenshot of the
 current screen. Decide from the screenshot only and return one JSON object:
@@ -115,8 +135,15 @@ UsageCallback = Callable[[dict[str, int]], None]
 DeltaCallback = Callable[[str, str], None]
 
 
-def system_prompt() -> str:
-    return SYSTEM_PROMPT + capabilities_prompt()
+def system_prompt(capabilities: Any = None) -> str:
+    allow = None if capabilities is None else {str(item) for item in capabilities}
+    body = SYSTEM_PROMPT
+    if allow is None or any(name.startswith("browser.") for name in allow):
+        body = body.replace(
+            "\nAvailable capabilities:\n",
+            BROWSER_PROMPT + "\nAvailable capabilities:\n",
+        )
+    return body + capabilities_prompt(allow)
 
 
 def observation_text(
@@ -127,18 +154,24 @@ def observation_text(
     instructions: list[str] | None = None,
     screenshot_attached: bool = False,
     task_context: str = "",
+    known_capabilities: Any = None,
 ) -> str:
     data = observation.to_dict()
     data["screenshot_attached"] = bool(screenshot_attached)
     if not observation.screen_card:
         data.pop("screen_card", None)
+    available = (
+        list(CAPABILITIES)
+        if known_capabilities is None
+        else [str(item) for item in known_capabilities]
+    )
     payload = {
         "goal": goal,
         "observation": data,
         "recent_history": history_compact(history),
         "remaining_steps": remaining_steps,
         "user_instructions": list(instructions or []),
-        "known_capabilities": list(CAPABILITIES),
+        "known_capabilities": available,
     }
     if task_context.strip():
         payload["task_context"] = task_context.strip()

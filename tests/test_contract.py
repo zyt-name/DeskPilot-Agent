@@ -18,7 +18,7 @@ from xm_agent.adapters.computer_use_mcp import ComputerUseMcpAdapter
 from xm_agent.adapters.mock import MockAdapter
 from xm_agent.adapters.windows_mcp import WindowsMcpAdapter
 from xm_agent.adapters.xshell_mcp import XshellMcpAdapter
-from xm_agent.contracts import CAPABILITIES
+from xm_agent.contracts import CAPABILITIES, capabilities_prompt
 from xm_agent.types import Element, Observation, Receipt, Verification
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
@@ -161,6 +161,32 @@ def test_close_is_idempotent(backend):
 
 
 def test_capability_contract_is_stable():
-    assert len(CAPABILITIES) == 8
+    assert len(CAPABILITIES) == 13
     assert "task.await_user" in CAPABILITIES
     assert "desktop.observe" in CAPABILITIES
+    assert "browser.observe" in CAPABILITIES
+
+
+def test_browser_capabilities_are_complete():
+    browser = {
+        name for name in CAPABILITIES if name.startswith("browser.")
+    }
+    assert browser == {
+        "browser.open",
+        "browser.observe",
+        "browser.act",
+        "browser.verify",
+        "browser.session",
+    }
+    for name in browser:
+        spec = CAPABILITIES[name]
+        assert spec.input_schema["type"] == "object"
+        assert spec.description.strip()
+
+
+def test_capabilities_prompt_filters_by_channel():
+    only_desktop = capabilities_prompt(["desktop.observe", "task.finish"])
+    assert "desktop.observe" in only_desktop
+    assert "browser.open" not in only_desktop
+    full = capabilities_prompt()
+    assert "browser.open" in full

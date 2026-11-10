@@ -88,6 +88,9 @@ class AnthropicProvider:
                     instructions=instructions,
                     screenshot_attached=image is not None,
                     task_context=context,
+                    known_capabilities=getattr(
+                        self, "available_capabilities", None
+                    ),
                 ),
             }
         )
@@ -200,7 +203,11 @@ class AnthropicProvider:
             "model": self.model,
             "max_tokens": max_tokens,
             "temperature": self.temperature,
-            "system": system if system is not None else system_prompt(),
+            "system": system
+            if system is not None
+            else system_prompt(
+                getattr(self, "available_capabilities", None)
+            ),
             "messages": [{"role": "user", "content": content}],
         }
         stream = on_delta is not None

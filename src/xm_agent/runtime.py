@@ -10,6 +10,7 @@ from typing import Any, Callable
 from . import vision
 from .adapters.base import Adapter
 from .audit import AuditLog
+from .channels import ChannelHub, is_observe
 from .control import RunCancelled, RunControl, RunPreempted
 from .guard.gate import AuditGate, GateDecision
 from .lock import LeaseLock
@@ -32,7 +33,6 @@ MAX_PLAN_ACTIONS = 4
 _TERMINAL_CAPABILITIES = {
     "task.finish",
     "task.await_user",
-    "desktop.observe",
 }
 
 _LOGIN_TEXT = re.compile(r"(登录|登陆|sign\s*in|log\s*in|login)", re.I)
@@ -88,8 +88,10 @@ class AgentRuntime:
         max_audit_denials: int = 2,
         max_provider_retries: int = 2,
         provider_retry_delay: float = 1.2,
+        hub: ChannelHub | None = None,
     ) -> None:
         self.adapter = adapter
+        self.hub = hub if hub is not None else ChannelHub(desktop=adapter)
         self.provider = provider
         self.policy = policy
         self.audit = audit
@@ -137,6 +139,11 @@ class AgentRuntime:
         self._screen_card = ""
         self._decided_hash = ""
         self._user_notes = []
+        # 只把真能执行的能力告诉模型：没接浏览器通道就别让它调 browser.*
+        try:
+            self.provider.available_capabilities = self.hub.capabilities()
+        except (AttributeError, TypeError):
+            pass
         self.audit.event(trace_id, "start", {"goal": goal})
         self._emit("start", {"trace_id": trace_id, "goal": goal})
 
@@ -495,9 +502,9 @@ class AgentRuntime:
                         history,
                     )
 
-                if action.capability == "desktop.observe":
+                if is_observe(action.capability):
                     receipt, refreshed = self._capture_observation(
-                        step, action.args
+                        step, action, action.args
                     )
                     record.receipt = receipt
                     record.verification = (
@@ -547,7 +554,7 @@ class AgentRuntime:
                 except RunCancelled:
                     raise _Stop("aborted", "cancelled by user")
                 try:
-                    receipt = self.adapter.execute(
+                    receipt = self.hub.execute(
                         action.capability, action.args
                     )
                 except Exception as exc:
@@ -571,7 +578,7 @@ class AgentRuntime:
                         )
                     else:
                         try:
-                            verification = self.adapter.verify(action.expect)
+                            verification = self.hub.verify(action.expect)
                         except Exception as exc:
                             verification = Verification(
                                 False, f"verify error: {exc}"
@@ -725,7 +732,7 @@ class AgentRuntime:
         attempts = 0
         while True:
             try:
-                observation = self.adapter.observe(
+                observation = self.hub.observe(
                     step, include_screenshot=include_screenshot
                 )
                 break
@@ -874,11 +881,9 @@ class AgentRuntime:
         Vision backends rely on the prompt rule; their screen card is also
         checked, which covers cached screens.
         """
-        if action.capability in {
-            "task.await_user",
-            "task.finish",
-            "desktop.observe",
-        }:
+        if action.capability.startswith("task.") or is_observe(
+            action.capability
+        ):
             return None
         if _LOGIN_GOAL_TEXT.search(goal or ""):
             return None
@@ -954,7 +959,9 @@ class AgentRuntime:
         planned: list[Action] = []
         for item in [action, *action.steps]:
             planned.append(item)
-            if item.capability in _TERMINAL_CAPABILITIES:
+            if item.capability in _TERMINAL_CAPABILITIES or is_observe(
+                item.capability
+            ):
                 break
             if len(planned) >= limit:
                 break
@@ -978,12 +985,17 @@ class AgentRuntime:
         return str(saved.get("path") or "") or None
 
     def _capture_observation(
-        self, step: int, args: dict[str, Any]
+        self,
+        step: int,
+        action: Action,
+        args: dict[str, Any],
     ) -> tuple[Receipt, Observation | None]:
+        kind = self.hub.kind_for(action.capability)
         try:
-            observation = self.adapter.observe(
+            observation = self.hub.observe(
                 step,
                 include_screenshot=bool(args.get("include_screenshot")),
+                kind=kind,
             )
         except Exception as exc:
             error = f"observation failed: {exc}"

@@ -30,7 +30,7 @@ class ContractTests(unittest.TestCase):
 
     def test_unknown_capability_raises(self):
         with self.assertRaises(KeyError):
-            get_capability("browser.open")
+            get_capability("browser.teleport")
 
     def test_prompt_lists_every_capability(self):
         prompt = capabilities_prompt()

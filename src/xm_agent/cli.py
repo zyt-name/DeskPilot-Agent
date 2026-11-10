@@ -8,7 +8,13 @@ from typing import Any
 
 from .adapters.mock import MockAdapter
 from .audit import AuditLog
-from .bootstrap import build_adapter, build_provider, policy_from_config
+from .bootstrap import (
+    build_adapter,
+    build_hub,
+    build_provider,
+    policy_from_config,
+)
+from .channels import ChannelHub
 from .config import AgentConfig, load_config
 from .contracts import CAPABILITIES
 from .lock import LeaseLock
@@ -149,6 +155,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if args.yes
         else _interactive_confirm
     )
+    hub = build_hub(config, adapter)
     runtime = AgentRuntime(
         adapter=adapter,
         provider=provider,
@@ -161,11 +168,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         provider_retry_delay=config.runtime.provider_retry_delay,
         confirm=confirm,
         on_event=_print_event,
+        hub=hub,
     )
     try:
         result = runtime.run(args.goal)
     finally:
-        adapter.close()
+        hub.close_all()
 
     print(f"trace: {result.trace_id}")
     print(f"audit: {audit.path_for(result.trace_id)}")
@@ -327,6 +335,7 @@ def _cmd_demo(_: argparse.Namespace) -> int:
     )
     audit = AuditLog(".xm-agent/audit")
     lock = LeaseLock(".xm-agent/agent.lock")
+    hub = ChannelHub(desktop=adapter)
     runtime = AgentRuntime(
         adapter=adapter,
         provider=provider,
@@ -337,6 +346,7 @@ def _cmd_demo(_: argparse.Namespace) -> int:
         max_consecutive_failures=2,
         confirm=lambda action, reason, mandatory=False: True,
         on_event=_print_event,
+        hub=hub,
     )
     result = runtime.run("在记事本中输入 hello 并保存")
     print(f"trace: {result.trace_id}")

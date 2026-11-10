@@ -22,12 +22,17 @@ from ..types import Action, Observation
 READ_ONLY_CAPABILITIES = {
     "desktop.observe",
     "desktop.verify",
+    "browser.observe",
+    "browser.verify",
     "wait.for",
     "task.finish",
     "task.await_user",
 }
 
 READ_ONLY_DESKTOP_ACTIONS = {"scroll", "move"}
+
+# 浏览器里「只看不动」的动作。滚动会改变视口，但不会改远端状态。
+READ_ONLY_BROWSER_ACTIONS = {"scroll", "wheel", "wait", "wait_text"}
 
 AUDIT_CONTROL_KEYS = {
     "audit_note",
@@ -287,10 +292,12 @@ class OperationDescriptor:
                 f"{self.args.get('source', '?')} -> "
                 f"{self.args.get('destination', '?')}"
             )
-        elif capability == "desktop.act":
+        elif capability in {"desktop.act", "browser.act"}:
             detail = str(
                 self.args.get("text")
                 or self.args.get("keys")
+                or self.args.get("url")
+                or self.args.get("element_index")
                 or self.args.get("element_id")
                 or self.args.get("x", "")
             )
@@ -549,6 +556,34 @@ def _ui_effects(action: str, args: dict[str, Any], element_name: str) -> list[st
     return list(dict.fromkeys(effects))
 
 
+def _browser_effects(
+    action: str, args: dict[str, Any], element_name: str
+) -> list[str]:
+    """浏览器动作的效果。语义尽量复用桌面规则，避免两套判断漂移。"""
+    if action in READ_ONLY_BROWSER_ACTIONS:
+        return ["read"]
+    effects: list[str] = [f"browser_{action or 'act'}"]
+    if action in {"goto", "navigate", "open"}:
+        effects.append("navigate")
+        url = str(args.get("url") or "").strip().lower()
+        if url and not url.startswith(("http://", "https://", "about:")):
+            # file:// javascript: data: 等会跳出普通网页语义
+            effects.append("external_write")
+    elif action in {"back", "forward", "reload"}:
+        effects.append("navigate")
+    elif action in {"click", "tap"}:
+        effects.extend(_ui_effects("click", args, element_name))
+    elif action in {"type", "fill", "input"}:
+        effects.extend(_ui_effects("type", args, element_name))
+    elif action in {"press", "key"}:
+        effects.extend(
+            _ui_effects("key", {**args, "keys": args.get("keys") or args.get("text", "")}, element_name)
+        )
+    if args.get("rollback_risk") or args.get("irreversible"):
+        effects.append("ui_commit")
+    return list(dict.fromkeys(effects))
+
+
 def _risk_from_effects(effects: Iterable[str], targets: list[OperationTarget]) -> str:
     effects = set(effects)
     if any(target.hard_blocked for target in targets) and effects & {
@@ -643,7 +678,11 @@ def normalize_operation(
     raw_args = dict(action.args or {})
     args = clean_args(raw_args)
     capability = action.capability
-    ui_action = str(args.get("action", "")) if capability == "desktop.act" else ""
+    ui_action = (
+        str(args.get("action", "")).casefold()
+        if capability in {"desktop.act", "browser.act", "browser.session"}
+        else ""
+    )
 
     path_values: list[str] = []
     effects: list[str] = []
@@ -677,6 +716,18 @@ def normalize_operation(
                     element_name = element.name
                     break
         effects = _ui_effects(ui_action, args, element_name)
+    elif capability == "browser.act":
+        element_name = ""
+        index = args.get("element_index")
+        if index is not None and observation is not None:
+            wanted = f"b{index}"
+            for element in observation.elements:
+                if element.id in {wanted, str(index)}:
+                    element_name = element.name
+                    break
+        effects = _browser_effects(ui_action, args, element_name)
+    elif capability == "browser.session":
+        effects = ["read"] if ui_action in {"status", "handoff"} else ["process_control"]
     else:
         effects = ["read"]
 
@@ -696,11 +747,15 @@ def normalize_operation(
 
     mutating = capability not in READ_ONLY_CAPABILITIES and not (
         capability == "desktop.act" and ui_action in READ_ONLY_DESKTOP_ACTIONS
+    ) and not (
+        capability == "browser.act" and ui_action in READ_ONLY_BROWSER_ACTIONS
     )
     if capability == "terminal.exec" and effects == ["read"]:
         mutating = False
     if capability == "desktop.act" and ui_action in READ_ONLY_DESKTOP_ACTIONS:
         effects.append("read")
+    if capability == "browser.act" and ui_action in READ_ONLY_BROWSER_ACTIONS:
+        effects = ["read"]
 
     risk_hint = _risk_from_effects(effects, targets)
     declared_categories = raw_args.get("sensitive_categories")
@@ -741,6 +796,9 @@ def detect_sensitivity(
     read_only = capability in READ_ONLY_CAPABILITIES or (
         capability == "desktop.act"
         and descriptor.action in READ_ONLY_DESKTOP_ACTIONS
+    ) or (
+        capability == "browser.act"
+        and descriptor.action in READ_ONLY_BROWSER_ACTIONS
     )
     if read_only and not (descriptor.declared_sensitive or capability in always):
         return Sensitivity()
@@ -756,7 +814,7 @@ def detect_sensitivity(
         categories.append("external_effect")
         if "write" in effects or "overwrite" in effects:
             categories.append("data_loss")
-    elif capability == "desktop.act":
+    elif capability in {"desktop.act", "browser.act"}:
         if "ui_destructive" in effects:
             reasons.append("界面元素或快捷键可能触发删除/卸载/清空")
             categories.append("data_loss")
@@ -815,7 +873,7 @@ def detect_sensitivity(
         categories.append("policy")
 
     if not reasons:
-        if capability == "desktop.act" and descriptor.mutating:
+        if capability in {"desktop.act", "browser.act"} and descriptor.mutating:
             # Typing and clicking are low-risk by default in AI audit mode.
             return Sensitivity(risk="low")
         return Sensitivity()
@@ -865,9 +923,10 @@ def needs_visual_review(
     sensitivity: Sensitivity | None = None,
 ) -> bool:
     """UI actions lack a textual audit trail, so their review needs an image."""
-    return descriptor.capability == "desktop.act" and needs_rollback_review(
-        descriptor, sensitivity
-    )
+    return descriptor.capability in {
+        "desktop.act",
+        "browser.act",
+    } and needs_rollback_review(descriptor, sensitivity)
 
 
 def environment_profile(

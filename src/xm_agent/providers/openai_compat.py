@@ -90,7 +90,12 @@ class OpenAICompatProvider:
         context: str = "",
     ) -> Action:
         messages = [
-            {"role": "system", "content": system_prompt()},
+            {
+                "role": "system",
+                "content": system_prompt(
+                    getattr(self, "available_capabilities", None)
+                ),
+            },
             {
                 "role": "user",
                 "content": self._user_content(
@@ -340,6 +345,7 @@ class OpenAICompatProvider:
             instructions=instructions,
             screenshot_attached=image is not None,
             task_context=task_context,
+            known_capabilities=getattr(self, "available_capabilities", None),
         )
         if image is None:
             return text

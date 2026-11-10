@@ -996,7 +996,7 @@ always_confirm = ["file.transfer", "terminal.exec"]
 > **模块标记：浏览器功能（Browser Channel）**
 >
 > - 归属：**独立执行通道**，与「桌面操控」「终端」并列，不是桌面适配器的一个子模式。
-> - 状态：**P0 地基已验证，P1 引擎与适配器已完成一半**（`src/xm_agent/browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块已落地并自测；`browser.*` 能力契约、通道抽象、前端镜像、扫码接管、资源管理、更新检测尚未实现）。未完成部分不得在 README 或 STATUS 的「已完成」中描述为已有能力。
+> - 状态：**P0 地基与 P1 上半已完成**。`browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块，加上 4.22 的通道抽象、`browser.*` 能力契约、审计规则、CLI 与面板接入，均已落地并真机自测。**未完成**：前端镜像界面、扫码接管编排、内置 Chromium 下载与资源管理、MCP 资源更新检测、空闲回收调度。这些不得在 README 或 STATUS 的「已完成」中描述为已有能力。
 > - 引擎：**仅支持 Microsoft Edge、Google Chrome，以及内置 Chromium 兜底**；其他浏览器不在支持范围。
 > - 数据：三种引擎**各用独立 profile**，互不共享，也不读取用户日常浏览器的资料。
 > - 驱动：**纯 Python 标准库直连 CDP**，不依赖 Playwright、Selenium 或任何第三方包。
@@ -1288,6 +1288,119 @@ resources ensure（MCP，已有）
 
 **打包注意**：PyInstaller 需额外收集 `certifi` 的 CA 包（`urllib` 走 https 时需要）。若使用 `--onefile`，首次解压会增加启动延迟，建议 `--onedir`，内核下载到用户目录而不是包内目录（包内目录可能只读）。
 
+### 4.22 通道抽象与能力路由（已实现）
+
+> **模块标记：浏览器功能（Browser Channel）· P1 上半**
+>
+> 状态：**已实现并真机自测**。`src/xm_agent/channels.py`（通道契约与 Hub）、`src/xm_agent/browser/channel.py`（浏览器通道）、5 个 `browser.*` 能力契约、guard 规则、CLI 与面板接入均已完成。前端镜像、扫码接管、资源管理、更新检测仍属后续阶段。
+
+#### 4.22.1 为什么必须先做这一层
+
+浏览器模块的地基（CDP、引擎、会话）做完时，它**还调不通**。原因不是缺个函数，而是 Runtime 的结构把它挡在门外，共有四处硬编码：
+
+| 位置 | 原状 | 后果 |
+|---|---|---|
+| `AgentRuntime.__init__` | `adapter` 单个后端 | 一个任务只能用一种后端，桌面和浏览器不能共存 |
+| `CAPABILITIES` | 8 项全是 `desktop.*` | 模型根本不知道浏览器能干什么 |
+| `Observation` 的构造 | 由各个 adapter 自行拼装 | 浏览器页面没有 UIA 元素树，形状对不上 |
+| `ui/server.py` | 「有 adapter 在跑」等于「正在占用屏幕」 | 起浏览器也要收起控制台、显示录制指示器——明明没碰桌面 |
+
+只把浏览器硬塞进 `Adapter` 协议也能跑，但会留下后患：`observe()` 没有通道语义，模型分不清看到的是屏幕还是网页；`vision_only` 这类桌面专有属性会污染浏览器；将来加第三个通道又要改一遍 Runtime。所以先抽一层。
+
+#### 4.22.2 契约：Channel 只有四个方法
+
+```python
+class Channel(Protocol):
+    name: str                  # 实例名，Hub 内唯一
+    kind: str                  # "desktop" | "browser"
+    capabilities: frozenset[str]
+
+    def observe(self, step, include_screenshot=False) -> Observation: ...
+    def execute(self, capability, args) -> Receipt: ...
+    def verify(self, expect) -> Verification: ...
+    def close(self) -> None: ...
+```
+
+刻意只保留 Runtime 真正调用到的四个方法。截图落盘、窗口前置、空闲回收这些是通道自己的事，Hub 不关心——否则每加一种能力就要扩一次协议。
+
+两个可选约定，用 `getattr` 探测而不是写进 Protocol：
+
+- `available()`：现在能不能干活。浏览器未启动时返回 `False`，避免「上次用的是浏览器」导致隐式观测把它重新拉起来。
+- `capture_screenshot()` / `screenshot_dir`：审计要图时的取图口，桌面后端历史上就有，浏览器对齐即可。
+
+#### 4.22.3 路由规则
+
+Hub 按**能力名**分发，不猜意图：
+
+```text
+browser.*                  → 浏览器通道
+desktop.* / terminal.* /   → 桌面通道
+file.* / wait.* / task.*
+```
+
+三条细则：
+
+1. **精确声明优先**。通道若在自己的 `capabilities` 里列了某能力，就直接给它；否则按前缀选。这样浏览器只声明自己的 5 项，不必假装支持 `task.finish`。
+2. **观测跟随动作**。Hub 记住 `last_kind`：浏览器动作之后观测网页，桌面动作之后观测屏幕。没有这条，每一步都要两边各截一次，既慢又会给模型看错的界面。`task.*` 是终止能力，不参与观测。
+3. **不可用就回落**。`active()` 跳过 `available()` 为假的通道。这是 `browser.session close` 之后仍能继续跑桌面任务的原因。
+
+能力清单也按通道裁剪：Runtime 在 `run()` 开始时把 `hub.capabilities()` 写进 provider，系统提示与每步的 `known_capabilities` 都只列真能调的项。配置里 `[runtime.browser] enabled = false` 时，模型完全看不到 `browser.*`，不会浪费步数去试。
+
+#### 4.22.4 五个浏览器能力
+
+| 能力 | 用途 | 关键参数 |
+|---|---|---|
+| `browser.open` | 启动内核并加载 URL，复用持久 profile | `url`、`new_tab`、`wait_loaded` |
+| `browser.observe` | 读页面：URL、标题、带序号的元素、可见文本、可选截图 | `include_screenshot` |
+| `browser.act` | 一个动作：goto / click / type / press / scroll / back / forward / reload / wait | `element_index`、`url`、`text`、`keys`、`amount` |
+| `browser.verify` | 按精确文本校验：URL 片段、标题、正文、元素名 | `url_contains`、`text`、`element_text` |
+| `browser.session` | status / handoff（把窗口给用户扫码）/ close | `action` |
+
+元素序号用 `b0`、`b1`…，与 `browser.observe` 清单里的 `[b3]` 一一对应；`element_index` 也接受纯数字，`_as_index` 统一解析。**优先序号而不是坐标**：坐标会因滚动、弹窗、懒加载而失效，序号每次观测都重新编号。
+
+`browser.act` 的 `click` 支持三种定位（序号 → 坐标 → CSS 选择器），按可靠性排序回落；`type` 可先点元素再输入，解决 `Input.insertText` 在没有焦点时静默丢弃的问题。
+
+#### 4.22.5 与审计的衔接
+
+浏览器动作同样是「看不见的命令行」，必须进同一条审计管线。做法是**复用**而不是另写一套：
+
+- `browser.observe` / `browser.verify` 进 `READ_ONLY_CAPABILITIES`；`scroll` / `wait` 视为只读，不算 mutating。
+- `browser.act` 的效果推导复用 `_ui_effects`：点击「提交 / 发布 / 支付 / 删除 / 发送」类文本会得到 `ui_destructive` 或 `ui_commit`，风险等级与桌面点击完全一致。`goto` 只判 `navigate`；非 `http/https/about` 协议（`file:`、`javascript:`、`data:`）额外标记 `external_write`。
+- `needs_visual_review` 对 `browser.act` 也生效：高风险点击仍要过顶层视觉审计。
+- 审计摘要把浏览器动作翻译成人话（「在网页上点击元素（可能提交、发布或跳转）」），用户在确认弹窗里看得懂。
+
+#### 4.22.6 实测（本机 Edge 157.0.4341.42，无头）
+
+`scripts/probe_browser_channel.py` 起本地静态页，按模型的方式走完 open → observe → click → type → verify → close：
+
+| 环节 | 实测 |
+|---|---|
+| 首次启动到可操作（含 profile 创建） | 722 ms |
+| 页面观测（元素 + 文本） | 62 ms |
+| 按序号点击 | 16 ms |
+| 中文输入「上海天气」 | 通过（4 字符） |
+| 点击后新元素出现、文本校验 | 通过 |
+| 优雅关闭后 profile 保留 | 通过 |
+
+Runtime 全链路（真实浏览器 + 桌面 MockAdapter，5 步任务）：
+
+```text
+1 browser.open   观测源=mock      ok
+2 browser.act    观测源=browser   ok   ← 自动切到网页
+3 browser.act    观测源=browser   ok
+4 browser.act    观测源=browser   ok   verify 命中「结果:上海天气」
+5 task.finish    观测源=browser   ok
+总计 0.9 s；桌面只被观测 1 次
+```
+
+#### 4.22.7 未完成（按依赖顺序）
+
+1. **前端镜像**：侧边抽屉 + 全屏视图（左侧对话列），接 `Page.startScreencast`。基础设施 `mirror.py` 已就绪，缺的是 HTTP 通道与前端。
+2. **扫码接管**：`login_wall` 已能识别，`handoff` 已能把窗口前置；还差「识别到登录墙 → 自动 handoff + 暂停等用户」的服务端编排。
+3. **内置 Chromium 下载与资源管理**：`kind="browser"` 的 manifest、镜像源、断点续传、启动探针（4.21 已写清约定，代码未写）。
+4. **MCP 资源更新检测**：查 GitHub release、版本比较、兼容性判定。
+5. **空闲回收调度**：`retire_if_idle()` 已实现，缺一个后台定时器周期性调用。
+
 ---
 
 ## 5. 桌面端形态与分发（后期）
@@ -1434,7 +1547,7 @@ resources ensure（MCP，已有）
 | 面板其余页面（总览 / AI 模型 / 用量 / 历史 / 设置，饼图与资源悬浮窗） | `src/xm_agent/ui/static/` | 完成 |
 | 数据保留清理（审计 JSONL 与截图按天清理、`cleanup` CLI、启动调度） | `src/xm_agent/maintenance.py`、`src/xm_agent/cli.py` | 完成，dry-run 与保留期下限测试通过 |
 | 只读探测脚本（`tools/list`、`Snapshot`、Computer-Use 截图、Xshell 状态） | `scripts/probe_windows_mcp.py`、`scripts/probe_computer_use_mcp.py`、`scripts/probe_xshell_mcp.py` | Windows 端到端只读已验；其余待构建/环境 |
-| 测试（pytest，317 项） | `tests/` | 通过 |
+| 测试（pytest，390 项） | `tests/` | 通过 |
 | 无依赖假 MCP Server（覆盖 12 个工具，用于协议联调） | `examples/fake_mcp_server.py` | 完成 |
 
 ### 6.2 待完成
@@ -1456,7 +1569,7 @@ resources ensure（MCP，已有）
 | ~~P0~~ | 顶层 AI 审计（操作描述符、盲审、失败关闭、执行前复核） | 已完成：敏感操作先规则后盲审；模型不可用或异常时升级用户确认 |
 | ~~P0~~ | 用户审计模式（AI 审计 / 执行前询问）与确认弹窗 | 已完成：两种模式可切换；批准仅对当前步骤生效 |
 | ~~P0~~ | 登录阻塞与用户接管 | 已完成：无凭据时 `task.await_user` 中止；UIA 登录页确定性兜底；同会话「继续」沿用原目标并从当前屏幕恢复，队列透传用户消息与上下文 |
-| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21） | Edge / Chrome / 内置 Chromium 三引擎解析与独立 profile 跑通；画面镜像 + 扫码接管 + 运行时不截屏/不显覆盖层/不让出桌面；内置 Chromium 纳入资源完整性；资源更新检测可发现、门禁、回滚；未实现前不得计入「已完成」 |
+| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入。待完成：前端镜像界面、扫码接管编排、内置 Chromium 纳入资源完整性、资源更新检测、空闲回收调度 |
 | P1 | 非标准登录页识别（验证码 / 二次验证 / 纯图形） | 视觉模型判定并请求用户接管；无法判定时不得绕过或猜测 |
 | P1 | 凭据安全输入 | 密码不进入任务目标、会话记录与审计日志；接入系统凭据存储 |
 | P1 | 审计决策面板、Token 统计与回放 | 缓存已实现；模型/耗时/用户决定的统计与回放待做 |

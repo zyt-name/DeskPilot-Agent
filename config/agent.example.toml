@@ -18,6 +18,8 @@ default_adapter = "mock"
 # 内置浏览器通道（浏览器功能）。见 TECH_DESIGN 4.21。
 # 只支持 Edge / Chrome / 内置 Chromium，其他浏览器不在支持范围。
 [runtime.browser]
+# 关闭后能力清单里不会出现 browser.*，模型也就不会尝试调用。
+enabled = true
 # auto = 按 Edge → Chrome → 内置 Chromium 顺序回落；指定具体引擎时缺失会直接报错，
 # 不会静默换成别的浏览器。
 engine = "auto"
@@ -69,6 +71,11 @@ allowed_capabilities = [
   "desktop.observe",
   "desktop.act",
   "desktop.verify",
+  "browser.open",
+  "browser.observe",
+  "browser.act",
+  "browser.verify",
+  "browser.session",
   "terminal.exec",
   "file.transfer",
   "wait.for",

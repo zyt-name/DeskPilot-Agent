@@ -19,6 +19,9 @@ from .ai.factory import (
     build_model_provider,
     usage_recorder,
 )
+from .browser.channel import BrowserChannel
+from .browser.session import BrowserSettings
+from .channels import ChannelHub
 from .policy import Policy
 from .providers.fake import HeuristicMockProvider
 from .providers.openai_compat import OpenAICompatProvider
@@ -431,9 +434,53 @@ def build_audit_gate(
     )
 
 
+def build_browser_channel(
+    config: AgentConfig,
+    *,
+    screenshot_dir: str = ".xm-agent/screenshots",
+) -> BrowserChannel | None:
+    """按配置构造浏览器通道。关闭时返回 None，能力清单里就不会出现 browser.*。"""
+    browser = config.browser
+    if not browser.enabled:
+        return None
+    headless: bool | None = None
+    if browser.headless == "always":
+        headless = True
+    elif browser.headless == "never":
+        headless = False
+    settings = BrowserSettings(
+        engine=browser.engine,
+        profile_root=browser.profile_root,
+        headless=browser.headless,
+        keep_alive_seconds=browser.keep_alive_seconds,
+        mirror_fps=browser.mirror_fps,
+        screenshot_max_width=browser.screenshot_max_width,
+        connect_timeout=browser.connect_timeout,
+    )
+    return BrowserChannel(
+        settings, screenshot_dir=screenshot_dir, headless=headless
+    )
+
+
+def build_hub(
+    config: AgentConfig,
+    adapter: Any,
+    *,
+    screenshot_dir: str = ".xm-agent/screenshots",
+) -> ChannelHub:
+    """桌面通道 + 浏览器通道。桌面后端始终存在，浏览器按配置挂载。"""
+    hub = ChannelHub(desktop=adapter)
+    channel = build_browser_channel(config, screenshot_dir=screenshot_dir)
+    if channel is not None:
+        hub.register(channel)
+    return hub
+
+
 __all__ = [
     "build_adapter",
     "build_audit_gate",
+    "build_browser_channel",
+    "build_hub",
     "build_provider",
     "ensure_vision",
     "policy_from_config",

@@ -363,6 +363,14 @@
       detail = `${args.direction || ""} ${args.source || ""} → ${args.destination || ""}`;
     } else if (operation.capability === "desktop.act") {
       detail = args.text || args.keys || args.element_id || "";
+    } else if (operation.capability === "browser.act") {
+      detail =
+        args.url ||
+        args.text ||
+        args.keys ||
+        (args.element_index !== undefined ? `#${args.element_index}` : "");
+    } else if (operation.capability === "browser.open") {
+      detail = args.url || "";
     }
     if (String(detail).length > 200) detail = `${String(detail).slice(0, 200)}…`;
     return `${operation.capability}${action}${detail ? ` ${detail}` : ""}`;

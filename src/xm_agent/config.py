@@ -70,6 +70,7 @@ class AdapterConfig:
 class BrowserConfig:
     """内置浏览器通道。见 TECH_DESIGN 4.21。"""
 
+    enabled: bool = True
     engine: str = "auto"  # auto | edge | chrome | chromium
     profile_root: str = ".xm-agent/browser/profiles"
     headless: str = "auto"  # auto | always | never
@@ -272,6 +273,7 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
     if browser_headless not in {"auto", "always", "never"}:
         raise ValueError("runtime.browser.headless must be one of auto / always / never")
     browser = BrowserConfig(
+        enabled=bool(browser_raw.get("enabled", defaults.browser.enabled)),
         engine=browser_engine,
         profile_root=str(
             browser_raw.get("profile_root", defaults.browser.profile_root)

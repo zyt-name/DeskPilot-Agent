@@ -33,11 +33,13 @@ from ..audit import AuditLog
 from ..bootstrap import (
     build_adapter,
     build_audit_gate,
+    build_browser_channel,
     build_provider,
     ensure_vision,
     policy_from_config,
     probe_adapter_kind,
 )
+from ..channels import ChannelHub
 from ..config import AgentConfig
 from ..context import compact_context, snapshot_context
 from ..control import RunControl
@@ -170,6 +172,9 @@ class UiServer:
         self._confirm_events: dict[str, threading.Event] = {}
         self._confirm_timeout = 300.0
         self._stopping = threading.Event()
+        # 浏览器跨任务复用：profile 常驻，登录态与窗口都留着。
+        self.browser = build_browser_channel(config)
+        self._browser_lock = threading.Lock()
 
     def start(self) -> str:
         handler = _make_handler(self)
@@ -181,8 +186,22 @@ class UiServer:
         self._thread.start()
         return f"http://{self.host}:{self.port}/"
 
+    def _hub_for(self, adapter: Any) -> ChannelHub:
+        hub = ChannelHub(desktop=adapter)
+        with self._browser_lock:
+            if self.browser is not None:
+                self.browser.retire_if_idle()
+                hub.register(self.browser)
+        return hub
+
     def stop(self) -> None:
         self._stopping.set()
+        with self._browser_lock:
+            if self.browser is not None:
+                try:
+                    self.browser.close()
+                except Exception:
+                    pass
         with self._subscriber_lock:
             subscribers = list(self._subscribers.items())
             self._subscribers.clear()
@@ -1469,9 +1488,11 @@ class UiServer:
                 or None,
                 executor=(provider, provider_name, provider_model),
             )
+            hub = self._hub_for(adapter)
             runtime = AgentRuntime(
                 adapter=adapter,
                 provider=provider,
+                hub=hub,
                 policy=policy_from_config(self.config),
                 audit=AuditLog(
                     self.config.audit.root, self.config.audit.keep_days
