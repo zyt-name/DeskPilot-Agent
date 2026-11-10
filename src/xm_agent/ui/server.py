@@ -45,7 +45,7 @@ from ..config import AgentConfig
 from ..context import compact_context, snapshot_context
 from ..control import RunControl
 from ..lock import LeaseLock
-from ..resources import ResourceManager
+from ..resources import ResourceManager, UpdateChecker
 from ..runtime import AgentRuntime
 from ..storage import Storage
 from ..summary import FINISH_LABELS, final_summary, one_line
@@ -173,6 +173,9 @@ class UiServer:
         self._confirm_events: dict[str, threading.Event] = {}
         self._confirm_timeout = 300.0
         self._stopping = threading.Event()
+        self.updates = UpdateChecker()
+        self._update_lock = threading.Lock()
+        self._update_cache: dict[str, Any] = {"checked_at": "", "candidates": []}
         # 浏览器跨任务复用：profile 常驻，登录态与窗口都留着。
         self.browser = build_browser_channel(config)
         self._browser_lock = threading.Lock()
@@ -281,6 +284,44 @@ class UiServer:
                 pass
         subscriber = channel.subscribe(push)
         return subscriber, frames
+
+    def resource_updates(self, refresh: bool = False) -> dict[str, Any]:
+        """查上游有没有新版本。只报告，不自动安装（见 TECH_DESIGN 4.22.13）。"""
+        mode = str(getattr(self.config.resources, "update_check", "notify"))
+        if mode == "off":
+            return {"mode": "off", "checked_at": "", "candidates": []}
+        with self._update_lock:
+            cached = self._update_cache
+            fresh = bool(cached.get("checked_at")) and (
+                time.time() - float(cached.get("ts") or 0) < 600
+            )
+            if fresh and not refresh:
+                return {
+                    "mode": mode,
+                    "checked_at": cached["checked_at"],
+                    "candidates": list(cached["candidates"]),
+                }
+            try:
+                found = self.updates.check(
+                    self.resources.resources, refresh=refresh
+                )
+                payload = [item.to_dict() for item in found]
+                error = ""
+            except Exception as exc:  # noqa: BLE001 - 查版本失败不该拖垮面板
+                payload, error = [], f"{exc.__class__.__name__}: {exc}"
+            self._update_cache = {
+                "ts": time.time(),
+                "checked_at": _now(),
+                "candidates": payload,
+            }
+            data: dict[str, Any] = {
+                "mode": mode,
+                "checked_at": self._update_cache["checked_at"],
+                "candidates": payload,
+            }
+            if error:
+                data["error"] = error
+            return data
 
     def _hub_for(self, adapter: Any) -> ChannelHub:
         hub = ChannelHub(desktop=adapter)
@@ -1860,6 +1901,10 @@ def _make_handler(app: UiServer):
                 return
             if path == "/api/browser":
                 self._json(app.browser_snapshot())
+                return
+            if path == "/api/resources/updates":
+                refresh = (query.get("refresh") or [""])[0] not in {"", "0"}
+                self._json(app.resource_updates(refresh=refresh))
                 return
             if path == "/api/browser/stream":
                 self._browser_stream(query)

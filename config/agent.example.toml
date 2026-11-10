@@ -141,3 +141,8 @@ cwd = "vendor/computer-use-mcp"
 
 [adapters.computer_use.tools]
 computer = "computer"
+
+[resources]
+# off = 不查上游版本；notify = 面板提示有新版本（不自动升级）
+# 自动升级需要「下载 → 探针 → 切换 → 回滚」完整链路，尚未实现。
+update_check = "notify"

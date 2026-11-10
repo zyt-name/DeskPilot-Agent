@@ -2017,3 +2017,17 @@ textarea::placeholder, input::placeholder { color: #a4abb6; }
   .task-workspace.browser-focus { grid-template-columns: minmax(0, 1fr); }
   .task-workspace.browser-focus .task-chat { display: none; }
 }
+
+/* 资源行里的「有新版本」标记：同大版本可升级=绿，跨大版本只提示=橙 */
+.r-update {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.r-update.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.r-update.warn { color: #b26a00; border-color: rgba(178, 106, 0, .45); }

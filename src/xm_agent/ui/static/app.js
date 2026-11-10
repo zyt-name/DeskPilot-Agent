@@ -15,6 +15,7 @@ const state = {
   resourceJobId: "",
   resourceModalOpen: false,
   resourceSnapshot: null,
+  resourceUpdates: [],
 };
 
 const STATUS_LABEL = {
@@ -1319,6 +1320,18 @@ function renderResourceRows(rows) {
       ),
     );
     item.appendChild(name);
+    const update = (state.resourceUpdates || []).find(
+      (candidate) => candidate.id === row.id,
+    );
+    if (update) {
+      const badge = el(
+        "span",
+        `r-update ${update.compatible ? "ok" : "warn"}`,
+        `新版 ${update.latest}`,
+      );
+      badge.title = update.reason || "";
+      name.appendChild(badge);
+    }
     item.appendChild(el("span", "r-version", `v${row.version}`));
     item.appendChild(el("span", `r-status ${tone}`, label));
     box.appendChild(item);
@@ -1390,6 +1403,11 @@ async function pollResourceJob() {
 }
 
 function openResourceModal() {
+  loadResourceUpdates().then(() => {
+    if (state.resourceSnapshot) {
+      renderResourceSummary(state.resourceSnapshot.resources);
+    }
+  });
   state.resourceModalOpen = true;
   $("resource-modal").classList.remove("hidden");
 }
@@ -1452,10 +1470,22 @@ async function forceRepairResources() {
   }
 }
 
+async function loadResourceUpdates(refresh = false) {
+  try {
+    const data = await api(
+      `/api/resources/updates${refresh ? "?refresh=1" : ""}`,
+    );
+    state.resourceUpdates = data.candidates || [];
+  } catch (err) {
+    state.resourceUpdates = [];
+  }
+}
+
 async function loadResources() {
   try {
     const snapshot = await api("/api/resources");
     state.resourceSnapshot = snapshot;
+    await loadResourceUpdates();
     renderResourceSummary(snapshot.resources);
     if (snapshot.job && snapshot.job.running) {
       openResourceModal();

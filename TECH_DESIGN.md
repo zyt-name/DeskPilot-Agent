@@ -1475,9 +1475,20 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 
 **实测**（内置 Chromium 157.0.8103.50，npmmirror 源 10.6 MB/s，约 20s 下完 200.9 MB）：安装后 `chrome.exe --version` 返回 `Google Chrome for Testing 157.0.8103.50`；`resolve_engine("chromium")` 命中 `source=bundled`；启动 1.41s、观测 example.com、按序号点击 b0 均成功。
 
-#### 4.22.13 未完成
+#### 4.22.13 资源更新检测（已实现，只检测不自动装）
 
-1. **资源更新检测**（含第三方 MCP）：查 GitHub Releases/Tags、版本比较、兼容门禁、旁路安装、探针通过才切换、失败回滚、`off/notify/auto` 三档。当前只支持「清单里写死的版本」，没有自动发现新版本。
+`src/xm_agent/resources/updates.py`：
+
+- 查 `releases/latest`，失败再退回 `tags`（有的仓库只用 tag 发版）；拉不到就当没有新版本，不抛异常——面板不该因为 GitHub 挂了而报错。
+- 版本比较把 `v1.2.3-beta` 归一成数字元组；仓库级缓存 6 小时（GitHub 未认证额度只有 60 次/小时），面板再叠一层 10 分钟缓存，点「刷新」两级都绕过。
+- 兼容门禁：跨大版本一律判为不可自动切换，理由是 MCP 工具集会变，而 Runtime 的提示词与审计规则都是按当前工具集写的；浏览器内核只提示不升级（CDP 命令集要一起验）。
+- 面板 `/api/resources/updates` 返回 `mode / checked_at / candidates`，资源行显示「新版 x.y.z」：同大版本绿色、跨大版本橙色并带理由。配置 `[resources].update_check = off|notify`。
+
+**为什么不做自动安装**：升级要过「下载 → 构建 → `tools/list` 探针 → 切换」四道关，任何一步失败都必须能退回旧版，这条链路涉及动态版本与回滚，单独实现。真机检测已发现 Windows-MCP 上游 v0.8.8 与固定的 0.8.5 同属 0.x 但要求 Python ≥3.14——正是「版本号兼容 ≠ 环境兼容」的例子，所以更不该静默升级。
+
+#### 4.22.14 未完成
+
+1. **资源自动升级链路**：旁路安装到新版本目录 → 探针通过才切换 → 失败保留旧版可回滚；`update_check` 增加 `auto` 档。
 
 ---
 

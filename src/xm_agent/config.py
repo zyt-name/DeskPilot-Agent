@@ -81,6 +81,12 @@ class BrowserConfig:
 
 
 @dataclass
+class ResourceConfig:
+    # off = 不查；notify = 只在面板提示有新版（自动安装需过三道关，另行实现）
+    update_check: str = "notify"
+
+
+@dataclass
 class AgentConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
@@ -88,6 +94,7 @@ class AgentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
+    resources: ResourceConfig = field(default_factory=ResourceConfig)
     adapters: dict[str, AdapterConfig] = field(
         default_factory=lambda: {"mock": AdapterConfig()}
     )
@@ -134,6 +141,7 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
     audit_ai_raw = data.get("audit_ai", {})
     model_raw = data.get("model", {})
     policy_raw = data.get("policy", {})
+    resources_raw = data.get("resources", {})
     adapters_raw = data.get("adapters", {})
 
     defaults = AgentConfig()
@@ -297,6 +305,13 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         ),
     )
 
+    update_check = str(
+        resources_raw.get("update_check", defaults.resources.update_check)
+    ).strip().lower()
+    if update_check not in {"off", "notify"}:
+        raise ValueError("resources.update_check must be off or notify")
+    resources = ResourceConfig(update_check=update_check)
+
     return AgentConfig(
         runtime=runtime,
         audit=audit,
@@ -304,6 +319,7 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         model=model,
         policy=policy,
         browser=browser,
+        resources=resources,
         adapters=adapters,
         default_adapter=default_adapter,
     )

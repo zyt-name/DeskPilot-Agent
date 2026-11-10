@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .manager import ResourceManager, ResourceState
+from .updates import UpdateCandidate, UpdateChecker
 from .manifest import (
     GITHUB_ARCHIVE_MIRRORS,
     NPM_REGISTRIES,
@@ -18,5 +19,7 @@ __all__ = [
     "Resource",
     "ResourceManager",
     "ResourceState",
+    "UpdateCandidate",
+    "UpdateChecker",
     "resource_by_id",
 ]
