@@ -199,7 +199,7 @@ PYTHONPATH=src .venv\Scripts\python.exe -m pytest -q
 
 > AI 已经能真正调用这个通道：`browser.open` / `observe` / `act` / `verify` / `session` 五个能力已进契约，Runtime 按能力名把它和桌面通道并行路由（`src/xm_agent/channels.py`）。面板里也能看到 AI 正在看的页面：任务页右上角的浏览器按钮打开侧边抽屉，实时镜像；全屏视图切成「左对话 + 右浏览器」，边看边发指令。
 >
-> 后端下拉里还有一项 **「内置浏览器」**：选它就不挂载桌面通道，全程不截屏、不点击、不让出桌面。碰到登录页会自动把窗口切成可见并暂停等你扫码，登录后回复「继续」即接着跑，登录态留在独立 profile 里。空闲超过 `keep_alive_seconds` 自动释放内核。**尚未实现**：内置 Chromium 下载与资源更新检测。
+> 后端下拉里还有一项 **「内置浏览器」**：选它就不挂载桌面通道，全程不截屏、不点击、不让出桌面。碰到登录页会自动把窗口切成可见并暂停等你扫码，登录后回复「继续」即接着跑，登录态留在独立 profile 里。空闲超过 `keep_alive_seconds` 自动释放内核。内置 Chromium 可按需下载，MCP 资源与内核都能查上游新版本并安全升级。
 
 与桌面操控并列的执行通道：Agent 在自有的浏览器进程中完成任务，**不截取、不点击、不占用**用户桌面。
 
@@ -214,7 +214,7 @@ PYTHONPATH=src .venv\Scripts\python.exe -m pytest -q
 - **空闲回收**：后台每 `clamp(keep_alive/3, 5, 60)` 秒巡检，任务运行中或有人看镜像时不回收；`keep_alive_seconds < 0` 表示永不自动回收。
 - **不抢桌面**：该通道运行时不显示操控胶囊、不最小化控制台、不调用 `DesktopHandoff`。
 - **内置内核纳入资源管理**：Chromium 用 Google 官方 Chrome for Testing 构建，`start.cmd` 检测系统浏览器、`python -m xm_agent resources ensure --only chromium` 按需安装（约 210MB，默认不自动下载），Google 官方与 npmmirror 双源，装完跑 `--version` 探针确认能启动。
-- **资源更新检测**（含第三方 MCP）：查 GitHub Releases/Tags，与固定版本比较，跨大版本只提示不升级；面板资源行直接标「新版 x.y.z」。自动升级（探针通过才切换、失败回滚）尚未实现。
+- **资源更新与升级**（含第三方 MCP）：查 GitHub Releases/Tags，与在用版本比较，跨大版本只提示不升级。同大版本可在资源行点「升级到 x.y.z」：新版本装到旁路目录、**探针通过才切换入口**，失败自动删掉新版本、旧版照常可用；升级后按钮变成「已升级 vX · 回滚 vY」，一键切回出厂版本。`[resources].update_check` 支持 `off / notify / auto`。
 - **已知限制**：部分站点会拦截自动化与无头浏览器，滑块/点选验证码需转人工；不承诺绕过风控，首次启用会明示风险。
 
 **实测**（本机 Edge 157，纯标准库，零第三方依赖）：内核启动 722ms（含 profile 创建）、页面观测 62ms、按序号点击 16ms、中文输入可用、点击后文本校验命中、`Browser.close` 优雅关闭后 profile 与登录态完整保留（硬杀会丢，这是个真实坑）。Runtime 全链路 5 步 0.9s，其中桌面只被观测 1 次——浏览器动作之后自动切到网页观测。纯浏览器模式同样 5 步 0.8s，审计目录零桌面截图；无头切可见 0.5s，持久 Cookie 在切换后仍在（`probe=kept`）。详见 `TECH_DESIGN.md` 4.21.14、4.22.6、4.22.9–4.22.11。

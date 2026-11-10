@@ -2028,6 +2028,16 @@ textarea::placeholder, input::placeholder { color: #a4abb6; }
   font-size: 11px;
   line-height: 1.5;
   color: var(--muted);
+  background: transparent;
+  font-family: inherit;
+}
+button.r-update {
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+button.r-update:hover {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 60%, transparent);
 }
 .r-update.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 .r-update.warn { color: #b26a00; border-color: rgba(178, 106, 0, .45); }

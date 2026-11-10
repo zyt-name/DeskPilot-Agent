@@ -10,7 +10,7 @@ import threading
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Sequence
@@ -21,9 +21,12 @@ from .manifest import (
     PYPI_INDEXES,
     RESOURCES,
     Resource,
+    clean_version,
 )
+from .updates import version_key
 
 MARKER_NAME = ".xm-agent-resource.json"
+PINS_NAME = "active.json"
 MAX_ARCHIVE_ENTRIES = 20000
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 CHUNK = 64 * 1024
@@ -54,6 +57,8 @@ class ResourceState:
     source: str = ""
     stage: str = ""
     license: str = ""
+    # 清单里出厂钉住的版本；`version` 是实际在用的（可能被升级过）
+    builtin_version: str = ""
     runtime_ok: bool | None = None
     runtime_detail: str = ""
     runtime_tools: list[str] = field(default_factory=list)
@@ -162,7 +167,8 @@ class ResourceManager:
                 )
 
             try:
-                self._install(resource, state, phase, emit)
+                target = self.expected(resource)
+                self._install(target, state, phase, emit)
                 state = self._inspect(resource)
             except Exception as exc:
                 state = ResourceState(
@@ -175,6 +181,7 @@ class ResourceManager:
                     detail=str(exc),
                     location=str(self.root / resource.link),
                     license=resource.license,
+                    builtin_version=resource.version,
                 )
                 emit(
                     "error",
@@ -200,6 +207,60 @@ class ResourceManager:
     def missing(self, only: Sequence[str] | None = None) -> list[ResourceState]:
         return [state for state in self.status() if not state.ok]
 
+    # ------------------------------------------------------------------- pins
+    def resource(self, resource_id: str) -> Resource:
+        for item in self.resources:
+            if item.id == resource_id:
+                return item
+        raise ValueError(f"unknown resource: {resource_id}")
+
+    @property
+    def pins_path(self) -> Path:
+        return self.root / ".xm-agent" / "resources" / PINS_NAME
+
+    def pins(self) -> dict[str, dict[str, Any]]:
+        """已激活的升级版本：`{id: {version, ref, activated_at, probe}}`。
+
+        清单里的版本是「出厂版本」，用户升级后实际在用的是这个记录。
+        放在数据目录而不是源码里，升级不需要改代码。
+        """
+        try:
+            data = json.loads(self.pins_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(key): dict(value)
+            for key, value in data.items()
+            if isinstance(value, dict)
+        }
+
+    def _write_pins(self, pins: dict[str, dict[str, Any]]) -> None:
+        path = self.pins_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(pins, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+
+    def expected(self, resource: Resource) -> Resource:
+        """实际应使用的版本：升级记录优先，回落到清单里钉住的版本。
+
+        目录已经不在时不信记录——否则面板会一直报「缺失」而没法自愈。
+        """
+        pin = self.pins().get(resource.id) or {}
+        version = clean_version(str(pin.get("version") or ""))
+        if not version or version_key(version) <= version_key(resource.version):
+            return resource
+        dest = self.root / resource.install_dir / f"{resource.directory}-{version}"
+        if not (dest / resource.entry).exists():
+            return resource
+        return replace(
+            resource, version=version, ref=str(pin.get("ref") or version)
+        )
+
     # ----------------------------------------------------------------- inspect
     def _select(self, only: Sequence[str] | None) -> list[Resource]:
         if not only:
@@ -218,6 +279,32 @@ class ResourceManager:
         return [resource for resource in self.resources if resource.id in wanted]
 
     def _inspect(self, resource: Resource) -> ResourceState:
+        expected = self.expected(resource)
+        state = self._inspect_exact(expected)
+        if (
+            state.ok
+            and expected.version != resource.version
+            and resource.kind != "browser"
+        ):
+            # 记录说在用新版本，入口却指着别的目录：这种分裂必须报出来，
+            # 否则面板显示「已就绪」，实际跑的可能是旧版。
+            target = self._link_target(self.root / resource.link)
+            dest = self.root / expected.dest
+            try:
+                mismatch = target is not None and target != dest.resolve()
+            except OSError:
+                mismatch = True
+            if mismatch:
+                name = target.name if target is not None else "（无入口）"
+                return self._state(
+                    expected,
+                    OUTDATED,
+                    f"入口指向 {name}，记录为 {expected.version}，可重新安装或回滚",
+                    target or self.root / resource.link,
+                )
+        return state
+
+    def _inspect_exact(self, resource: Resource) -> ResourceState:
         dest = self.root / resource.dest
         link = self.root / resource.link
         candidates: list[tuple[str, Path]] = []
@@ -326,6 +413,10 @@ class ResourceManager:
         source: str = "",
         stage: str = "",
     ) -> ResourceState:
+        builtin = next(
+            (item.version for item in self.resources if item.id == resource.id),
+            resource.version,
+        )
         return ResourceState(
             id=resource.id,
             name=resource.name,
@@ -338,6 +429,7 @@ class ResourceManager:
             source=source,
             stage=stage,
             license=resource.license,
+            builtin_version=builtin,
         )
 
     @staticmethod
@@ -359,6 +451,8 @@ class ResourceManager:
         state: ResourceState,
         phase: Callable[[str, str, float], None],
         emit: Callable[..., None],
+        *,
+        switch_link: bool = True,
     ) -> None:
         dest = self.root / resource.dest
         link = self.root / resource.link
@@ -393,7 +487,11 @@ class ResourceManager:
             # 引擎解析按 chromium-<version>/chrome.exe 直接找最新版本。
             phase("verify", "校验内核文件", 90)
         else:
-            self._ensure_link(resource, link, dest, phase)
+            if switch_link:
+                self._ensure_link(resource, link, dest, phase)
+            else:
+                # 旁路安装：稳定入口仍然指向旧版本，探针通过前不切
+                phase("link", "旁路安装，暂不切换入口", 80)
             phase("build", "准备运行环境", 82)
             if resource.kind == "python":
                 self._build_python(resource, dest, phase)
@@ -413,8 +511,12 @@ class ResourceManager:
             return
         marker = self._read_marker(dest)
         if marker:
-            shutil.rmtree(dest)
-            return
+            try:
+                shutil.rmtree(dest)
+                return
+            except OSError:
+                # 删不掉就搬去备份区：残留目录不该让整次安装失败
+                pass
         backup_root = self.root / ".xm-agent" / "resource-backup"
         backup_root.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -706,7 +808,12 @@ class ResourceManager:
     def _tail(result: subprocess.CompletedProcess | None) -> str:
         if result is None:
             return ""
-        text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+        # stderr 放后面：pip / npm 的致命错误都写在 stderr，取尾部才不会把它截掉
+        text = "\n".join(
+            part
+            for part in (result.stdout or "", result.stderr or "")
+            if part
+        )
         text = text.replace("\r", "")
         return text[-600:]
 
@@ -808,7 +915,13 @@ class ResourceManager:
         state = self._inspect(resource)
         if not state.ok:
             return False, state.detail or state.status
-        executable = Path(state.location) / resource.entry
+        return self.probe_browser_path(Path(state.location))
+
+    def probe_browser_path(self, path: Path, entry: str = "") -> tuple[bool, str]:
+        """对指定目录跑内核启动探针，用于旁路安装的候选版本。"""
+        executable = Path(path) / (entry or "chrome.exe")
+        if not executable.exists():
+            return False, f"缺少内核文件：{executable.name}"
         try:
             result = subprocess.run(
                 [str(executable), "--version"],
@@ -825,6 +938,208 @@ class ResourceManager:
         if result.returncode != 0 or not text:
             return False, f"内核未正常响应（退出码 {result.returncode}）"
         return True, text.splitlines()[0][:120]
+
+    # ----------------------------------------------------------------- upgrade
+    def stage(
+        self,
+        resource_id: str,
+        version: str,
+        *,
+        ref: str = "",
+        progress: ProgressCallback | None = None,
+    ) -> ResourceState:
+        """把新版本装到旁路目录，**不动**稳定入口。
+
+        升级的第一道关：装完、构建完都只是候选，能不能用由探针说了算，
+        探针之前任何东西都不许指向它。
+        """
+        resource = self.resource(resource_id)
+        target = resource.with_version(version, ref)
+
+        def emit(event: str, **payload: Any) -> None:
+            if progress is None:
+                return
+            try:
+                progress({"event": event, **payload})
+            except Exception:
+                pass
+
+        def phase(name: str, message: str, resource_percent: float) -> None:
+            emit(
+                "phase",
+                resource=target.id,
+                phase=name,
+                status="installing",
+                message=message,
+                resource_percent=max(0, min(100, int(resource_percent))),
+            )
+
+        with self._lock:
+            state = self._inspect_exact(target)
+            if state.status != READY:
+                self._install(
+                    target,
+                    state,
+                    phase,
+                    emit,
+                    switch_link=False,
+                )
+                state = self._inspect_exact(target)
+        return state
+
+    def switch(
+        self,
+        resource_id: str,
+        version: str,
+        *,
+        ref: str = "",
+        probe: str = "",
+    ) -> ResourceState:
+        """探针通过后才切换稳定入口，并记下在用版本。"""
+        resource = self.resource(resource_id)
+        target = resource.with_version(version, ref)
+        dest = self.root / target.dest
+        if not (dest / target.entry).exists():
+            raise ResourceError(f"{target.name} {target.version} 尚未安装完成")
+
+        link = self.root / resource.link
+        previous = self._link_target(link)
+        current = self.expected(resource)
+        if resource.kind == "browser":
+            # 内核没有稳定入口（引擎解析按目录找），在用版本由启用记录决定
+            with self._lock:
+                self._pin(resource, target, current.version, probe)
+            return self._inspect(resource)
+        with self._lock:
+            try:
+                self._clear_link(link, resource)
+                self._create_link(link, dest)
+            except Exception:
+                # 切一半失败就等于入口没了，必须立刻把旧链接接回去
+                self._relink(link, previous, resource)
+                raise
+            self._pin(resource, target, current.version, probe)
+
+        state = self._inspect(resource)
+        if not state.ok:
+            pins = self.pins()
+            pins.pop(resource.id, None)
+            self._write_pins(pins)
+            self._relink(link, previous, resource)
+            raise ResourceError(f"切换后状态异常：{state.detail or state.status}")
+        return state
+
+    def _pin(
+        self,
+        resource: Resource,
+        target: Resource,
+        previous_version: str,
+        probe: str = "",
+    ) -> None:
+        pins = self.pins()
+        pins[resource.id] = {
+            "version": target.version,
+            "ref": target.ref,
+            "from": previous_version,
+            "probe": probe[:200],
+            "activated_at": _now(),
+        }
+        self._write_pins(pins)
+
+    def discard(self, resource_id: str, version: str) -> bool:
+        """删掉旁路装的候选版本；正在用的那个不删。"""
+        resource = self.resource(resource_id)
+        target = resource.with_version(version)
+        dest = self.root / target.dest
+        if not dest.is_dir() or self._is_link(dest):
+            return False
+        if self._link_target(self.root / resource.link) == dest.resolve():
+            return False
+        shutil.rmtree(dest, ignore_errors=True)
+        return not dest.exists()
+
+    def prune(self, resource_id: str, keep: int = 1) -> list[str]:
+        """回收多余版本目录，永远保留在用版本与清单版本。"""
+        resource = self.resource(resource_id)
+        protected = {self.expected(resource).version, resource.version}
+        root = self.root / resource.install_dir
+        if not root.is_dir():
+            return []
+        prefix = f"{resource.directory}-"
+        candidates: list[tuple[tuple[int, ...], str, Path]] = []
+        for path in root.glob(f"{prefix}*"):
+            if not path.is_dir() or self._is_link(path):
+                continue
+            version = clean_version(path.name[len(prefix) :])
+            if not version or version in protected:
+                continue
+            if not self._read_marker(path):
+                continue
+            candidates.append((version_key(version), version, path))
+        candidates.sort(reverse=True)
+        removed: list[str] = []
+        for _, version, path in candidates[keep:]:
+            shutil.rmtree(path, ignore_errors=True)
+            if not path.exists():
+                removed.append(version)
+        return removed
+
+    def rollback(self, resource_id: str) -> tuple[bool, str]:
+        """取消版本锁定，把在用版本切回清单里的出厂版本。"""
+        resource = self.resource(resource_id)
+        pins = self.pins()
+        previous_pin = pins.pop(resource_id, None)
+        if previous_pin is None:
+            return True, f"{resource.name} 没有升级记录，当前即 {resource.version}"
+        upgraded = clean_version(str(previous_pin.get("version") or ""))
+
+        dest = self.root / resource.dest
+        if not (dest / resource.entry).exists():
+            self._write_pins(pins)
+            return False, (
+                f"已取消 {upgraded} 的锁定，"
+                f"但出厂版本 {resource.version} 的目录不在，需要重新安装"
+            )
+        if resource.kind == "browser":
+            # 内核没有链接可改，写一条指向出厂版本的启用记录即可
+            self._pin(resource, resource, upgraded, "rollback")
+            return True, f"已切回 {resource.version}（内置内核按启用版本解析）"
+
+        self._write_pins(pins)
+        link = self.root / resource.link
+        previous = self._link_target(link)
+        try:
+            self._clear_link(link, resource)
+            self._create_link(link, dest)
+        except Exception as exc:
+            self._relink(link, previous, resource)
+            return False, f"切回 {resource.version} 失败：{exc}"
+        return True, f"已切回 {resource.version}"
+    def _link_target(self, link: Path) -> Path | None:
+        if not (link.exists() or self._is_link(link)):
+            return None
+        try:
+            return link.resolve()
+        except OSError:
+            return None
+
+    def _clear_link(self, link: Path, resource: Resource) -> None:
+        if self._is_link(link):
+            self._remove_link(link)
+        elif link.exists():
+            # 老布局是真实目录，搬去备份区，别直接删用户的东西
+            self._retire(link, resource)
+
+    def _relink(
+        self, link: Path, previous: Path | None, resource: Resource
+    ) -> None:
+        if previous is None or not previous.is_dir():
+            return
+        try:
+            self._clear_link(link, resource)
+            self._create_link(link, previous)
+        except Exception:
+            pass
 
     def _read_version(self, resource: Resource, path: Path) -> str:
         if resource.kind == "browser":

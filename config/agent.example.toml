@@ -143,6 +143,7 @@ cwd = "vendor/computer-use-mcp"
 computer = "computer"
 
 [resources]
-# off = 不查上游版本；notify = 面板提示有新版本（不自动升级）
-# 自动升级需要「下载 → 探针 → 切换 → 回滚」完整链路，尚未实现。
+# off = 不查上游版本；notify = 面板提示有新版本（手动点「升级」）；
+# auto = 同大版本自动升级：先装到旁路目录，探针通过才切换，失败保留旧版。
+# 跨大版本一律只提示——MCP 工具集会变，而提示词与审计规则是按当前工具集写的。
 update_check = "notify"

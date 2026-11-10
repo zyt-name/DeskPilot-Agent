@@ -45,7 +45,7 @@ from ..config import AgentConfig
 from ..context import compact_context, snapshot_context
 from ..control import RunControl
 from ..lock import LeaseLock
-from ..resources import ResourceManager, UpdateChecker
+from ..resources import ResourceManager, UpdateChecker, Upgrader, make_prober
 from ..runtime import AgentRuntime
 from ..storage import Storage
 from ..summary import FINISH_LABELS, final_summary, one_line
@@ -176,6 +176,12 @@ class UiServer:
         self.updates = UpdateChecker()
         self._update_lock = threading.Lock()
         self._update_cache: dict[str, Any] = {"checked_at": "", "candidates": []}
+        # 升级链路：旁路装 → 探针 → 切换，探针用的命令会被改到旁路目录。
+        self.upgrader = Upgrader(
+            self.resources,
+            self.updates,
+            prober=make_prober(config, self.resources),
+        )
         # 浏览器跨任务复用：profile 常驻，登录态与窗口都留着。
         self.browser = build_browser_channel(config)
         self._browser_lock = threading.Lock()
@@ -286,7 +292,11 @@ class UiServer:
         return subscriber, frames
 
     def resource_updates(self, refresh: bool = False) -> dict[str, Any]:
-        """查上游有没有新版本。只报告，不自动安装（见 TECH_DESIGN 4.22.13）。"""
+        """查上游有没有新版本；`auto` 档顺手把可升级的排队升掉。
+
+        `auto` 不是「静默换掉」——升级本身还要过探针，失败保留旧版，
+        进度在资源面板里可见（见 TECH_DESIGN 4.22.15）。
+        """
         mode = str(getattr(self.config.resources, "update_check", "notify"))
         if mode == "off":
             return {"mode": "off", "checked_at": "", "candidates": []}
@@ -308,20 +318,213 @@ class UiServer:
                 payload = [item.to_dict() for item in found]
                 error = ""
             except Exception as exc:  # noqa: BLE001 - 查版本失败不该拖垮面板
-                payload, error = [], f"{exc.__class__.__name__}: {exc}"
+                found, payload = [], []
+                error = f"{exc.__class__.__name__}: {exc}"
             self._update_cache = {
                 "ts": time.time(),
                 "checked_at": _now(),
                 "candidates": payload,
             }
-            data: dict[str, Any] = {
-                "mode": mode,
-                "checked_at": self._update_cache["checked_at"],
-                "candidates": payload,
+        data: dict[str, Any] = {
+            "mode": mode,
+            "checked_at": self._update_cache["checked_at"],
+            "candidates": payload,
+        }
+        if error:
+            data["error"] = error
+        if mode == "auto":
+            data["started"] = self._auto_upgrade(found)
+        return data
+
+    def _auto_upgrade(self, candidates: list[Any]) -> list[str]:
+        """自动升级的入口：只挑同大版本、且不在失败冷却期里的候选。
+
+        有任务在跑就不动——切换入口会影响下一次拉起后端。
+        """
+        if self._active.locked():
+            return []
+        try:
+            pending = self.upgrader.pending(candidates)
+        except Exception:  # noqa: BLE001 - 判断失败就当没有可升级项
+            return []
+        if not pending:
+            return []
+        snapshot = self.start_upgrade(
+            only=[item.resource_id for item in pending], candidates=pending
+        )
+        job = snapshot.get("job") or {}
+        return list(job.get("upgrades") or [])
+
+    def start_upgrade(
+        self,
+        only: list[str] | None = None,
+        force: bool = False,
+        *,
+        version: str = "",
+        candidates: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """后台升级：一次一条资源，进度写进与安装检测同一个 job。"""
+        ids = [str(item) for item in only or []]
+        with self._resource_lock:
+            if self._resource_job and self._resource_job.get("running"):
+                return self.resources_snapshot()
+            states = [self._resource_dict(state) for state in self.resources.status()]
+            job_id = uuid.uuid4().hex[:12]
+            self._resource_job = {
+                "id": job_id,
+                "kind": "upgrade",
+                "running": True,
+                "phase": "detecting",
+                "percent": 1,
+                "message": "正在检查上游版本",
+                "started_at": _now(),
+                "finished_at": None,
+                "ok": None,
+                "error": None,
+                "upgrades": ids,
+                "resources": states,
             }
-            if error:
-                data["error"] = error
-            return data
+        threading.Thread(
+            target=self._run_upgrade,
+            args=(job_id, ids, bool(force), version, list(candidates or [])),
+            daemon=True,
+        ).start()
+        return self.resources_snapshot()
+
+    def _run_upgrade(
+        self,
+        job_id: str,
+        only: list[str],
+        force: bool,
+        version: str,
+        candidates: list[Any],
+    ) -> None:
+        def update(**fields: Any) -> None:
+            with self._resource_lock:
+                job = self._resource_job
+                if job is None or job.get("id") != job_id:
+                    return
+                for key, value in fields.items():
+                    if key == "percent" and isinstance(value, (int, float)):
+                        job["percent"] = max(
+                            int(job.get("percent") or 0),
+                            min(100, int(value)),
+                        )
+                    else:
+                        job[key] = value
+
+        def on_progress(event: dict[str, Any]) -> None:
+            resource_id = str(event.get("resource") or "")
+            message = str(event.get("message") or "")
+            if not message:
+                return
+            with self._resource_lock:
+                job = self._resource_job
+                if job is None or job.get("id") != job_id:
+                    return
+                job["phase"] = str(event.get("phase") or job.get("phase") or "")
+                job["message"] = message
+                rows = job.get("resources") or []
+                for row in rows:
+                    if row.get("id") == resource_id:
+                        row["status"] = "installing"
+                        row["detail"] = message
+                        break
+
+        try:
+            pool = list(candidates)
+            if not pool:
+                update(message="正在检查上游版本")
+                pool = self.upgrader.candidates()
+            if version and only:
+                item = self.upgrader.candidate_for(only[0], version)
+                picked = [item] if item is not None else []
+            elif only:
+                wanted = set(only)
+                picked = [item for item in pool if item.resource_id in wanted]
+            elif force:
+                # 强制升级 = 绕过兼容门禁，用户已经明确要求了
+                picked = [item for item in pool if self.upgrader.is_newer(item.resource_id, item.latest)]
+            else:
+                picked = self.upgrader.pending(pool)
+
+            results: list[dict[str, Any]] = []
+            total = max(1, len(picked))
+            for index, item in enumerate(picked):
+                update(
+                    message=f"正在升级 {item.name} 到 {item.latest}",
+                    percent=int(index / total * 90) + 2,
+                )
+                outcome = self.upgrader.upgrade(
+                    item.resource_id,
+                    candidate=item,
+                    force=force,
+                    progress=on_progress,
+                )
+                payload = outcome.to_dict()
+                results.append(payload)
+                update(
+                    message=outcome.detail
+                    or f"{item.name} {payload['status']}",
+                    percent=int((index + 1) / total * 90) + 2,
+                )
+                fresh = next(
+                    (
+                        self._resource_dict(one)
+                        for one in self.resources.status()
+                        if one.id == item.resource_id
+                    ),
+                    None,
+                )
+                if fresh is not None:
+                    with self._resource_lock:
+                        job = self._resource_job
+                        if job is not None and job.get("id") == job_id:
+                            for row in job.get("resources") or []:
+                                if row.get("id") == item.resource_id:
+                                    row.update(fresh)
+                                    break
+            with self._resource_lock:
+                job = self._resource_job
+                if job is None or job.get("id") != job_id:
+                    return
+                job["running"] = False
+                job["phase"] = "done"
+                job["percent"] = 100
+                job["finished_at"] = _now()
+                job["upgrades"] = results
+                if not picked:
+                    job["ok"] = True
+                    job["message"] = "没有可升级的新版本"
+                else:
+                    failed = [
+                        item for item in results if item["status"] == "failed"
+                    ]
+                    job["ok"] = not failed
+                    if failed:
+                        job["message"] = (
+                            "升级未完成："
+                            + "、".join(
+                                f"{item['name']}（{item['detail']}）"
+                                for item in failed
+                            )
+                            + "；旧版本仍在使用"
+                        )
+                    else:
+                        job["message"] = "；".join(
+                            f"{item['name']} → {item['to']}"
+                            for item in results
+                            if item["status"] == "upgraded"
+                        ) or "已是最新版本"
+        except Exception as exc:  # noqa: BLE001 - 升级失败不能让面板卡住
+            update(
+                running=False,
+                phase="error",
+                finished_at=_now(),
+                ok=False,
+                error=str(exc),
+                message=f"升级失败：{exc}",
+            )
 
     def _hub_for(self, adapter: Any) -> ChannelHub:
         hub = ChannelHub(desktop=adapter)
@@ -488,6 +691,7 @@ class UiServer:
         return {
             "root": str(self.resources.root),
             "resources": states,
+            "pins": self.resources.pins(),
             "job": job,
         }
 
@@ -503,6 +707,7 @@ class UiServer:
             job_id = uuid.uuid4().hex[:12]
             self._resource_job = {
                 "id": job_id,
+                "kind": "sync",
                 "running": True,
                 "phase": "detecting",
                 "percent": 1,
@@ -2140,6 +2345,28 @@ def _make_handler(app: UiServer):
                             bool(body.get("force")),
                         ),
                         202,
+                    )
+                    return
+                if path == "/api/resources/upgrade":
+                    only = body.get("only")
+                    if only is not None and not isinstance(only, list):
+                        raise ValueError("only must be a list of resource ids")
+                    self._json(
+                        app.start_upgrade(
+                            [str(item) for item in only or []],
+                            bool(body.get("force")),
+                            version=str(body.get("version") or ""),
+                        ),
+                        202,
+                    )
+                    return
+                if path == "/api/resources/rollback":
+                    resource_id = str(body.get("id") or "")
+                    if not resource_id:
+                        raise ValueError("id is required")
+                    outcome = app.upgrader.rollback(resource_id)
+                    self._json(
+                        {**outcome.to_dict(), "resources": app.resources_snapshot()}
                     )
                     return
             except ValueError as exc:

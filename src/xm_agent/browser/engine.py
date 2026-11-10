@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import socket
 import subprocess
@@ -88,20 +89,42 @@ def _registry_paths(name: str) -> list[str]:
     return found
 
 
+def _pinned_bundled_version(bundled_root: Path) -> str:
+    """读资源管理器的启用版本记录。
+
+    内置内核没有稳定入口链接（引擎解析直接找 `chromium-*` 目录），
+    所以在用版本由 `.xm-agent/resources/active.json` 决定；读不到就当没有，
+    绝不能因为一份记录坏了而启动不了浏览器。
+    """
+    try:
+        pin_path = bundled_root.parents[1] / "resources" / "active.json"
+        data = json.loads(pin_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, IndexError):
+        return ""
+    record = data.get("chromium") if isinstance(data, dict) else None
+    return str(record.get("version") or "") if isinstance(record, dict) else ""
+
+
 def find_engine_path(name: str, bundled_root: Path | None = None) -> str | None:
-    """按名称定位可执行文件；内置 Chromium 在 resources 安装目录下找最新版本。"""
+    """按名称定位可执行文件；内置 Chromium 在 resources 安装目录下找版本。"""
     if name == "chromium":
         if bundled_root is None:
             return None
-        candidates = sorted(bundled_root.glob("chromium-*/chrome.exe"), reverse=True)
-        for candidate in candidates:
-            if candidate.exists():
-                return str(candidate)
-        # zip 解压后可能多一层目录
-        candidates = sorted(bundled_root.glob("chromium-*/**/chrome.exe"), reverse=True)
-        for candidate in candidates:
-            if candidate.exists():
-                return str(candidate)
+        pinned = _pinned_bundled_version(bundled_root)
+        if pinned:
+            # 有启用版本就听它的（升级后是新的，回滚后是旧的）
+            for pattern in (
+                f"chromium-{pinned}/chrome.exe",
+                f"chromium-{pinned}/**/chrome.exe",
+            ):
+                for candidate in sorted(bundled_root.glob(pattern), reverse=True):
+                    if candidate.exists():
+                        return str(candidate)
+        # 没有记录时取最新版本；zip 解压后可能多一层目录，两种布局都试
+        for pattern in ("chromium-*/chrome.exe", "chromium-*/**/chrome.exe"):
+            for candidate in sorted(bundled_root.glob(pattern), reverse=True):
+                if candidate.exists():
+                    return str(candidate)
         return None
     for path in ENGINE_PATHS.get(name, []):
         if path and Path(path).exists():

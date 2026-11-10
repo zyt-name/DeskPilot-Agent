@@ -996,7 +996,7 @@ always_confirm = ["file.transfer", "terminal.exec"]
 > **模块标记：浏览器功能（Browser Channel）**
 >
 > - 归属：**独立执行通道**，与「桌面操控」「终端」并列，不是桌面适配器的一个子模式。
-> - 状态：**P1 已完成**。`browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块，加上 4.22 的通道抽象、`browser.*` 能力契约、审计规则、CLI 与面板接入、面板镜像、纯浏览器模式、空闲回收调度、扫码登录接管，均已落地并真机自测。内置 Chromium 已纳入资源管理（按需安装、双源下载、`--version` 探针）。**未完成**：资源更新检测（自动发现新版本）。这一项不得在 README 或 STATUS 的「已完成」中描述为已有能力。
+> - 状态：**P1 已完成**。`browser/` 的 cdp / engine / session / snapshot / input / mirror 六个模块，加上 4.22 的通道抽象、`browser.*` 能力契约、审计规则、CLI 与面板接入、面板镜像、纯浏览器模式、空闲回收调度、扫码登录接管，均已落地并真机自测。内置 Chromium 已纳入资源管理（按需安装、双源下载、`--version` 探针），资源更新检测与自动升级（旁路安装 → 探针 → 切换 → 回滚）均已完成（4.22.13 / 4.22.15）。**未完成**：可选独立第二窗口。
 > - 引擎：**仅支持 Microsoft Edge、Google Chrome，以及内置 Chromium 兜底**；其他浏览器不在支持范围。
 > - 数据：三种引擎**各用独立 profile**，互不共享，也不读取用户日常浏览器的资料。
 > - 驱动：**纯 Python 标准库直连 CDP**，不依赖 Playwright、Selenium 或任何第三方包。
@@ -1204,7 +1204,7 @@ https://storage.googleapis.com/chrome-for-testing-public/<version>/win64/chrome-
 | P2 通道抽象 | 浏览器通道运行时不截屏、不显覆盖层、不让出桌面；路由与引擎可强制指定 |
 | P3 界面三表层 | 抽屉、全屏视图（含左侧对话列）、可选独立窗口均可用（后端帧流已完成） |
 | P4 登录与接管 | 每个引擎首次扫码、接管、自动续跑全链路通过；profile 可按引擎清除 |
-| P5 资源与更新 | 内置 Chromium 纳入 `ensure` 与完整性探针；MCP 资源更新检测可发现、可门禁、可回滚 |
+| P5 资源与更新 | **已完成**：内置 Chromium 纳入 `ensure` 与完整性探针；MCP 资源更新可发现、可门禁、可自动升级、可回滚（4.22.15） |
 | P6 加固 | 反爬兜底、可见模式、下载上传、性能 |
 
 #### 4.21.14 地基实测（2026-11-10，本机 Edge 157 + 纯标准库 CDP）
@@ -1292,7 +1292,7 @@ resources ensure（MCP，已有）
 
 > **模块标记：浏览器功能（Browser Channel）· P1 上半**
 >
-> 状态：**已实现并真机自测**。`src/xm_agent/channels.py`（通道契约与 Hub）、`src/xm_agent/browser/channel.py`（浏览器通道）、5 个 `browser.*` 能力契约、guard 规则、CLI 与面板接入、面板镜像（抽屉 + 全屏视图 + SSE 帧流）均已完成。扫码接管编排、资源管理、更新检测、纯浏览器模式仍属后续阶段。
+> 状态：**已实现并真机自测**。`src/xm_agent/channels.py`（通道契约与 Hub）、`src/xm_agent/browser/channel.py`（浏览器通道）、5 个 `browser.*` 能力契约、guard 规则、CLI 与面板接入、面板镜像（抽屉 + 全屏视图 + SSE 帧流）均已完成。扫码接管编排、纯浏览器模式、内置内核资源管理与更新升级（4.22.13 / 4.22.15）也已完成；剩余可选项是独立第二窗口。
 
 #### 4.22.1 为什么必须先做这一层
 
@@ -1482,13 +1482,54 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 - 查 `releases/latest`，失败再退回 `tags`（有的仓库只用 tag 发版）；拉不到就当没有新版本，不抛异常——面板不该因为 GitHub 挂了而报错。
 - 版本比较把 `v1.2.3-beta` 归一成数字元组；仓库级缓存 6 小时（GitHub 未认证额度只有 60 次/小时），面板再叠一层 10 分钟缓存，点「刷新」两级都绕过。
 - 兼容门禁：跨大版本一律判为不可自动切换，理由是 MCP 工具集会变，而 Runtime 的提示词与审计规则都是按当前工具集写的；浏览器内核只提示不升级（CDP 命令集要一起验）。
-- 面板 `/api/resources/updates` 返回 `mode / checked_at / candidates`，资源行显示「新版 x.y.z」：同大版本绿色、跨大版本橙色并带理由。配置 `[resources].update_check = off|notify`。
-
-**为什么不做自动安装**：升级要过「下载 → 构建 → `tools/list` 探针 → 切换」四道关，任何一步失败都必须能退回旧版，这条链路涉及动态版本与回滚，单独实现。真机检测已发现 Windows-MCP 上游 v0.8.8 与固定的 0.8.5 同属 0.x 但要求 Python ≥3.14——正是「版本号兼容 ≠ 环境兼容」的例子，所以更不该静默升级。
+- 面板 `/api/resources/updates` 返回 `mode / checked_at / candidates`，资源行显示「新版 x.y.z」：同大版本绿色、跨大版本橙色并带理由。配置 `[resources].update_check = off|notify|auto`。
 
 #### 4.22.14 未完成
 
-1. **资源自动升级链路**：旁路安装到新版本目录 → 探针通过才切换 → 失败保留旧版可回滚；`update_check` 增加 `auto` 档。
+1. **独立第二窗口**（pywebview 多窗口打开 `/browser`）：可选形态，双屏场景用，暂不做。
+
+#### 4.22.15 资源自动升级（已实现：旁路安装 → 探针 → 切换 → 回滚）
+
+升级要过「下载 → 构建 → 探针 → 切换」四道关，任何一步失败都必须能退回旧版，因此单独成一条链路：`src/xm_agent/resources/upgrade.py`（`Upgrader`）+ `ResourceManager` 的 `stage / switch / discard / prune / rollback`。
+
+**版本从哪来、装到哪去**
+
+| 环节 | 做法 |
+|---|---|
+| 目标版本 | `Resource.with_version(version, ref)`：目录名用归一的数字（`v0.8.8` → `0.8.8`），`ref` 保留上游 tag 原文——GitHub 归档按 tag 取包，Chrome for Testing 的地址要纯版本号，两者不能混 |
+| 安装位置 | `<install_dir>/<dir>-<version>`，与在用版本并列；`_install(..., switch_link=False)` 全程不碰稳定入口 |
+| 探针 | Python/Node：把配置里指向稳定入口的 `command`/`cwd` 改写到旁路目录，真的拉起 MCP 服务跑 `tools/list`；内核：跑 `chrome.exe --version` |
+| 切换 | 探针通过才重建 junction（`vendor/Windows-MCP`），并把「在用版本」写进 `.xm-agent/resources/active.json` |
+| 失败 | 删掉旁路目录、旧链接原样不动；同一版本 6 小时内不再自动重试（`attempts.json`），否则面板每十分钟检查一次就重下一次 200MB |
+| 回滚 | `resources rollback`：清掉在用版本记录，链接切回清单里的出厂版本；内核没有链接，改写启用版本即可 |
+
+**为什么版本记录放在数据目录**：清单里的 `version` 是「出厂版本」，用户升级后实际在用另一个版本。把在用版本记在 `.xm-agent/resources/active.json` 而不是改源码，升级不需要重新发版；`ResourceManager.expected()` 优先用它，目录不在了就自动忽略（面板不会一直报「缺失」而无法自愈）。
+
+**内置内核的激活方式与 MCP 不同**：内核没有稳定入口链接（`browser/engine.py` 直接 glob `chromium-*`），所以 `find_engine_path("chromium")` 先读启用版本记录，命中就用它，否则取最新目录。这一条让「升级」和「回滚」对内核同样成立，且读数失败时退回「取最新」，不会因为一份坏记录导致浏览器起不来。
+
+**`auto` 档的边界**：`update_check = "auto"` 时，面板调 `/api/resources/updates` 会顺手把「同大版本 + 不在冷却期」的候选排进升级任务。三条硬约束：有任务在跑不动（切换入口会影响下一次拉起后端）、跨大版本永不自动升、失败版本冷却 6 小时。`notify` 档只在资源行给一个「升级到 x.y.z」按钮，点了才动。
+
+**实测（2026-11-10，本机 Python 3.12 / Windows-MCP 0.8.5 → v0.8.8）**：
+
+| 观察点 | 结果 |
+|---|---|
+| 上游发现 | `releases/latest` 返回 `v0.8.8`，同一大版本 → compatible |
+| 旁路安装（真实下载 + 构建） | 下载 → 解压 → `vendor/Windows-MCP-0.8.8` → 建 venv 成功；`vendor/Windows-MCP` 全程仍指向 0.8.5 |
+| 构建失败 | `pip install -e .` 四个源全失败：`ERROR: Package 'windows-mcp' requires a different Python: 3.12.10 not in '>=3.14'` |
+| 旧版完好 | 失败后入口仍是 0.8.5，`resources status` 报 0.8.5「已就绪」；启用记录为空 |
+| 失败记录 | `attempts.json` 记 0.8.8 failed，存的是 pip 的 `ERROR:` 行（不再是一段进度条碎片） |
+| 探针失败 | 另造一个「构建成功但起不来」的旁路版本：探针 0.33s 报 `[WinError 216]`，旁路目录被删，入口不变，状态仍是 0.8.5 就绪 |
+| 真实探针 | 用真实配置对 0.8.5 目录跑改写后的命令：MCP 握手成功、20 个工具、3.32s |
+| 界面 | 资源行出现「升级到 v0.8.8」；升级后变「已升级 v0.8.8 · 回滚 v0.8.5」；点回滚 → toast「已切回 0.8.5」，入口与记录同时回到 0.8.5 |
+| 内核解析 | 真实目录布局下，启用记录指向 157 → 命中 `chromium-157.0.8103.50/chrome.exe`；记录指向不存在的 999 → 回落到最新目录 |
+
+这正是「版本号兼容 ≠ 环境兼容」的现场：门禁只看大版本，环境问题只能由构建和探针兜住。所以自动升级不做静默替换，失败必须能一眼看出原因。
+
+**踩坑记录（真机发现的严重 bug）**：第一版 `make_prober` 改写命令时用的是 `resource.dest`（清单版本 `0.8.5`），而不是探针拿到的旁路目录。结果是「验证的是旧版、切换的是新版」——真机上表现为一个内容为 `not an exe` 的假 `python.exe` 也能探针通过（它实际连的是旧的 0.8.5），随后入口被切到这个坏目录。修复为从入参 `dest` 推导替换路径（能写成相对项目根就写相对），并补了回归用例：断言改写后的 `command[0]` 与 `cwd` 指向 `test-mcp-1.4.3` 而不是清单版本。教训：探针的「目标目录」只能有一个来源。
+
+同时修掉一个报告问题：`_tail` 原先把 stderr 拼在 stdout 前面再取末尾 600 字，而 pip 的 `ERROR:` 写在 stderr —— 被完整截掉，面板只剩进度条碎片。现在 stderr 放最后，并用 `reason_of()` 从日志里挑出真正的原因行。
+
+**已知限制**：MCP 资源升级后，`config/agent.example.toml` 里的 `command` 仍写稳定入口（`vendor/Windows-MCP/...`），junction 换向即生效，配置不用改；但如果用户在配置里把路径写死成版本化目录，升级与探针都会落到那个固定目录上，等于绕开这套机制——升级后请在配置里保留稳定入口。
 
 ---
 
@@ -1658,7 +1699,7 @@ GET /api/browser/stream  SSE：browser_ready + browser_frame(data URL)
 | ~~P0~~ | 顶层 AI 审计（操作描述符、盲审、失败关闭、执行前复核） | 已完成：敏感操作先规则后盲审；模型不可用或异常时升级用户确认 |
 | ~~P0~~ | 用户审计模式（AI 审计 / 执行前询问）与确认弹窗 | 已完成：两种模式可切换；批准仅对当前步骤生效 |
 | ~~P0~~ | 登录阻塞与用户接管 | 已完成：无凭据时 `task.await_user` 中止；UIA 登录页确定性兜底；同会话「继续」沿用原目标并从当前屏幕恢复，队列透传用户消息与上下文 |
-| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入、面板镜像（抽屉 / 全屏 / SSE 帧流）、纯浏览器模式、空闲回收调度、扫码登录接管。内置 Chromium 已纳入资源管理（按需安装、双源、启动探针）。待完成：资源更新检测 |
+| **浏览器**（新模块） | **浏览器功能：内置浏览器通道**（见 4.21 / 4.22） | 已完成：三引擎解析与独立 profile、CDP 六模块、通道抽象与路由、5 个 `browser.*` 能力、审计规则、CLI 与面板接入、面板镜像（抽屉 / 全屏 / SSE 帧流）、纯浏览器模式、空闲回收调度、扫码登录接管。内置 Chromium 已纳入资源管理（按需安装、双源、启动探针）、资源更新检测、自动升级（旁路安装 → 探针 → 切换 → 回滚）。可选待做：独立第二窗口 |
 | P1 | 非标准登录页识别（验证码 / 二次验证 / 纯图形） | 视觉模型判定并请求用户接管；无法判定时不得绕过或猜测 |
 | P1 | 凭据安全输入 | 密码不进入任务目标、会话记录与审计日志；接入系统凭据存储 |
 | P1 | 审计决策面板、Token 统计与回放 | 缓存已实现；模型/耗时/用户决定的统计与回放待做 |

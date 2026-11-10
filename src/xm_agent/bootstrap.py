@@ -166,12 +166,32 @@ def probe_adapter_kind(
         return {"ok": False, "detail": "配置中没有对应的后端", "tools": []}
     if not adapter.command:
         return {"ok": False, "detail": "后端没有配置启动命令", "tools": []}
-    env = {**os.environ, **(adapter.env or {})} if adapter.env else None
+    return probe_mcp_command(
+        adapter.command,
+        cwd=adapter.cwd,
+        env=adapter.env or None,
+        timeout=timeout,
+    )
+
+
+def probe_mcp_command(
+    command: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """用给定命令跑一次 MCP 握手。
+
+    与 `probe_adapter_kind` 分开，是因为升级要在**旁路目录**上验证新版本，
+    而那时配置里的命令还指向旧版本。
+    """
+    merged = {**os.environ, **env} if env else None
     try:
         client = StdioMCPClient(
-            adapter.command,
-            env=env,
-            cwd=adapter.cwd,
+            list(command),
+            env=merged,
+            cwd=cwd,
             default_timeout=timeout,
         )
     except (OSError, MCPError) as exc:

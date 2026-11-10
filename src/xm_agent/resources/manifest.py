@@ -1,7 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+
+
+def clean_version(version: str) -> str:
+    """把 `v1.2.3` 归一成 `1.2.3`。
+
+    目录名与版本比较都用归一后的形式；git tag 里的 `v` 前缀只对下载有用，
+    不能进目录名——否则 `chromium-v157` 这种目录会让引擎解析找不到。
+    """
+    text = str(version or "").strip()
+    if text[:1] in {"v", "V"} and text[1:2].isdigit():
+        text = text[1:]
+    return text
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,17 @@ class Resource:
     @property
     def link(self) -> str:
         return f"{self.install_dir}/{self.directory}"
+
+    def with_version(self, version: str, ref: str = "") -> "Resource":
+        """同一资源的另一个版本。
+
+        目录版本用归一后的数字，`ref` 保留上游 tag 原样——GitHub 归档按 tag
+        取包，而 Chrome for Testing 的地址要求纯版本号，两者不能混用。
+        """
+        target = clean_version(version)
+        if not target or target == self.version:
+            return self
+        return replace(self, version=target, ref=ref or target)
 
     def to_dict(self) -> dict[str, Any]:
         return {

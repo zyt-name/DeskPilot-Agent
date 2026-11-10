@@ -174,18 +174,3 @@ def test_server_reports_candidates_and_caches(tmp_path):
     app.resource_updates(refresh=True)
     assert len(calls) > fetched
 
-
-def _server(tmp_path, mode: str = "notify"):
-    from xm_agent.config import AdapterConfig, AgentConfig
-    from xm_agent.ui.server import UiServer
-
-    config = AgentConfig()
-    config.adapters = {"mock": AdapterConfig()}
-    config.resources.update_check = mode
-    config.audit.root = str(tmp_path / "audit")
-    config.runtime.lock_path = str(tmp_path / "agent.lock")
-    return UiServer(
-        config,
-        db_path=tmp_path / "app.db",
-        resources_root=tmp_path / "resource-root",
-    )

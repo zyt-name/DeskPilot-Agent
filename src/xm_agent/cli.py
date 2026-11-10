@@ -190,10 +190,99 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 1
 
 
+def _upgrade_resources(args: argparse.Namespace, manager: Any) -> int:
+    """升级 / 回滚：装到旁路目录，探针通过才切换。"""
+    from .config import load_config
+    from .resources import Upgrader, UpdateChecker, make_prober
+
+    config_path = getattr(args, "config", None)
+    if config_path is None and Path("config/agent.example.toml").is_file():
+        config_path = "config/agent.example.toml"
+    config = load_config(config_path)
+    upgrader = Upgrader(
+        manager,
+        UpdateChecker(),
+        prober=make_prober(config, manager),
+    )
+    only = [str(item) for item in (getattr(args, "only", None) or [])]
+
+    if args.action == "rollback":
+        if not only:
+            print("[resources] 需要 --only 指定要回滚的资源")
+            return 2
+        results = [upgrader.rollback(resource_id) for resource_id in only]
+    else:
+        if only and getattr(args, "version", ""):
+            picked = [
+                upgrader.candidate_for(resource_id, args.version)
+                for resource_id in only
+            ]
+        else:
+            candidates = upgrader.candidates(refresh=True)
+            if only:
+                wanted = set(only)
+                picked = [
+                    item for item in candidates if item.resource_id in wanted
+                ]
+            elif getattr(args, "force", False):
+                picked = [
+                    item
+                    for item in candidates
+                    if upgrader.is_newer(item.resource_id, item.latest)
+                ]
+            else:
+                picked = upgrader.pending(candidates)
+        picked = [item for item in picked if item is not None]
+        if not picked:
+            print("[resources] 没有可升级的新版本")
+        show = _progress_printer()
+        results = [
+            upgrader.upgrade(
+                item.resource_id,
+                candidate=item,
+                force=bool(getattr(args, "force", False)),
+                progress=show,
+            )
+            for item in picked
+        ]
+
+    if args.json:
+        print(
+            json.dumps(
+                [item.to_dict() for item in results],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        for item in results:
+            print(
+                f"[resources] {item.name}: {item.from_version} → "
+                f"{item.to_version or item.from_version} · {item.status}"
+                + (f" · {item.detail}" if item.detail else "")
+            )
+    return 0 if all(item.ok for item in results) else 1
+
+
+def _progress_printer():
+    """同一句进度只打一次，下载中的 MB 数变了才继续打。"""
+    last = {"text": ""}
+
+    def show(event: dict[str, Any]) -> None:
+        message = str(event.get("message") or "")
+        if message and message != last["text"]:
+            last["text"] = message
+            print(f"[resources] {message}")
+
+    return show
+
+
 def _cmd_resources(args: argparse.Namespace) -> int:
     from .resources import ResourceManager
 
     manager = ResourceManager(args.root)
+    if args.action in {"upgrade", "rollback"}:
+        return _upgrade_resources(args, manager)
     if args.action in {"status", "check"}:
         states = manager.status()
         if args.action == "check":
@@ -455,6 +544,54 @@ def main(argv: list[str] | None = None) -> int:
         help="rebuild even when the resource is already ready",
     )
     ensure_parser.set_defaults(handler=_cmd_resources)
+
+    upgrade_parser = resources_sub.add_parser(
+        "upgrade",
+        help="install a newer upstream version beside the current one, "
+        "probe it, then switch (rolls back on failure)",
+    )
+    upgrade_parser.add_argument("--json", action="store_true")
+    upgrade_parser.add_argument(
+        "--root", default=".", help="project root (defaults to cwd)"
+    )
+    upgrade_parser.add_argument(
+        "--only",
+        action="append",
+        help="limit to a resource id; repeat for multiple",
+    )
+    upgrade_parser.add_argument(
+        "--version",
+        default="",
+        help="target version (requires a single --only)",
+    )
+    upgrade_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="ignore the compatibility gate (cross-major versions included)",
+    )
+    upgrade_parser.add_argument(
+        "--config",
+        help="config file (defaults to config/agent.example.toml if present)",
+    )
+    upgrade_parser.set_defaults(handler=_cmd_resources)
+
+    rollback_parser = resources_sub.add_parser(
+        "rollback", help="point the stable link back at the pinned version"
+    )
+    rollback_parser.add_argument("--json", action="store_true")
+    rollback_parser.add_argument(
+        "--root", default=".", help="project root (defaults to cwd)"
+    )
+    rollback_parser.add_argument(
+        "--only",
+        action="append",
+        help="resource id to roll back; repeat for multiple",
+    )
+    rollback_parser.add_argument(
+        "--config",
+        help="config file (defaults to config/agent.example.toml if present)",
+    )
+    rollback_parser.set_defaults(handler=_cmd_resources)
 
     gui_parser = subparsers.add_parser(
         "gui", help="launch the local desktop console"

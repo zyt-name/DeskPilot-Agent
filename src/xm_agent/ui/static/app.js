@@ -16,6 +16,8 @@ const state = {
   resourceModalOpen: false,
   resourceSnapshot: null,
   resourceUpdates: [],
+  resourceUpdatesMode: "notify",
+  resourcePins: {},
 };
 
 const STATUS_LABEL = {
@@ -1320,15 +1322,31 @@ function renderResourceRows(rows) {
       ),
     );
     item.appendChild(name);
+    const pinned = (state.resourcePins || {})[row.id];
     const update = (state.resourceUpdates || []).find(
       (candidate) => candidate.id === row.id,
     );
-    if (update) {
+    if (pinned && pinned.version !== row.builtin_version) {
+      const back = row.builtin_version || pinned.from || "";
       const badge = el(
-        "span",
-        `r-update ${update.compatible ? "ok" : "warn"}`,
-        `新版 ${update.latest}`,
+        "button",
+        "r-update ok",
+        `已升级 v${pinned.version}${back ? ` · 回滚 v${back}` : ""}`,
       );
+      badge.title = back
+        ? `点击切回出厂版本 v${back}；旁路版本目录会保留`
+        : "点击取消版本锁定";
+      badge.addEventListener("click", () => rollbackResource(row.id));
+      name.appendChild(badge);
+    } else if (update && update.compatible) {
+      const badge = el("button", "r-update ok", `升级到 ${update.latest}`);
+      badge.title =
+        update.reason ||
+        "先装到旁路目录，探针通过才切换；失败保留当前版本";
+      badge.addEventListener("click", () => upgradeResources([row.id]));
+      name.appendChild(badge);
+    } else if (update) {
+      const badge = el("span", "r-update warn", `新版 ${update.latest}`);
       badge.title = update.reason || "";
       name.appendChild(badge);
     }
@@ -1340,9 +1358,11 @@ function renderResourceRows(rows) {
 
 function renderResourceJob(snapshot) {
   state.resourceSnapshot = snapshot;
+  state.resourcePins = snapshot.pins || {};
   const job = snapshot.job;
   const rows = job ? job.resources : snapshot.resources;
   const running = Boolean(job && job.running);
+  const upgrading = Boolean(job && job.kind === "upgrade");
   const percent = job ? Number(job.percent || 0) : 0;
   $("resource-progress").style.width = `${Math.max(0, Math.min(100, percent))}%`;
   $("resource-spinner").classList.toggle("hidden", !running);
@@ -1356,7 +1376,10 @@ function renderResourceJob(snapshot) {
 
   if (!job) {
     $("resource-modal-title").textContent = "资源状态";
-    $("resource-modal-note").textContent = "点击「检测并修复资源」开始检查。";
+    $("resource-modal-note").textContent =
+      state.resourceUpdatesMode === "auto"
+        ? "同大版本自动升级：旁路安装 → 探针通过才切换，失败保留旧版；跨大版本只提示。"
+        : "点击「检测并修复资源」开始检查。";
     return;
   }
   $("resource-modal-note").textContent =
@@ -1364,15 +1387,21 @@ function renderResourceJob(snapshot) {
   if (running) {
     const detecting = job.phase === "detecting";
     const probing = job.phase === "probe";
-    $("resource-modal-title").textContent = detecting
-      ? "正在检测资源完整性"
-      : probing
-        ? "正在检测资源可用性"
-        : "正在修复资源";
+    $("resource-modal-title").textContent = upgrading
+      ? "正在升级资源"
+      : detecting
+        ? "正在检测资源完整性"
+        : probing
+          ? "正在检测资源可用性"
+          : "正在修复资源";
   } else if (job.ok) {
-    $("resource-modal-title").textContent = "资源检测完成";
+    $("resource-modal-title").textContent = upgrading
+      ? "资源升级完成"
+      : "资源检测完成";
   } else {
-    $("resource-modal-title").textContent = "资源检测完成（有异常）";
+    $("resource-modal-title").textContent = upgrading
+      ? "资源升级完成（保留旧版）"
+      : "资源检测完成（有异常）";
   }
 }
 
@@ -1396,17 +1425,66 @@ async function pollResourceJob() {
     state.resourceJobId = "";
     if (snapshot.job) {
       toast(snapshot.job.message || "资源检测完成", !snapshot.job.ok);
+      if (snapshot.job.kind === "upgrade") {
+        // 升级后候选列表要重算，否则行上还挂着「升级到 x」
+        await loadResourceUpdates(true);
+        renderResourceRows(snapshot.resources);
+        renderResourceSummary(snapshot.resources);
+      }
     }
   } catch (err) {
     toast(`读取资源状态失败：${err.message}`, true);
   }
 }
 
+async function upgradeResources(ids, force = false) {
+  if (!ids || !ids.length) return;
+  openResourceModal();
+  stopResourcePolling();
+  $("resource-spinner").classList.remove("hidden");
+  $("resource-modal-title").textContent = "正在升级资源";
+  $("resource-modal-note").textContent =
+    "先装到旁路目录，探针通过才切换；失败会删除新版本、旧版照常可用…";
+  $("resource-progress").style.width = "1%";
+  try {
+    const snapshot = await api("/api/resources/upgrade", {
+      method: "POST",
+      body: JSON.stringify({ only: ids, force }),
+    });
+    renderResourceJob(snapshot);
+    pollResourceJob();
+  } catch (err) {
+    $("resource-spinner").classList.add("hidden");
+    $("resource-modal-title").textContent = "资源升级失败";
+    $("resource-modal-note").textContent = err.message;
+    toast(`资源升级失败：${err.message}`, true);
+  }
+}
+
+async function rollbackResource(id) {
+  try {
+    const data = await api("/api/resources/rollback", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    });
+    toast(data.detail || "已切回出厂版本", !data.ok);
+    if (data.resources) {
+      renderResourceJob(data.resources);
+      await loadResourceUpdates(true);
+      renderResourceRows(data.resources.resources || []);
+    }
+  } catch (err) {
+    toast(`回滚失败：${err.message}`, true);
+  }
+}
+
 function openResourceModal() {
   loadResourceUpdates().then(() => {
-    if (state.resourceSnapshot) {
-      renderResourceSummary(state.resourceSnapshot.resources);
-    }
+    const snapshot = state.resourceSnapshot;
+    if (!snapshot) return;
+    // 版本信息是后到的，到了要把行重画一遍，否则「升级到 x」不出现
+    renderResourceRows((snapshot.job || snapshot).resources || []);
+    renderResourceSummary(snapshot.resources);
   });
   state.resourceModalOpen = true;
   $("resource-modal").classList.remove("hidden");
@@ -1476,6 +1554,12 @@ async function loadResourceUpdates(refresh = false) {
       `/api/resources/updates${refresh ? "?refresh=1" : ""}`,
     );
     state.resourceUpdates = data.candidates || [];
+    state.resourceUpdatesMode = data.mode || "notify";
+    if (data.started && data.started.length && !state.resourceJobId) {
+      // auto 档：服务端已经排队升级，面板跟上看进度
+      openResourceModal();
+      pollResourceJob();
+    }
   } catch (err) {
     state.resourceUpdates = [];
   }
@@ -1485,6 +1569,7 @@ async function loadResources() {
   try {
     const snapshot = await api("/api/resources");
     state.resourceSnapshot = snapshot;
+    state.resourcePins = snapshot.pins || {};
     await loadResourceUpdates();
     renderResourceSummary(snapshot.resources);
     if (snapshot.job && snapshot.job.running) {

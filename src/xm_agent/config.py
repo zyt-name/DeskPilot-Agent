@@ -82,7 +82,8 @@ class BrowserConfig:
 
 @dataclass
 class ResourceConfig:
-    # off = 不查；notify = 只在面板提示有新版（自动安装需过三道关，另行实现）
+    # off = 不查；notify = 只在面板提示有新版；
+    # auto = 同大版本自动走「旁路安装 → 探针 → 切换」，失败保留旧版
     update_check: str = "notify"
 
 
@@ -308,8 +309,8 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
     update_check = str(
         resources_raw.get("update_check", defaults.resources.update_check)
     ).strip().lower()
-    if update_check not in {"off", "notify"}:
-        raise ValueError("resources.update_check must be off or notify")
+    if update_check not in {"off", "notify", "auto"}:
+        raise ValueError("resources.update_check must be off, notify or auto")
     resources = ResourceConfig(update_check=update_check)
 
     return AgentConfig(
